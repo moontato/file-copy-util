@@ -8,6 +8,7 @@ import java.util.*;
 public class FileHasher {
 
     private static final int BUFFER_SIZE = 8192;
+    private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
 
     public static String computeHash(File file) throws IOException, NoSuchAlgorithmException {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -61,10 +62,12 @@ public class FileHasher {
     }
 
     private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder();
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
+        char[] hexChars = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int v = bytes[i] & 0xFF;
+            hexChars[i * 2] = HEX_CHARS[v >>> 4];
+            hexChars[i * 2 + 1] = HEX_CHARS[v & 0x0F];
         }
-        return sb.toString();
+        return new String(hexChars);
     }
 }

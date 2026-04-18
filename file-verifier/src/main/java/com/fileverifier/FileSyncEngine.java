@@ -63,7 +63,7 @@ public class FileSyncEngine {
                                Set<String> selectedSourceDirs, Set<String> selectedDestDirs,
                                ProgressListener listener) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
-        executor.submit(() -> {
+        Future<?> future = executor.submit(() -> {
             try {
                 if (jobType == JobType.COPY_AND_VERIFY) {
                     runCopyAndVerify(sourceDir, destDir, selectedSourceDirs, listener);
@@ -77,6 +77,14 @@ public class FileSyncEngine {
             }
         });
         executor.shutdown();
+        try {
+            if (!executor.awaitTermination(10, TimeUnit.MINUTES)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static void runCopyAndVerify(File sourceDir, File destDir,
@@ -99,6 +107,7 @@ public class FileSyncEngine {
                     if (relDir.startsWith(File.separator)) {
                         relDir = relDir.substring(1);
                     }
+                    relDir = relDir.replace(File.separator, "/");
                     if (!selectedSourceDirs.contains(relDir)) {
                         rsyncArgs.add("--exclude");
                         rsyncArgs.add(relDir + "/");
@@ -122,7 +131,7 @@ public class FileSyncEngine {
                 int lineCount = 0;
                 while ((line = reader.readLine()) != null) {
                     lineCount++;
-                    if (line.contains("transfering")) {
+                    if (line.contains("transferring")) {
                         listener.onProgressUpdate("Transferring files...", 25);
                     }
                     if (line.contains("generating")) {
@@ -163,7 +172,7 @@ public class FileSyncEngine {
                         mismatched++;
                         listener.onFileProcessed(entry.getKey(), "missing");
                     }
-                    int percent = 80 + (int)((double)matched / Math.max(totalFiles, 1) * 20);
+                    int percent = 80 + (int)((double)(matched + mismatched) / Math.max(totalFiles, 1) * 20);
                     listener.onProgressUpdate("Verifying: " + matched + "/" + totalFiles + " files matched",
                         Math.min(percent, 100));
                 }
@@ -199,21 +208,39 @@ public class FileSyncEngine {
             List<String> errors = new ArrayList<>();
 
             for (Map.Entry<String, String> entry : sourceHashes.entrySet()) {
-                File destFile = new File(destDir, entry.getKey());
                 String fileName = entry.getKey();
+                File destFile = new File(destDir, fileName);
 
-                // Check if parent directory is selected
+                // Normalize parent directory path to forward slashes
                 String parentDir = new File(fileName).getParent();
+                if (parentDir != null) {
+                    parentDir = parentDir.replace(File.separator, "/");
+                }
+
+                // Check if parent directory is selected in source
                 if (parentDir != null && selectedSourceDirs != null && !selectedSourceDirs.isEmpty()) {
                     boolean parentSelected = false;
                     for (String sel : selectedSourceDirs) {
-                        if (parentDir.startsWith(sel) || sel.startsWith(parentDir + File.separator) ||
-                            parentDir.equals(sel)) {
+                        if (parentDir.equals(sel) || parentDir.startsWith(sel + "/")) {
                             parentSelected = true;
                             break;
                         }
                     }
                     if (!parentSelected) {
+                        continue;
+                    }
+                }
+
+                // Check if parent directory is selected in destination
+                if (parentDir != null && selectedDestDirs != null && !selectedDestDirs.isEmpty()) {
+                    boolean destParentSelected = false;
+                    for (String sel : selectedDestDirs) {
+                        if (parentDir.equals(sel) || parentDir.startsWith(sel + "/")) {
+                            destParentSelected = true;
+                            break;
+                        }
+                    }
+                    if (!destParentSelected) {
                         continue;
                     }
                 }

@@ -2,7 +2,6 @@ package com.fileverifier;
 
 import java.io.File;
 import java.util.*;
-import java.util.stream.Collectors;
 
 public class DirectoryScanner {
 
@@ -27,26 +26,5 @@ public class DirectoryScanner {
                 recursiveScan(child, basePath, directories);
             }
         }
-    }
-
-    public static List<String> getRelativePaths(File rootDir, List<String> absolutePaths) {
-        String rootPath = rootDir.getAbsolutePath();
-        String searchPath = rootPath.endsWith(File.separator) ? rootPath : rootPath + File.separator;
-        return absolutePaths.stream()
-            .map(path -> path.startsWith(searchPath) ? path.substring(searchPath.length()) : path)
-            .sorted()
-            .collect(Collectors.toList());
-    }
-
-    public static Map<String, String> buildPathMap(File rootDir, List<String> relativePaths) {
-        Map<String, String> map = new LinkedHashMap<>();
-        String rootPath = rootDir.getAbsolutePath();
-        if (!rootPath.endsWith(File.separator)) {
-            rootPath += File.separator;
-        }
-        for (String rel : relativePaths) {
-            map.put(rel, rootPath + rel);
-        }
-        return map;
     }
 }

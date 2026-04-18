@@ -21,8 +21,6 @@ public class FileVerifierFrame extends JFrame {
     private JList<DirectoryEntry> destList;
     private JLabel statusLabel;
 
-    private Set<String> selectedSourceDirs = new LinkedHashSet<>();
-    private Set<String> selectedDestDirs = new LinkedHashSet<>();
     private File currentSourceDir = null;
     private File currentDestDir = null;
     private boolean scanning = false;
@@ -196,12 +194,30 @@ public class FileVerifierFrame extends JFrame {
         // Source list actions
         JPanel sourceActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 2));
         JButton selectAllSourceBtn = new JButton("Select All");
-        selectAllSourceBtn.addActionListener(e -> selectAll(sourceListModel, true));
+        selectAllSourceBtn.addActionListener(e -> selectAll(sourceListModel, sourceList, true));
         JButton deselectAllSourceBtn = new JButton("Deselect All");
-        deselectAllSourceBtn.addActionListener(e -> selectAll(sourceListModel, false));
+        deselectAllSourceBtn.addActionListener(e -> selectAll(sourceListModel, sourceList, false));
         sourceActions.add(selectAllSourceBtn);
         sourceActions.add(deselectAllSourceBtn);
         sourcePanel.add(sourceActions, BorderLayout.SOUTH);
+
+        // Source list checkbox toggle
+        sourceList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                int index = sourceList.locationToIndex(e.getPoint());
+                if (index >= 0 && SwingUtilities.isLeftMouseButton(e)) {
+                    DirectoryEntry entry = sourceListModel.getElementAt(index);
+                    entry.selected = !entry.selected;
+                    SwingUtilities.invokeLater(() -> {
+                        Rectangle bounds = sourceList.getCellBounds(index, index);
+                        if (bounds != null) {
+                            sourceList.repaint(bounds);
+                        }
+                    });
+                }
+            }
+        });
 
         // Dest directory list
         JPanel destPanel = new JPanel(new BorderLayout());
@@ -219,12 +235,30 @@ public class FileVerifierFrame extends JFrame {
         // Dest list actions
         JPanel destActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 2));
         JButton selectAllDestBtn = new JButton("Select All");
-        selectAllDestBtn.addActionListener(e -> selectAll(destListModel, true));
+        selectAllDestBtn.addActionListener(e -> selectAll(destListModel, destList, true));
         JButton deselectAllDestBtn = new JButton("Deselect All");
-        deselectAllDestBtn.addActionListener(e -> selectAll(destListModel, false));
+        deselectAllDestBtn.addActionListener(e -> selectAll(destListModel, destList, false));
         destActions.add(selectAllDestBtn);
         destActions.add(deselectAllDestBtn);
         destPanel.add(destActions, BorderLayout.SOUTH);
+
+        // Dest list checkbox toggle
+        destList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                int index = destList.locationToIndex(e.getPoint());
+                if (index >= 0 && SwingUtilities.isLeftMouseButton(e)) {
+                    DirectoryEntry entry = destListModel.getElementAt(index);
+                    entry.selected = !entry.selected;
+                    SwingUtilities.invokeLater(() -> {
+                        Rectangle bounds = destList.getCellBounds(index, index);
+                        if (bounds != null) {
+                            destList.repaint(bounds);
+                        }
+                    });
+                }
+            }
+        });
 
         // Split pane
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, sourcePanel, destPanel);
@@ -347,8 +381,6 @@ public class FileVerifierFrame extends JFrame {
 
         sourceListModel.clear();
         destListModel.clear();
-        selectedSourceDirs.clear();
-        selectedDestDirs.clear();
 
         SwingWorker<Void, Void> worker = new SwingWorker<>() {
             @Override
@@ -357,23 +389,11 @@ public class FileVerifierFrame extends JFrame {
                 List<String> destDirs = DirectoryScanner.scanDirectories(destDir);
 
                 SwingUtilities.invokeLater(() -> {
-                    String sourceAbs = sourceDir.getAbsolutePath();
-                    String destAbs = destDir.getAbsolutePath();
                     for (String dir : sourceDirs) {
                         sourceListModel.addElement(new DirectoryEntry(dir, true));
-                        String relPath = dir.startsWith(sourceAbs)
-                            ? dir.substring(sourceAbs.length()).replace(File.separator, "/")
-                            : dir;
-                        if (relPath.startsWith("/")) relPath = relPath.substring(1);
-                        selectedSourceDirs.add(relPath);
                     }
                     for (String dir : destDirs) {
                         destListModel.addElement(new DirectoryEntry(dir, true));
-                        String relPath = dir.startsWith(destAbs)
-                            ? dir.substring(destAbs.length()).replace(File.separator, "/")
-                            : dir;
-                        if (relPath.startsWith("/")) relPath = relPath.substring(1);
-                        selectedDestDirs.add(relPath);
                     }
                     scanning = false;
                     statusLabel.setText(String.format("Scanned: %d source directories, %d destination directories",
@@ -387,18 +407,11 @@ public class FileVerifierFrame extends JFrame {
         worker.execute();
     }
 
-    private void selectAll(DefaultListModel<DirectoryEntry> model, boolean select) {
+    private void selectAll(DefaultListModel<DirectoryEntry> model, JList<DirectoryEntry> list, boolean select) {
         for (int i = 0; i < model.size(); i++) {
             model.getElementAt(i).selected = select;
         }
-        try {
-            java.lang.reflect.Method m = model.getClass().getSuperclass().getDeclaredMethod(
-                "fireContentsChanged", Object.class, int.class, int.class);
-            m.setAccessible(true);
-            m.invoke(model, model, 0, model.size() - 1);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        SwingUtilities.invokeLater(() -> list.repaint());
     }
 
     private void runJob() {
@@ -419,25 +432,37 @@ public class FileVerifierFrame extends JFrame {
             return;
         }
 
-        // Collect selected directories
+        File sourceDir = new File(sourcePath);
+        File destDir = new File(destPath);
+
+        // Collect selected directories as relative paths
         Set<String> selectedSource = new LinkedHashSet<>();
+        String sourceAbs = sourceDir.getAbsolutePath();
         for (int i = 0; i < sourceListModel.size(); i++) {
             DirectoryEntry entry = sourceListModel.getElementAt(i);
             if (entry.selected) {
-                selectedSource.add(entry.path);
+                String rel = entry.path.startsWith(sourceAbs)
+                    ? entry.path.substring(sourceAbs.length())
+                    : entry.path;
+                if (rel.startsWith(File.separator)) rel = rel.substring(1);
+                rel = rel.replace(File.separator, "/");
+                selectedSource.add(rel);
             }
         }
 
         Set<String> selectedDest = new LinkedHashSet<>();
+        String destAbs = destDir.getAbsolutePath();
         for (int i = 0; i < destListModel.size(); i++) {
             DirectoryEntry entry = destListModel.getElementAt(i);
             if (entry.selected) {
-                selectedDest.add(entry.path);
+                String rel = entry.path.startsWith(destAbs)
+                    ? entry.path.substring(destAbs.length())
+                    : entry.path;
+                if (rel.startsWith(File.separator)) rel = rel.substring(1);
+                rel = rel.replace(File.separator, "/");
+                selectedDest.add(rel);
             }
         }
-
-        File sourceDir = new File(sourcePath);
-        File destDir = new File(destPath);
 
         FileSyncEngine.JobType jobType = currentJobType;
 
@@ -523,10 +548,10 @@ public class FileVerifierFrame extends JFrame {
 
         @Override
         public Component getListCellRendererComponent(JList<? extends DirectoryEntry> list,
-                                                       DirectoryEntry value,
-                                                       int index,
-                                                       boolean isSelected,
-                                                       boolean cellHasFocus) {
+                                                        DirectoryEntry value,
+                                                        int index,
+                                                        boolean isSelected,
+                                                        boolean cellHasFocus) {
             setSelected(value.selected);
             setText(value.path);
 
