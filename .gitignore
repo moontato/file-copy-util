@@ -1,3 +1,4 @@
 apache-maven-*/
 target/
 *.md
+*.png

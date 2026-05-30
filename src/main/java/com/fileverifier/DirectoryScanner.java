@@ -5,25 +5,26 @@ import java.util.*;
 
 public class DirectoryScanner {
 
-    public static List<String> scanDirectories(File rootDir) {
-        List<String> directories = new ArrayList<>();
+    public static List<String> scanFiles(File rootDir) {
+        List<String> files = new ArrayList<>();
         if (rootDir == null || !rootDir.exists() || !rootDir.isDirectory()) {
-            return directories;
+            return files;
         }
-        recursiveScan(rootDir, rootDir.getAbsolutePath(), directories);
-        Collections.sort(directories);
-        return directories;
+        recursiveScan(rootDir, rootDir.getAbsolutePath(), files);
+        Collections.sort(files);
+        return files;
     }
 
-    private static void recursiveScan(File dir, String basePath, List<String> directories) {
+    private static void recursiveScan(File dir, String basePath, List<String> files) {
         File[] children = dir.listFiles();
         if (children == null) {
             return;
         }
         for (File child : children) {
-            if (child.isDirectory()) {
-                directories.add(child.getAbsolutePath());
-                recursiveScan(child, basePath, directories);
+            if (child.isFile()) {
+                files.add(child.getAbsolutePath());
+            } else if (child.isDirectory()) {
+                recursiveScan(child, basePath, files);
             }
         }
     }

@@ -87,116 +87,129 @@ public class FileSyncEngine {
         }
     }
 
-    private static void runCopyAndVerify(File sourceDir, File destDir,
-                                          Set<String> selectedSourceDirs,
-                                          ProgressListener listener) {
+  private static void runCopyAndVerify(File sourceDir, File destDir,
+                                           Set<String> selectedSourceFiles,
+                                           ProgressListener listener) {
         try {
-            String destPath = destDir.getAbsolutePath();
+            listener.onProgressUpdate("Starting rsync copy...", 0);
+
+            // Use rsync with --files-from to copy only selected files
             List<String> rsyncArgs = new ArrayList<>();
             rsyncArgs.add("rsync");
             rsyncArgs.add("-av");
-            rsyncArgs.add("--delete");
             rsyncArgs.add("--checksum");
             rsyncArgs.add("--progress");
 
-            if (selectedSourceDirs != null && !selectedSourceDirs.isEmpty()) {
-                // Build include/exclude filters
-                List<String> allDirs = DirectoryScanner.scanDirectories(sourceDir);
-                for (String dir : allDirs) {
-                    String relDir = dir.substring(sourceDir.getAbsolutePath().length());
-                    if (relDir.startsWith(File.separator)) {
-                        relDir = relDir.substring(1);
-                    }
-                    relDir = relDir.replace(File.separator, "/");
-                    if (!selectedSourceDirs.contains(relDir)) {
-                        rsyncArgs.add("--exclude");
-                        rsyncArgs.add(relDir + "/");
+            if (selectedSourceFiles != null && !selectedSourceFiles.isEmpty()) {
+                // Create a temporary file with the list of files to copy
+                File filelist = File.createTempFile("filelist-", ".txt");
+                try (java.io.FileWriter writer = new java.io.FileWriter(filelist)) {
+                    for (String relPath : selectedSourceFiles) {
+                        writer.write(relPath + "\n");
                     }
                 }
-            }
+                rsyncArgs.add("--files-from=" + filelist.getAbsolutePath());
+                rsyncArgs.add("--relative");
+                rsyncArgs.add(sourceDir.getAbsolutePath() + "/");
+                rsyncArgs.add(destDir.getAbsolutePath() + "/");
 
-            rsyncArgs.add(sourceDir.getAbsolutePath() + "/");
-            rsyncArgs.add(destPath + "/");
+                ProcessBuilder pb = new ProcessBuilder(rsyncArgs);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
 
-            listener.onProgressUpdate("Starting rsync copy...", 0);
-
-            ProcessBuilder pb = new ProcessBuilder(rsyncArgs);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            // Show progress from rsync output
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                int lineCount = 0;
-                while ((line = reader.readLine()) != null) {
-                    lineCount++;
-                    if (line.contains("transferring")) {
-                        listener.onProgressUpdate("Transferring files...", 25);
-                    }
-                    if (line.contains("generating")) {
-                        listener.onProgressUpdate("Generating checksums...", 50);
-                    }
-                    if (line.contains("sent") || line.contains("total size")) {
-                        listener.onProgressUpdate("Verifying copy...", 75);
-                    }
-                    if (line.startsWith("rsync: ") || line.startsWith("ERROR") ||
-                        line.startsWith("failed") || line.startsWith("error")) {
-                        listener.onFileProcessed(line.trim(), "error");
-                    }
-                }
-            }
-
-            int exitCode = process.waitFor();
-
-            if (exitCode == 0) {
-                listener.onProgressUpdate("Copy completed. Verifying...", 80);
-
-                // Verify by comparing hashes of a sample
-                Map<String, String> sourceHashes = FileHasher.computeHashesForDirectory(sourceDir);
-                int totalFiles = sourceHashes.size();
-                int matched = 0;
-                int mismatched = 0;
-
-                for (Map.Entry<String, String> entry : sourceHashes.entrySet()) {
-                    File destFile = new File(destDir, entry.getKey());
-                    if (destFile.exists()) {
-                        String destHash = FileHasher.computeHash(destFile);
-                        if (destHash.equals(entry.getValue())) {
-                            matched++;
-                        } else {
-                            mismatched++;
-                            listener.onFileProcessed(entry.getKey(), "mismatch");
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.contains("transferring")) {
+                            listener.onProgressUpdate("Transferring files...", 25);
                         }
+                        if (line.contains("generating")) {
+                            listener.onProgressUpdate("Generating checksums...", 50);
+                        }
+                        if (line.contains("sent") || line.contains("total size")) {
+                            listener.onProgressUpdate("Verifying copy...", 75);
+                        }
+                        if (line.startsWith("rsync: ") || line.startsWith("ERROR") ||
+                            line.startsWith("failed") || line.startsWith("error")) {
+                            listener.onFileProcessed(line.trim(), "error");
+                        }
+                    }
+                }
+
+                int exitCode = process.waitFor();
+                filelist.delete();
+
+                if (exitCode != 0) {
+                    String msg = "rsync failed with exit code: " + exitCode;
+                    listener.onProgressUpdate(msg, -1);
+                    listener.onCompletion(new JobResult(JobStatus.FAILED, msg,
+                        0, 0, 0, 0, 0, Arrays.asList("rsync exit code: " + exitCode)));
+                    return;
+                }
+            } else {
+                // No files selected, just copy everything
+                List<String> fullRsyncArgs = new ArrayList<>(rsyncArgs);
+                fullRsyncArgs.add(sourceDir.getAbsolutePath() + "/");
+                fullRsyncArgs.add(destDir.getAbsolutePath() + "/");
+
+                ProcessBuilder pb = new ProcessBuilder(fullRsyncArgs);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.contains("transferring")) {
+                            listener.onProgressUpdate("Transferring files...", 25);
+                        }
+                    }
+                }
+                process.waitFor();
+            }
+
+            listener.onProgressUpdate("Copy completed. Verifying...", 80);
+
+            // Verify by comparing hashes
+            Map<String, String> sourceHashes = FileHasher.computeHashesForDirectory(sourceDir);
+            int totalFiles = sourceHashes.size();
+            int matched = 0;
+            int mismatched = 0;
+
+            for (Map.Entry<String, String> entry : sourceHashes.entrySet()) {
+                File destFile = new File(destDir, entry.getKey());
+                if (destFile.exists()) {
+                    String destHash = FileHasher.computeHash(destFile);
+                    if (destHash.equals(entry.getValue())) {
+                        matched++;
                     } else {
                         mismatched++;
-                        listener.onFileProcessed(entry.getKey(), "missing");
+                        listener.onFileProcessed(entry.getKey(), "mismatch");
                     }
-                    int percent = 80 + (int)((double)(matched + mismatched) / Math.max(totalFiles, 1) * 20);
-                    listener.onProgressUpdate("Verifying: " + matched + "/" + totalFiles + " files matched",
-                        Math.min(percent, 100));
+                } else {
+                    mismatched++;
+                    listener.onFileProcessed(entry.getKey(), "missing");
                 }
-
-                String msg = String.format("Copy & Verify Complete: %d files copied, %d matched, %d mismatched",
-                    totalFiles, matched, mismatched);
-                listener.onProgressUpdate(msg, 100);
-                listener.onCompletion(new JobResult(JobStatus.COMPLETED, msg,
-                    totalFiles, matched, mismatched, 0, totalFiles, new ArrayList<>()));
-            } else {
-                String msg = "rsync failed with exit code: " + exitCode;
-                listener.onProgressUpdate(msg, -1);
-                listener.onCompletion(new JobResult(JobStatus.FAILED, msg,
-                    0, 0, 0, 0, 0, Arrays.asList("rsync exit code: " + exitCode)));
+                int percent = 80 + (int)((double)(matched + mismatched) / Math.max(totalFiles, 1) * 20);
+                listener.onProgressUpdate("Verifying: " + matched + "/" + totalFiles + " files matched",
+                    Math.min(percent, 100));
             }
+
+            String msg = String.format("Copy & Verify Complete: %d files checked, %d matched, %d mismatched",
+                totalFiles, matched, mismatched);
+            listener.onProgressUpdate(msg, 100);
+            listener.onCompletion(new JobResult(JobStatus.COMPLETED, msg,
+                totalFiles, matched, mismatched, 0, totalFiles, new ArrayList<>()));
         } catch (IOException | InterruptedException | NoSuchAlgorithmException e) {
             throw new RuntimeException("Copy/Verify operation failed: " + e.getMessage(), e);
         }
     }
 
-    private static void runVerifyOnly(File sourceDir, File destDir,
-                                       Set<String> selectedSourceDirs,
-                                       Set<String> selectedDestDirs,
-                                       ProgressListener listener) {
+ private static void runVerifyOnly(File sourceDir, File destDir,
+                                        Set<String> selectedSourceFiles,
+                                        Set<String> selectedDestFiles,
+                                        ProgressListener listener) {
         try {
             listener.onProgressUpdate("Starting verification...", 0);
 
@@ -209,41 +222,22 @@ public class FileSyncEngine {
 
             for (Map.Entry<String, String> entry : sourceHashes.entrySet()) {
                 String fileName = entry.getKey();
+
+                // Check if file is selected in source
+                if (selectedSourceFiles != null && !selectedSourceFiles.isEmpty()) {
+                    if (!selectedSourceFiles.contains(fileName)) {
+                        continue;
+                    }
+                }
+
+                // Check if file is selected in destination
+                if (selectedDestFiles != null && !selectedDestFiles.isEmpty()) {
+                    if (!selectedDestFiles.contains(fileName)) {
+                        continue;
+                    }
+                }
+
                 File destFile = new File(destDir, fileName);
-
-                // Normalize parent directory path to forward slashes
-                String parentDir = new File(fileName).getParent();
-                if (parentDir != null) {
-                    parentDir = parentDir.replace(File.separator, "/");
-                }
-
-                // Check if parent directory is selected in source
-                if (parentDir != null && selectedSourceDirs != null && !selectedSourceDirs.isEmpty()) {
-                    boolean parentSelected = false;
-                    for (String sel : selectedSourceDirs) {
-                        if (parentDir.equals(sel) || parentDir.startsWith(sel + "/")) {
-                            parentSelected = true;
-                            break;
-                        }
-                    }
-                    if (!parentSelected) {
-                        continue;
-                    }
-                }
-
-                // Check if parent directory is selected in destination
-                if (parentDir != null && selectedDestDirs != null && !selectedDestDirs.isEmpty()) {
-                    boolean destParentSelected = false;
-                    for (String sel : selectedDestDirs) {
-                        if (parentDir.equals(sel) || parentDir.startsWith(sel + "/")) {
-                            destParentSelected = true;
-                            break;
-                        }
-                    }
-                    if (!destParentSelected) {
-                        continue;
-                    }
-                }
 
                 if (!destFile.exists()) {
                     missing++;

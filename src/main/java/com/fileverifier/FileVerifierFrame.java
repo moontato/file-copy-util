@@ -52,7 +52,7 @@ public class FileVerifierFrame extends JFrame {
         gbc.gridx = 0;
         gbc.gridy = 0;
         gbc.weightx = 0;
-        panel.add(new JLabel("Source:"), gbc);
+        panel.add(new JLabel("Source Directory:"), gbc);
 
         gbc.gridx = 1;
         gbc.weightx = 1.0;
@@ -75,7 +75,7 @@ public class FileVerifierFrame extends JFrame {
         gbc.gridx = 0;
         gbc.gridy = 1;
         gbc.weightx = 0;
-        panel.add(new JLabel("Destination:"), gbc);
+        panel.add(new JLabel("Destination Directory:"), gbc);
 
         gbc.gridx = 1;
         gbc.weightx = 1.0;
@@ -166,7 +166,7 @@ public class FileVerifierFrame extends JFrame {
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
         gbc.anchor = GridBagConstraints.CENTER;
-        JButton scanBtn = new JButton("Scan Directories");
+        JButton scanBtn = new JButton("Scan Files");
         scanBtn.setPreferredSize(new Dimension(200, 32));
         scanBtn.addActionListener(e -> scanDirectories());
         panel.add(scanBtn, gbc);
@@ -181,7 +181,7 @@ public class FileVerifierFrame extends JFrame {
         // Source directory list
         JPanel sourcePanel = new JPanel(new BorderLayout());
         sourcePanel.setBorder(BorderFactory.createTitledBorder(
-            BorderFactory.createLineBorder(Color.GRAY), "Source Directories"));
+            BorderFactory.createLineBorder(Color.GRAY), "Source Files"));
         sourceListModel = new DefaultListModel<>();
         sourceList = new JList<>(sourceListModel);
         sourceList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
@@ -222,7 +222,7 @@ public class FileVerifierFrame extends JFrame {
         // Dest directory list
         JPanel destPanel = new JPanel(new BorderLayout());
         destPanel.setBorder(BorderFactory.createTitledBorder(
-            BorderFactory.createLineBorder(Color.GRAY), "Destination Directories"));
+            BorderFactory.createLineBorder(Color.GRAY), "Destination Files"));
         destListModel = new DefaultListModel<>();
         destList = new JList<>(destListModel);
         destList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
@@ -282,7 +282,7 @@ public class FileVerifierFrame extends JFrame {
         panel.add(progressBar, BorderLayout.NORTH);
 
         // Status label
-        statusLabel = new JLabel("Ready. Select source and destination directories, then click Scan.");
+        statusLabel = new JLabel("Ready. Select source and destination directories, then click Scan Files.");
         statusLabel.setBorder(new EmptyBorder(2, 0, 2, 0));
         panel.add(statusLabel, BorderLayout.CENTER);
 
@@ -376,7 +376,7 @@ public class FileVerifierFrame extends JFrame {
         }
 
         scanning = true;
-        statusLabel.setText("Scanning directories...");
+        statusLabel.setText("Scanning files...");
         logArea.setText("");
 
         sourceListModel.clear();
@@ -385,21 +385,21 @@ public class FileVerifierFrame extends JFrame {
         SwingWorker<Void, Void> worker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
-                List<String> sourceDirs = DirectoryScanner.scanDirectories(sourceDir);
-                List<String> destDirs = DirectoryScanner.scanDirectories(destDir);
+                List<String> sourceFiles = DirectoryScanner.scanFiles(sourceDir);
+                List<String> destFiles = DirectoryScanner.scanFiles(destDir);
 
                 SwingUtilities.invokeLater(() -> {
-                    for (String dir : sourceDirs) {
-                        sourceListModel.addElement(new DirectoryEntry(dir, true));
+                    for (String file : sourceFiles) {
+                        sourceListModel.addElement(new DirectoryEntry(file, true));
                     }
-                    for (String dir : destDirs) {
-                        destListModel.addElement(new DirectoryEntry(dir, true));
+                    for (String file : destFiles) {
+                        destListModel.addElement(new DirectoryEntry(file, true));
                     }
                     scanning = false;
-                    statusLabel.setText(String.format("Scanned: %d source directories, %d destination directories",
-                        sourceDirs.size(), destDirs.size()));
-                    log("Scanned " + sourceDirs.size() + " source directories and " +
-                        destDirs.size() + " destination directories.");
+                    statusLabel.setText(String.format("Scanned: %d source files, %d destination files",
+                        sourceFiles.size(), destFiles.size()));
+                    log("Scanned " + sourceFiles.size() + " source files and " +
+                        destFiles.size() + " destination files.");
                 });
                 return null;
             }
@@ -435,7 +435,7 @@ public class FileVerifierFrame extends JFrame {
         File sourceDir = new File(sourcePath);
         File destDir = new File(destPath);
 
-        // Collect selected directories as relative paths
+        // Collect selected files as relative paths
         Set<String> selectedSource = new LinkedHashSet<>();
         String sourceAbs = sourceDir.getAbsolutePath();
         for (int i = 0; i < sourceListModel.size(); i++) {
@@ -469,8 +469,8 @@ public class FileVerifierFrame extends JFrame {
         log("Starting " + (jobType == FileSyncEngine.JobType.COPY_AND_VERIFY ? "Copy & Verify" : "Verify Only") + " job...");
         log("Source: " + sourcePath);
         log("Destination: " + destPath);
-        log("Selected source directories: " + selectedSource.size());
-        log("Selected destination directories: " + selectedDest.size());
+        log("Selected source files: " + selectedSource.size());
+        log("Selected destination files: " + selectedDest.size());
 
         progressBar.setValue(0);
         progressBar.setString("Running...");
