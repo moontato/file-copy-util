@@ -2,7 +2,6 @@ package com.fileverifier;
 
 import javax.swing.*;
 import java.awt.*;
-import java.io.File;
 
 public class FileVerifierApp {
 
@@ -16,12 +15,10 @@ public class FileVerifierApp {
             try {
                 FileVerifierFrame frame = new FileVerifierFrame();
                 frame.setVisible(true);
-            } catch (Exception e) {
-                JOptionPane.showMessageDialog(null,
-                    "Failed to start application: " + e.getMessage(),
-                    "Error", JOptionPane.ERROR_MESSAGE);
-                e.printStackTrace();
-            }
+       } catch (Exception e) {
+            System.err.println("Failed to start application: " + e.getMessage());
+            e.printStackTrace();
+        }
         });
     }
 }
