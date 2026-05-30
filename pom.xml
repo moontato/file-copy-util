@@ -4,12 +4,12 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.fileverifier</groupId>
-    <artifactId>file-verifier</artifactId>
+    <groupId>com.filecopyutil</groupId>
+    <artifactId>file-copy-util</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
-    <name>File Verifier</name>
+    <name>File Copy Util</name>
     <description>Copy and verify files between directories using rsync and SHA256 hashes</description>
 
     <properties>
