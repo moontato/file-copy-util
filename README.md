@@ -7,7 +7,8 @@ A Java GUI application for copying and verifying files between two directories u
 - **Copy & Verify** — Uses `rsync` to copy files, then verifies integrity with SHA-256 hashes
 - **Verify Only** — Compares SHA-256 hashes between source and destination without copying
 - **File Selection** — Recursively scans directories and displays all files with checkboxes to include/exclude
-- **Progress Tracking** — Real-time progress bar and detailed file-by-file logging
+- **Progress Tracking** — Real-time progress bar and detailed file-by-file logging with SHA-256 hash prefixes
+- **Smart Directory Selection** — File navigator opens at the previously selected path's parent for quick nearby folder picking
 - **Wayland Support** — Automatically detects Wayland sessions and falls back to X11 toolkit
 
 ## Requirements
@@ -39,8 +40,8 @@ java -jar target/file-copy-util-1.0.0.jar
 
 ### Workflow
 
-1. **Select Source Directory** — Click "Browse..." next to the source field to choose the source directory
-2. **Select Destination Directory** — Click "Browse..." next to the destination field to choose the destination directory
+1. **Select Source Directory** — Click "Browse..." next to the source field. The file navigator opens at the last selected path (or its parent) for easy nearby selection
+2. **Select Destination Directory** — Click "Browse..." next to the destination field. The navigator opens at the source directory's parent so you can quickly pick a sibling or nearby folder
 3. **Scan Files** — Click "Scan Files" to recursively scan both directories and populate the file lists
 4. **Select Files** — Use checkboxes to include/exclude files. Use "Select All" / "Deselect All" for convenience
 5. **Choose Job Type** — Toggle between "Copy & Verify" and "Verify Only"
