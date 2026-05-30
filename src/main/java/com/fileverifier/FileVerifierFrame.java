@@ -318,29 +318,83 @@ public class FileVerifierFrame extends JFrame {
     }
 
     private void browseDirectory(boolean isSource) {
-        JFileChooser fileChooser = new JFileChooser();
+        JTextField field = isSource ? sourcePathField : destPathField;
+
+        // Determine initial directory: prefer the other field's path
+        File initialDir = findValidStartDir(isSource);
+
+        JFileChooser fileChooser = new JFileChooser(initialDir);
         fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         fileChooser.setDialogTitle(isSource ? "Select Source Directory" : "Select Destination Directory");
 
-        // Set current directory from field if available
-        JTextField field = isSource ? sourcePathField : destPathField;
-        if (!field.getText().isEmpty()) {
-            File current = new File(field.getText());
-            if (current.exists()) {
-                fileChooser.setCurrentDirectory(current);
+        // Capture path at the exact moment the approve button is clicked
+        final String[] capturedPath = new String[1];
+        ActionListener approveListener = e -> {
+            if (JFileChooser.APPROVE_SELECTION.equals(e.getActionCommand())) {
+                File dir = fileChooser.getCurrentDirectory();
+                capturedPath[0] = dir.getAbsolutePath();
+            }
+        };
+        fileChooser.addActionListener(approveListener);
+
+        int result = fileChooser.showDialog(this, "Select Folder");
+        fileChooser.removeActionListener(approveListener);
+
+        if (result == JFileChooser.APPROVE_OPTION) {
+            String chosenPath;
+            if (capturedPath[0] != null) {
+                chosenPath = capturedPath[0];
+            } else {
+                chosenPath = fileChooser.getCurrentDirectory().getAbsolutePath();
+            }
+
+            field.setText(chosenPath);
+            File resolved = new File(chosenPath);
+            if (isSource) {
+                currentSourceDir = resolved;
+            } else {
+                currentDestDir = resolved;
+            }
+        }
+    }
+
+    private File findValidStartDir(boolean isSource) {
+        // The "other" field text (if source is being browsed, look at dest, and vice versa)
+        String otherText = (isSource ? destPathField : sourcePathField).getText().trim();
+        String ownText = (isSource ? sourcePathField : destPathField).getText().trim();
+
+        // Try the other directory first
+        if (!otherText.isEmpty()) {
+            File dir = new File(otherText);
+            if (dir.exists() && dir.isDirectory()) {
+                return dir.getParentFile() != null ? dir.getParentFile() : dir;
+            }
+            // Walk up parent chain to find a valid directory
+            File parent = dir.getParentFile();
+            while (parent != null) {
+                if (parent.exists() && parent.isDirectory()) {
+                    return parent;
+                }
+                parent = parent.getParentFile();
             }
         }
 
-        int result = fileChooser.showDialog(this, "Select Folder");
-        if (result == JFileChooser.APPROVE_OPTION) {
-            File selected = fileChooser.getSelectedFile();
-            field.setText(selected.getAbsolutePath());
-            if (isSource) {
-                currentSourceDir = selected;
-            } else {
-                currentDestDir = selected;
+        // Fall back to own directory
+        if (!ownText.isEmpty()) {
+            File dir = new File(ownText);
+            if (dir.exists() && dir.isDirectory()) {
+                return dir.getParentFile() != null ? dir.getParentFile() : dir;
+            }
+            File parent = dir.getParentFile();
+            while (parent != null) {
+                if (parent.exists() && parent.isDirectory()) {
+                    return parent;
+                }
+                parent = parent.getParentFile();
             }
         }
+
+        return null;
     }
 
     private void scanDirectories() {
