@@ -55,7 +55,7 @@ public class FileSyncEngine {
 
     public interface ProgressListener {
         void onProgressUpdate(String message, int percent);
-        void onFileProcessed(String fileName, String status);
+        void onFileProcessed(String fileName, String status, String srcHash, String dstHash);
         void onCompletion(JobResult result);
     }
 
@@ -132,7 +132,7 @@ public class FileSyncEngine {
                         }
                         if (line.startsWith("rsync: ") || line.startsWith("ERROR") ||
                             line.startsWith("failed") || line.startsWith("error")) {
-                            listener.onFileProcessed(line.trim(), "error");
+                            listener.onFileProcessed(line.trim(), "error", "", "");
                         }
                     }
                 }
@@ -181,15 +181,20 @@ public class FileSyncEngine {
                 File destFile = new File(destDir, entry.getKey());
                 if (destFile.exists()) {
                     String destHash = FileHasher.computeHash(destFile);
-                    if (destHash.equals(entry.getValue())) {
+                    String srcHash = entry.getValue();
+                    if (destHash.equals(srcHash)) {
                         matched++;
                     } else {
                         mismatched++;
-                        listener.onFileProcessed(entry.getKey(), "mismatch");
+                        listener.onFileProcessed(entry.getKey(), "mismatch",
+                            srcHash.length() >= 5 ? srcHash.substring(0, 5) : srcHash,
+                            destHash.length() >= 5 ? destHash.substring(0, 5) : destHash);
                     }
                 } else {
                     mismatched++;
-                    listener.onFileProcessed(entry.getKey(), "missing");
+                    listener.onFileProcessed(entry.getKey(), "missing",
+                        entry.getValue().length() >= 5 ? entry.getValue().substring(0, 5) : entry.getValue(),
+                        "");
                 }
                 int percent = 80 + (int)((double)(matched + mismatched) / Math.max(totalFiles, 1) * 20);
                 listener.onProgressUpdate("Verifying: " + matched + "/" + totalFiles + " files matched",
@@ -241,15 +246,22 @@ public class FileSyncEngine {
 
                 if (!destFile.exists()) {
                     missing++;
-                    listener.onFileProcessed(fileName, "missing");
+                    String srcHash = entry.getValue();
+                    listener.onFileProcessed(fileName, "missing",
+                        srcHash.length() >= 5 ? srcHash.substring(0, 5) : srcHash, "");
                 } else {
                     String destHash = FileHasher.computeHash(destFile);
-                    if (destHash.equals(entry.getValue())) {
+                    String srcHash = entry.getValue();
+                    if (destHash.equals(srcHash)) {
                         matched++;
-                        listener.onFileProcessed(fileName, "match");
+                        listener.onFileProcessed(fileName, "match",
+                            srcHash.length() >= 5 ? srcHash.substring(0, 5) : srcHash,
+                            destHash.length() >= 5 ? destHash.substring(0, 5) : destHash);
                     } else {
                         mismatched++;
-                        listener.onFileProcessed(fileName, "mismatch");
+                        listener.onFileProcessed(fileName, "mismatch",
+                            srcHash.length() >= 5 ? srcHash.substring(0, 5) : srcHash,
+                            destHash.length() >= 5 ? destHash.substring(0, 5) : destHash);
                     }
                 }
 

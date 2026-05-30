@@ -543,7 +543,7 @@ public class FileVerifierFrame extends JFrame {
                 }
 
                 @Override
-                public void onFileProcessed(String fileName, String status) {
+                public void onFileProcessed(String fileName, String status, String srcHash, String dstHash) {
                     SwingUtilities.invokeLater(() -> {
                         String icon = switch (status) {
                             case "match" -> "[OK]";
@@ -552,6 +552,10 @@ public class FileVerifierFrame extends JFrame {
                             case "error" -> "[ERROR]";
                             default -> "[INFO]";
                         };
+                        if (!srcHash.isEmpty() && !dstHash.isEmpty()) {
+                            log("  src: " + srcHash);
+                            log("  dst: " + dstHash);
+                        }
                         log("  " + icon + " " + fileName);
                     });
                 }
