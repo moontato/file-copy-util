@@ -63,7 +63,7 @@ public class FileSyncEngine {
                                Set<String> selectedSourceDirs, Set<String> selectedDestDirs,
                                ProgressListener listener) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
-        Future<?> future = executor.submit(() -> {
+        executor.submit(() -> {
             try {
                 if (jobType == JobType.COPY_AND_VERIFY) {
                     runCopyAndVerify(sourceDir, destDir, selectedSourceDirs, listener);
@@ -74,17 +74,10 @@ public class FileSyncEngine {
                 listener.onCompletion(new JobResult(JobStatus.FAILED,
                     "Job failed: " + e.getMessage(), 0, 0, 0, 0, 0,
                     Arrays.asList(e.getMessage())));
+            } finally {
+                executor.shutdown();
             }
         });
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.MINUTES)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 
   private static void runCopyAndVerify(File sourceDir, File destDir,
@@ -120,6 +113,7 @@ public class FileSyncEngine {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(process.getInputStream()))) {
                     String line;
+                    long lastHeartbeat = System.currentTimeMillis();
                     while ((line = reader.readLine()) != null) {
                         if (line.contains("transferring")) {
                             listener.onProgressUpdate("Transferring files...", 25);
@@ -133,6 +127,11 @@ public class FileSyncEngine {
                         if (line.startsWith("rsync: ") || line.startsWith("ERROR") ||
                             line.startsWith("failed") || line.startsWith("error")) {
                             listener.onFileProcessed(line.trim(), "error", "", "");
+                        }
+                        long now = System.currentTimeMillis();
+                        if (now - lastHeartbeat > 5000) {
+                            listener.onProgressUpdate("Copying files... (still running)", 30);
+                            lastHeartbeat = now;
                         }
                     }
                 }
@@ -160,9 +159,15 @@ public class FileSyncEngine {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(process.getInputStream()))) {
                     String line;
+                    long lastHeartbeat = System.currentTimeMillis();
                     while ((line = reader.readLine()) != null) {
                         if (line.contains("transferring")) {
                             listener.onProgressUpdate("Transferring files...", 25);
+                        }
+                        long now = System.currentTimeMillis();
+                        if (now - lastHeartbeat > 5000) {
+                            listener.onProgressUpdate("Copying files... (still running)", 30);
+                            lastHeartbeat = now;
                         }
                     }
                 }
