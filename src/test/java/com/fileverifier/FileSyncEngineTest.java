@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,8 +36,8 @@ class FileSyncEngineTest {
         rec = new TestSupport.Recorder();
     }
 
-    private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, Set<String> srcSel, Set<String> dstSel) {
-        return FileSyncEngine.execute(source.toFile(), dest.toFile(), type, srcSel, dstSel, rec);
+    private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel, FileSyncEngine.Selection dstSel) {
+        return FileSyncEngine.runOnce(source.toFile(), dest.toFile(), type, srcSel, dstSel, rec);
     }
 
     private static void assumeRsync() {
@@ -50,7 +51,7 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("a.txt"), "a");
         TestSupport.write(source.resolve("nested/b.txt"), "b");
 
-        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY, Set.of(), Set.of());
+        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.none(), TestSupport.none());
 
         assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
         assertTrue(result.message().contains("selection is empty"), result.message());
@@ -69,11 +70,31 @@ class FileSyncEngineTest {
         TestSupport.write(dest.resolve("b.txt"), "b");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
-                TestSupport.selection("a.txt", "b.txt"), TestSupport.selection("a.txt"));
+                TestSupport.selection("a.txt", "b.txt"),
+                TestSupport.knownRows(Set.of("a.txt", "b.txt"), "a.txt"));
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(1, result.filesChecked());
         assertEquals(1, result.filesMatched());
+    }
+
+    @Test
+    void staleDestinationListDoesNotSilentlySkipFiles() throws Exception {
+        // The GUI exposed this: after a copy job the destination list can be stale. "Not in the
+        // list" must not be read as "the user unticked it", or verification would silently skip
+        // the very files that were just copied.
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+        TestSupport.write(dest.resolve("a.txt"), "a");
+        TestSupport.write(dest.resolve("b.txt"), "b");
+
+        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selection("a.txt", "b.txt"),
+                TestSupport.knownRows(Set.of()));
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(2, result.filesChecked());
+        assertEquals(2, result.filesMatched());
     }
 
     @Test
@@ -101,7 +122,7 @@ class FileSyncEngineTest {
         TestSupport.write(dest.resolve("a.txt"), "a");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
-                TestSupport.selection("a.txt"), Set.of());
+                TestSupport.selection("a.txt"), TestSupport.knownRows(Set.of("a.txt")));
 
         assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
         assertEquals(0, result.filesChecked());
@@ -118,7 +139,7 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("other/deep/skip2.txt"), "junk\n");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selection("keep1.txt", "sub/keep2.txt"), Set.of());
+                TestSupport.selection("keep1.txt", "sub/keep2.txt"), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(2, result.filesChecked());
@@ -142,7 +163,7 @@ class FileSyncEngineTest {
         TestSupport.write(dest.resolve("stale.txt"), "different version\n");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selection("keep.txt"), Set.of());
+                TestSupport.selection("keep.txt"), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(1, result.filesChecked());
@@ -164,14 +185,14 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("three.txt"), "3\n");
 
         FileSyncEngine.JobResult first = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selectAllOf(source), Set.of());
+                TestSupport.selectAllOf(source), TestSupport.none());
         assertTrue(first.isSuccess(), first.message());
         assertEquals(3, first.filesCopied());
 
         // Second run over identical content: rsync transfers nothing, so nothing may be reported as copied.
         rec = new TestSupport.Recorder();
         FileSyncEngine.JobResult second = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selectAllOf(source), Set.of());
+                TestSupport.selectAllOf(source), TestSupport.none());
         assertTrue(second.isSuccess(), second.message());
         assertEquals(0, second.filesCopied(), "filesCopied must be measured from rsync output");
         assertEquals(3, second.filesMatched());
@@ -192,7 +213,7 @@ class FileSyncEngineTest {
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
                 TestSupport.selection("match.txt", "mismatch.txt", "missing.txt"),
-                TestSupport.selection("match.txt", "mismatch.txt", "missing.txt"));
+                TestSupport.selection("match.txt", "mismatch.txt"));
 
         assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status());
         assertEquals(3, result.filesChecked());
@@ -224,7 +245,7 @@ class FileSyncEngineTest {
         TestSupport.write(dest.resolve("stale.txt"), "stale destination copy\n");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selection("keep.txt", "stale.txt"), Set.of());
+                TestSupport.selection("keep.txt", "stale.txt"), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(2, result.filesChecked());
@@ -267,7 +288,7 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("b.txt"), "b\n");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selectAllOf(source), Set.of());
+                TestSupport.selectAllOf(source), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(100, rec.lastPercent());
@@ -275,6 +296,22 @@ class FileSyncEngineTest {
         assertTrue(rec.phases.stream().anyMatch(p -> p.contains("rsync finished")), rec.phases.toString());
         assertTrue(rec.phases.stream().anyMatch(p -> p.startsWith("Work set: 2 selected")), rec.phases.toString());
         assertTrue(rec.files.stream().anyMatch(f -> f.status().equals("copied")), rec.files.toString());
+    }
+
+    @Test
+    void copyPhaseProgressIsAnnouncementBoundedThenVerified() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(source.resolve("b.txt"), "b\n");
+
+        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selectAllOf(source), TestSupport.none());
+        assertTrue(result.isSuccess(), result.message());
+
+        // 2 files announced over 0..ANNOUNCE_PROGRESS_END, then the bar may only reach
+        // COPY_PROGRESS_END once rsync has actually exited, then 70..100 for verification.
+        assertEquals(List.of(20, 40, FileSyncEngine.COPY_PROGRESS_END, 85, 100), rec.percents,
+                rec.percents.toString());
     }
 
     // ---------------------------------------------------------------- B7
@@ -297,7 +334,7 @@ class FileSyncEngineTest {
                 PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_EXECUTE));
         try {
             FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                    TestSupport.selection("file.txt"), Set.of());
+                    TestSupport.selection("file.txt"), TestSupport.none());
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("rsync failed"), result.message());
@@ -313,14 +350,14 @@ class FileSyncEngineTest {
 
     @Test
     void validationRejectsMissingDirectoriesAndIdenticalPaths() {
-        FileSyncEngine.JobResult sameDir = FileSyncEngine.execute(source.toFile(), source.toFile(),
-                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), Set.of(), rec);
+        FileSyncEngine.JobResult sameDir = FileSyncEngine.runOnce(source.toFile(), source.toFile(),
+                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), TestSupport.none(), rec);
         assertEquals(FileSyncEngine.JobStatus.FAILED, sameDir.status());
         assertTrue(sameDir.message().contains("same directory"), sameDir.message());
 
         rec = new TestSupport.Recorder();
-        FileSyncEngine.JobResult missing = FileSyncEngine.execute(source.resolve("nope").toFile(), dest.toFile(),
-                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), Set.of(), rec);
+        FileSyncEngine.JobResult missing = FileSyncEngine.runOnce(source.resolve("nope").toFile(), dest.toFile(),
+                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), TestSupport.none(), rec);
         assertEquals(FileSyncEngine.JobStatus.FAILED, missing.status());
         assertTrue(missing.message().contains("Source directory does not exist"), missing.message());
     }
@@ -334,7 +371,7 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("bad\nname.txt"), "bad\n");
 
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selection("good.txt", "bad\nname.txt"), Set.of());
+                TestSupport.selection("good.txt", "bad\nname.txt"), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
         assertTrue(result.warnings().stream().anyMatch(w -> w.contains("newline")), result.warnings().toString());
@@ -397,5 +434,6 @@ class FileSyncEngineTest {
         assertNotNull(rec.result);
         assertEquals(1, rec.completions, "onCompletion must fire exactly once");
         assertEquals(returned, rec.result);
+        assertTrue(rec.awaitCompletion(2000));
     }
 }

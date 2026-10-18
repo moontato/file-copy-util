@@ -9,6 +9,8 @@ import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /** Shared helpers for the test suite. */
@@ -40,15 +42,28 @@ final class TestSupport {
         return file;
     }
 
-    static Set<String> selection(String... relPaths) {
-        return new LinkedHashSet<>(Arrays.asList(relPaths));
+    /** A selection where every listed path is also a row in the list (i.e. all ticked). */
+    static FileSyncEngine.Selection selection(String... relPaths) {
+        Set<String> s = new LinkedHashSet<>(Arrays.asList(relPaths));
+        return new FileSyncEngine.Selection(s, s);
+    }
+
+    /** Rows that exist in the list, of which only {@code selected} are ticked. */
+    static FileSyncEngine.Selection knownRows(Set<String> known, String... selected) {
+        return new FileSyncEngine.Selection(
+                new LinkedHashSet<>(Arrays.asList(selected)), new LinkedHashSet<>(known));
+    }
+
+    static FileSyncEngine.Selection none() {
+        return FileSyncEngine.Selection.none();
     }
 
     /** Convenience for "select everything the scanner found under dir". */
-    static Set<String> selectAllOf(Path dir) {
-        return DirectoryScanner.scanFiles(dir).files().stream()
+    static FileSyncEngine.Selection selectAllOf(Path dir) {
+        Set<String> all = DirectoryScanner.scanFiles(dir).files().stream()
                 .map(FileEntry::relPath)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
+        return new FileSyncEngine.Selection(all, all);
     }
 
     static List<String> relPathsUnder(Path dir) {
@@ -57,7 +72,7 @@ final class TestSupport {
                 .toList();
     }
 
-    static final class Recorder implements FileSyncEngine.ProgressListener {
+    static class Recorder implements FileSyncEngine.ProgressListener {
         record FileEvent(String relPath, String status, String srcHash, String dstHash) {
         }
 
@@ -67,6 +82,17 @@ final class TestSupport {
         final List<FileEvent> files = new ArrayList<>();
         int completions;
         FileSyncEngine.JobResult result;
+        private final CountDownLatch completionLatch = new CountDownLatch(1);
+
+        /** For jobs started asynchronously: blocks until onCompletion has fired. */
+        boolean awaitCompletion(long millis) {
+            try {
+                return completionLatch.await(millis, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
 
         @Override
         public void onPhase(String message) {
@@ -88,6 +114,7 @@ final class TestSupport {
         public void onCompletion(FileSyncEngine.JobResult result) {
             completions++;
             this.result = result;
+            completionLatch.countDown();
         }
 
         List<String> pathsWithStatus(String status) {

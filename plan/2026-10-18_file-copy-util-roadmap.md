@@ -117,6 +117,7 @@ Job cancellation, `Process.destroy()`, engine lifecycle/state machine, hash para
 | 3.7 | Perf: hash only the work set (both modes), reuse pre-copy source hashes for post-copy verification, bounded hash thread pool | Copy & Verify hashes each selected file once |
 | 3.8 | Search/filter box on both lists; relative paths shown in the lists | large selections usable |
 | 3.9 | Preferences: persist last source/dest/ignore list (`Preferences` API) | restart keeps context |
+| 3.10 | Real transfer progress: parse `rsync --progress` per-file completion instead of announcement counts, so the bar moves during a single large file | bar advances during a 10 GB file, not just at announcements |
 
 ## Phase 4 — Packaging, docs, hygiene
 
@@ -175,3 +176,32 @@ Engine tests are headless. The GUI was additionally smoke-driven under Xvfb with
 ### Deferred by design
 
 Phase 2 (cancel, engine-owned lifecycle, watchdog liveness, `IDLE`/`RUNNING` wiring - Phase 1 added only the `jobRunning` guard plus disabling Run), then Phases 3 and 4 as listed.
+
+---
+
+## Phase 2 completion record (2026-10-18)
+
+**Done.** `mvn -B clean verify` is green: 45 tests (9 scanner, 6 hasher, 20 semantics, 10 lifecycle), 0 failures.
+
+| Phase 2 item | Result |
+|---|---|
+| 2.1 engine-owned lifecycle | `FileSyncEngine` is now an instance (`AutoCloseable`) with `start()` (refused while a job runs), `execute()`, `cancel()`, `isRunning()`, `status()`, `lastResult()`, `close()`; `IDLE → RUNNING → COMPLETED/FAILED` all used, enforced by an `AtomicBoolean` CAS so only one job can ever hold the engine |
+| 2.2 cancellation | the live `Process` is retained; `cancel()` kills it plus `process.descendants()`; the job finishes with `FAILED`, the partial counters it reached, and a warning about hidden rsync temp files. Test asserts **no rsync process outlives the job** |
+| 2.3 GUI wiring | one `setJobControlsEnabled(boolean)` switches Run↔Cancel and disables Scan, both Browse buttons, both mode toggles and the timeout field; closing the window calls `engine.close()` |
+| 2.4 liveness | engine records `lastActivity` + timestamp (rsync output line or "verified <path>"); a `javax.swing.Timer` in the frame reports "Still running - last activity Ns ago (…)" after 3s of silence |
+| 2.5 timeout | `setJobTimeoutMillis` / GUI "Timeout (s, 0 = none)" field, default `NO_TIMEOUT`; a 250 ms scheduled watchdog kills the process past the deadline, and the job fails with a timeout message |
+| 2.6 tests | `FileSyncEngineLifecycleTest`: status transitions, second `start()` refused + `execute()` throwing while busy, engine reuse, `close()` rejects jobs, cancel mid-transfer (+ no orphan rsync), cancel mid-verification, timeout mid-copy, timeout mid-verification, default no-timeout |
+
+### Findings that changed the design
+
+6. **rsync prints every itemize line before it moves the data** (measured: all 3 lines at 0.469 s, job finished at 1.559 s). So `filesCopied` counts *announced* transfers - accurate for completed jobs, potentially overstated for cancelled ones (documented in `JobResult`). The copy phase of the bar is therefore capped at 40% by announcements and only reaches 70% when rsync actually exits.
+7. **A stale destination list silently excluded files from Verify Only** (found by driving the real frame: after a copy job, the freshly copied files had no destination rows and were skipped). Fixed by replacing bare sets with `Selection(selected, known)`: exclusion now requires a row the user's list actually contains but left unticked. The engine also stopped rescanning the destination (it now trusts the caller's `known` rows), which removes a full directory walk per verify job.
+8. **The timeout has to be enforced per work unit, not at loop tops**: a 1 s timeout did not fail a job whose hashing overran the deadline. Checks were added after each file's work and after the loop.
+
+### GUI verification (Xvfb, scratch harness)
+
+Idle controls enabled → job started: Run/Scan/Browse/mode/timeout disabled, Cancel enabled, engine `RUNNING`; second Run Job ignored; bar held at 40% during a silent 8 GB transfer with "Still running - last activity Ns ago (rsync: >f+++++++++ zz-huge.bin)"; after Cancel: controls restored, engine `FAILED`, exit 137, no orphan rsync; timeout job (`Timeout = 1`) aborted with partial counters.
+
+### Roadmap update
+
+Added 3.10 (true transfer progress via `rsync --progress` per-file completion) to Phase 3, since 2.4/finding 6 show that announcement-based progress cannot fill the bar during a long transfer.

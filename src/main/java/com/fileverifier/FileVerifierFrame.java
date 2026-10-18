@@ -6,7 +6,8 @@ import java.awt.*;
 import java.awt.event.*;
 import java.io.File;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 public class FileVerifierFrame extends JFrame {
 
@@ -22,8 +23,20 @@ public class FileVerifierFrame extends JFrame {
     private JLabel statusLabel;
 
     private boolean scanning = false;
-    private boolean jobRunning = false;
+
+    /** One engine per window: it owns at most one job at a time. */
+    private final FileSyncEngine engine = new FileSyncEngine();
+
     private JButton runButton;
+    private JButton cancelButton;
+    private JButton sourceBrowseButton;
+    private JButton destBrowseButton;
+    private JButton scanButton;
+    private JButton copyVerifyButton;
+    private JButton verifyOnlyButton;
+    private JTextField jobTimeoutField;
+    private Timer livenessTimer;
+
     private FileSyncEngine.JobType currentJobType = FileSyncEngine.JobType.COPY_AND_VERIFY;
 
     public FileVerifierFrame() {
@@ -32,6 +45,14 @@ public class FileVerifierFrame extends JFrame {
         setSize(1100, 800);
         setLocationRelativeTo(null);
         initComponents();
+
+        livenessTimer = new Timer(1000, e -> updateLiveness());
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                engine.close();
+            }
+        });
     }
 
     private void initComponents() {
@@ -67,9 +88,9 @@ public class FileVerifierFrame extends JFrame {
         gbc.gridx = 2;
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
-        JButton sourceBrowseBtn = new JButton("Browse...");
-        sourceBrowseBtn.addActionListener(e -> browseDirectory(true));
-        panel.add(sourceBrowseBtn, gbc);
+        sourceBrowseButton = new JButton("Browse...");
+        sourceBrowseButton.addActionListener(e -> browseDirectory(true));
+        panel.add(sourceBrowseButton, gbc);
 
         // Destination path
         gbc.gridx = 0;
@@ -90,9 +111,9 @@ public class FileVerifierFrame extends JFrame {
         gbc.gridx = 2;
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
-        JButton destBrowseBtn = new JButton("Browse...");
-        destBrowseBtn.addActionListener(e -> browseDirectory(false));
-        panel.add(destBrowseBtn, gbc);
+        destBrowseButton = new JButton("Browse...");
+        destBrowseButton.addActionListener(e -> browseDirectory(false));
+        panel.add(destBrowseButton, gbc);
 
         // Job type toggle
         gbc.gridx = 0;
@@ -109,54 +130,20 @@ public class FileVerifierFrame extends JFrame {
         togglePanel.setBorder(BorderFactory.createTitledBorder(
             BorderFactory.createLineBorder(Color.GRAY), "Operation Mode"));
 
-        JButton copyVerifyBtn = new JButton("Copy & Verify");
-        copyVerifyBtn.setFocusPainted(false);
-        copyVerifyBtn.setBackground(new Color(59, 130, 246));
-        copyVerifyBtn.setForeground(Color.WHITE);
-        copyVerifyBtn.setPreferredSize(new Dimension(150, 28));
-        copyVerifyBtn.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(new Color(30, 100, 200), 2),
-            new EmptyBorder(3, 8, 3, 8)));
+        copyVerifyButton = new JButton("Copy & Verify");
+        copyVerifyButton.setFocusPainted(false);
+        copyVerifyButton.setPreferredSize(new Dimension(150, 28));
 
-        JButton verifyOnlyBtn = new JButton("Verify Only");
-        verifyOnlyBtn.setFocusPainted(false);
-        verifyOnlyBtn.setBackground(Color.WHITE);
-        verifyOnlyBtn.setForeground(Color.GRAY);
-        verifyOnlyBtn.setPreferredSize(new Dimension(120, 28));
-        verifyOnlyBtn.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color.GRAY, 1),
-            new EmptyBorder(3, 8, 3, 8)));
+        verifyOnlyButton = new JButton("Verify Only");
+        verifyOnlyButton.setFocusPainted(false);
+        verifyOnlyButton.setPreferredSize(new Dimension(120, 28));
 
-        copyVerifyBtn.addActionListener(e -> {
-            currentJobType = FileSyncEngine.JobType.COPY_AND_VERIFY;
-            copyVerifyBtn.setBackground(new Color(59, 130, 246));
-            copyVerifyBtn.setForeground(Color.WHITE);
-            copyVerifyBtn.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(30, 100, 200), 2),
-                new EmptyBorder(3, 8, 3, 8)));
-            verifyOnlyBtn.setBackground(Color.WHITE);
-            verifyOnlyBtn.setForeground(Color.GRAY);
-            verifyOnlyBtn.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(Color.GRAY, 1),
-                new EmptyBorder(3, 8, 3, 8)));
-        });
+        copyVerifyButton.addActionListener(e -> selectJobType(FileSyncEngine.JobType.COPY_AND_VERIFY));
+        verifyOnlyButton.addActionListener(e -> selectJobType(FileSyncEngine.JobType.VERIFY_ONLY));
+        selectJobType(FileSyncEngine.JobType.COPY_AND_VERIFY);
 
-        verifyOnlyBtn.addActionListener(e -> {
-            currentJobType = FileSyncEngine.JobType.VERIFY_ONLY;
-            verifyOnlyBtn.setBackground(new Color(59, 130, 246));
-            verifyOnlyBtn.setForeground(Color.WHITE);
-            verifyOnlyBtn.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(30, 100, 200), 2),
-                new EmptyBorder(3, 8, 3, 8)));
-            copyVerifyBtn.setBackground(Color.WHITE);
-            copyVerifyBtn.setForeground(Color.GRAY);
-            copyVerifyBtn.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(Color.GRAY, 1),
-                new EmptyBorder(3, 8, 3, 8)));
-        });
-
-        togglePanel.add(copyVerifyBtn);
-        togglePanel.add(verifyOnlyBtn);
+        togglePanel.add(copyVerifyButton);
+        togglePanel.add(verifyOnlyButton);
         panel.add(togglePanel, gbc);
 
         // Scan button
@@ -166,10 +153,10 @@ public class FileVerifierFrame extends JFrame {
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
         gbc.anchor = GridBagConstraints.CENTER;
-        JButton scanBtn = new JButton("Scan Files");
-        scanBtn.setPreferredSize(new Dimension(200, 32));
-        scanBtn.addActionListener(e -> scanDirectories());
-        panel.add(scanBtn, gbc);
+        scanButton = new JButton("Scan Files");
+        scanButton.setPreferredSize(new Dimension(200, 32));
+        scanButton.addActionListener(e -> scanDirectories());
+        panel.add(scanButton, gbc);;
 
         return panel;
     }
@@ -298,16 +285,32 @@ public class FileVerifierFrame extends JFrame {
         logScrollPane.setPreferredSize(new Dimension(0, 150));
         panel.add(logScrollPane, BorderLayout.SOUTH);
 
-        // Run button
+        // Run / Cancel + job timeout
         JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 5));
-        JButton runBtn = new JButton("Run Job");
-        runBtn.setPreferredSize(new Dimension(130, 32));
-        runBtn.setBackground(new Color(34, 197, 94));
-        runBtn.setForeground(Color.WHITE);
-        runBtn.setFocusPainted(false);
-        runBtn.addActionListener(e -> runJob());
-        buttonPanel.add(runBtn);
-        runButton = runBtn;
+
+        buttonPanel.add(new JLabel("Timeout (s, 0 = none):"));
+        jobTimeoutField = new JTextField("0");
+        jobTimeoutField.setPreferredSize(new Dimension(50, 28));
+        jobTimeoutField.setHorizontalAlignment(JTextField.RIGHT);
+        jobTimeoutField.setToolTipText("Kill rsync if the whole job takes longer than this.");
+        buttonPanel.add(jobTimeoutField);
+
+        runButton = new JButton("Run Job");
+        runButton.setPreferredSize(new Dimension(130, 32));
+        runButton.setBackground(new Color(34, 197, 94));
+        runButton.setForeground(Color.WHITE);
+        runButton.setFocusPainted(false);
+        runButton.addActionListener(e -> runJob());
+        buttonPanel.add(runButton);
+
+        cancelButton = new JButton("Cancel");
+        cancelButton.setPreferredSize(new Dimension(110, 32));
+        cancelButton.setBackground(new Color(239, 68, 68));
+        cancelButton.setForeground(Color.WHITE);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setEnabled(false);
+        cancelButton.addActionListener(e -> requestCancel());
+        buttonPanel.add(cancelButton);
 
         JButton clearLogBtn = new JButton("Clear Log");
         clearLogBtn.addActionListener(e -> logArea.setText(""));
@@ -316,6 +319,69 @@ public class FileVerifierFrame extends JFrame {
         panel.add(buttonPanel, BorderLayout.EAST);
 
         return panel;
+    }
+
+    private void selectJobType(FileSyncEngine.JobType jobType) {
+        if (engine.isRunning()) {
+            return;
+        }
+        currentJobType = jobType;
+        boolean copyMode = jobType == FileSyncEngine.JobType.COPY_AND_VERIFY;
+        styleModeButton(copyVerifyButton, copyMode);
+        styleModeButton(verifyOnlyButton, !copyMode);
+    }
+
+    private static void styleModeButton(JButton button, boolean active) {
+        button.setBackground(active ? new Color(59, 130, 246) : Color.WHITE);
+        button.setForeground(active ? Color.WHITE : Color.GRAY);
+        button.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(active ? new Color(30, 100, 200) : Color.GRAY,
+                active ? 2 : 1),
+            new EmptyBorder(3, 8, 3, 8)));
+    }
+
+    /** Long job timeout in millis; 0 = no timeout. Invalid input falls back to no timeout. */
+    private long jobTimeoutMillis() {
+        try {
+            long seconds = Long.parseLong(jobTimeoutField.getText().trim());
+            return seconds <= 0 ? FileSyncEngine.NO_TIMEOUT : seconds * 1000L;
+        } catch (NumberFormatException e) {
+            return FileSyncEngine.NO_TIMEOUT;
+        }
+    }
+
+    /** Single place that decides what the user may touch while a job runs. */
+    private void setJobControlsEnabled(boolean idle) {
+        runButton.setEnabled(idle);
+        scanButton.setEnabled(idle);
+        sourceBrowseButton.setEnabled(idle);
+        destBrowseButton.setEnabled(idle);
+        copyVerifyButton.setEnabled(idle);
+        verifyOnlyButton.setEnabled(idle);
+        jobTimeoutField.setEnabled(idle);
+        cancelButton.setEnabled(!idle);
+    }
+
+    private void requestCancel() {
+        if (!engine.isRunning()) {
+            return;
+        }
+        cancelButton.setEnabled(false);
+        log("Cancellation requested - terminating rsync...");
+        statusLabel.setText("Cancelling...");
+        engine.cancel();
+    }
+
+    /** Liveness display driven by a timer, not by rsync output (a long transfer is silent). */
+    private void updateLiveness() {
+        if (!engine.isRunning()) {
+            return;
+        }
+        long seconds = engine.millisSinceLastActivity() / 1000;
+        if (seconds >= 3) {
+            statusLabel.setText(String.format("Still running - last activity %ds ago (%s)",
+                seconds, engine.lastActivityDescription()));
+        }
     }
 
     private void browseDirectory(boolean isSource) {
@@ -427,6 +493,11 @@ public class FileVerifierFrame extends JFrame {
         Path source = sourceDir.toPath();
         Path dest = destDir.toPath();
 
+        if (engine.isRunning()) {
+            log("A job is already running - wait for it or press Cancel.");
+            return;
+        }
+
         scanning = true;
         statusLabel.setText("Scanning files...");
         logArea.setText("");
@@ -499,7 +570,7 @@ public class FileVerifierFrame extends JFrame {
     }
 
     private void runJob() {
-        if (jobRunning) {
+        if (engine.isRunning()) {
             return;
         }
 
@@ -534,23 +605,32 @@ public class FileVerifierFrame extends JFrame {
             return;
         }
 
-        // Selection is a set of relative paths straight from the scanner's FileEntry - an empty
-        // set means "no files", so it must never reach the engine.
+        // Selection is built straight from the scanner's FileEntry rows. An empty selection means
+        // "no files", so it must never reach the engine.
         Set<String> selectedSource = new LinkedHashSet<>();
+        Set<String> sourceRows = new LinkedHashSet<>();
         for (int i = 0; i < sourceListModel.size(); i++) {
             DirectoryEntry entry = sourceListModel.getElementAt(i);
+            sourceRows.add(entry.relPath());
             if (entry.selected()) {
                 selectedSource.add(entry.relPath());
             }
         }
 
         Set<String> selectedDest = new LinkedHashSet<>();
+        Set<String> destinationRows = new LinkedHashSet<>();
         for (int i = 0; i < destListModel.size(); i++) {
             DirectoryEntry entry = destListModel.getElementAt(i);
+            destinationRows.add(entry.relPath());
             if (entry.selected()) {
                 selectedDest.add(entry.relPath());
             }
         }
+
+        FileSyncEngine.Selection sourceSelection =
+            new FileSyncEngine.Selection(selectedSource, sourceRows);
+        FileSyncEngine.Selection destinationSelection =
+            new FileSyncEngine.Selection(selectedDest, destinationRows);
 
         FileSyncEngine.JobType jobType = currentJobType;
 
@@ -563,21 +643,17 @@ public class FileVerifierFrame extends JFrame {
         }
         if (jobType == FileSyncEngine.JobType.VERIFY_ONLY) {
             // Mirror the engine's work-set rule so the user gets a dialog instead of a failed job.
-            Set<String> destinationRows = new HashSet<>();
-            for (int i = 0; i < destListModel.size(); i++) {
-                destinationRows.add(destListModel.getElementAt(i).relPath());
-            }
             int planned = 0;
             for (String rel : selectedSource) {
-                if (selectedDest.contains(rel) || !destinationRows.contains(rel)) {
+                if (!(destinationRows.contains(rel) && !selectedDest.contains(rel))) {
                     planned++;
                 }
             }
             if (planned == 0) {
                 JOptionPane.showMessageDialog(this,
-                    "Verify Only would check 0 files: every selected source file exists in the "
-                        + "destination but is unticked in the destination list. Tick the destination "
-                        + "rows you want checked.",
+                    "Verify Only would check 0 files: every selected source file has a row in the "
+                        + "destination list that is unticked. Tick the destination rows you want "
+                        + "checked, or press Deselect All there.",
                     "Empty Selection", JOptionPane.WARNING_MESSAGE);
                 return;
             }
@@ -591,12 +667,15 @@ public class FileVerifierFrame extends JFrame {
             log("Selected destination files: " + selectedDest.size());
         }
 
-        jobRunning = true;
-        runButton.setEnabled(false);
+        engine.setJobTimeoutMillis(jobTimeoutMillis());
+        if (engine.jobTimeoutMillis() > 0) {
+            log("Job timeout: " + engine.jobTimeoutMillis() + " ms");
+        }
+
         progressBar.setValue(0);
         progressBar.setString("Running...");
 
-        FileSyncEngine.runJob(sourceDir, destDir, jobType, selectedSource, selectedDest,
+        if (!engine.start(sourceDir, destDir, jobType, sourceSelection, destinationSelection,
             new FileSyncEngine.ProgressListener() {
                 @Override
                 public void onPhase(String message) {
@@ -636,8 +715,8 @@ public class FileVerifierFrame extends JFrame {
                 @Override
                 public void onCompletion(FileSyncEngine.JobResult result) {
                     SwingUtilities.invokeLater(() -> {
-                        jobRunning = false;
-                        runButton.setEnabled(true);
+                        livenessTimer.stop();
+                        setJobControlsEnabled(true);
 
                         if (result.isSuccess()) {
                             progressBar.setString("Complete");
@@ -668,7 +747,14 @@ public class FileVerifierFrame extends JFrame {
                         }
                     });
                 }
-            });
+            })) {
+            JOptionPane.showMessageDialog(this, "A job is already running.",
+                "Job Running", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        setJobControlsEnabled(false);
+        livenessTimer.start();
     }
 
     private void log(String message) {
