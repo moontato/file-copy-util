@@ -5,8 +5,8 @@ import javax.swing.border.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.File;
+import java.nio.file.Path;
 import java.util.*;
-import java.util.List;
 
 public class FileVerifierFrame extends JFrame {
 
@@ -21,9 +21,9 @@ public class FileVerifierFrame extends JFrame {
     private JList<DirectoryEntry> destList;
     private JLabel statusLabel;
 
-    private File currentSourceDir = null;
-    private File currentDestDir = null;
     private boolean scanning = false;
+    private boolean jobRunning = false;
+    private JButton runButton;
     private FileSyncEngine.JobType currentJobType = FileSyncEngine.JobType.COPY_AND_VERIFY;
 
     public FileVerifierFrame() {
@@ -208,7 +208,7 @@ public class FileVerifierFrame extends JFrame {
                 int index = sourceList.locationToIndex(e.getPoint());
                 if (index >= 0 && SwingUtilities.isLeftMouseButton(e)) {
                     DirectoryEntry entry = sourceListModel.getElementAt(index);
-                    entry.selected = !entry.selected;
+                    entry.setSelected(!entry.selected());
                     SwingUtilities.invokeLater(() -> {
                         Rectangle bounds = sourceList.getCellBounds(index, index);
                         if (bounds != null) {
@@ -249,7 +249,7 @@ public class FileVerifierFrame extends JFrame {
                 int index = destList.locationToIndex(e.getPoint());
                 if (index >= 0 && SwingUtilities.isLeftMouseButton(e)) {
                     DirectoryEntry entry = destListModel.getElementAt(index);
-                    entry.selected = !entry.selected;
+                    entry.setSelected(!entry.selected());
                     SwingUtilities.invokeLater(() -> {
                         Rectangle bounds = destList.getCellBounds(index, index);
                         if (bounds != null) {
@@ -307,6 +307,7 @@ public class FileVerifierFrame extends JFrame {
         runBtn.setFocusPainted(false);
         runBtn.addActionListener(e -> runJob());
         buttonPanel.add(runBtn);
+        runButton = runBtn;
 
         JButton clearLogBtn = new JButton("Clear Log");
         clearLogBtn.addActionListener(e -> logArea.setText(""));
@@ -349,12 +350,6 @@ public class FileVerifierFrame extends JFrame {
             }
 
             field.setText(chosenPath);
-            File resolved = new File(chosenPath);
-            if (isSource) {
-                currentSourceDir = resolved;
-            } else {
-                currentDestDir = resolved;
-            }
         }
     }
 
@@ -429,6 +424,9 @@ public class FileVerifierFrame extends JFrame {
             return;
         }
 
+        Path source = sourceDir.toPath();
+        Path dest = destDir.toPath();
+
         scanning = true;
         statusLabel.setText("Scanning files...");
         logArea.setText("");
@@ -436,39 +434,75 @@ public class FileVerifierFrame extends JFrame {
         sourceListModel.clear();
         destListModel.clear();
 
-        SwingWorker<Void, Void> worker = new SwingWorker<>() {
+        SwingWorker<ScanPair, Void> worker = new SwingWorker<>() {
             @Override
-            protected Void doInBackground() {
-                List<String> sourceFiles = DirectoryScanner.scanFiles(sourceDir);
-                List<String> destFiles = DirectoryScanner.scanFiles(destDir);
+            protected ScanPair doInBackground() {
+                return new ScanPair(DirectoryScanner.scanFiles(source),
+                    DirectoryScanner.scanFiles(dest));
+            }
 
-                SwingUtilities.invokeLater(() -> {
-                    for (String file : sourceFiles) {
-                        sourceListModel.addElement(new DirectoryEntry(file, true));
+            @Override
+            protected void done() {
+                try {
+                    ScanPair result = get();
+                    for (FileEntry entry : result.source().files()) {
+                        sourceListModel.addElement(new DirectoryEntry(entry, true));
                     }
-                    for (String file : destFiles) {
-                        destListModel.addElement(new DirectoryEntry(file, true));
+                    for (FileEntry entry : result.dest().files()) {
+                        destListModel.addElement(new DirectoryEntry(entry, true));
                     }
-                    scanning = false;
                     statusLabel.setText(String.format("Scanned: %d source files, %d destination files",
-                        sourceFiles.size(), destFiles.size()));
-                    log("Scanned " + sourceFiles.size() + " source files and " +
-                        destFiles.size() + " destination files.");
-                });
-                return null;
+                        result.source().files().size(), result.dest().files().size()));
+                    log(String.format("Scanned %d source files and %d destination files.",
+                        result.source().files().size(), result.dest().files().size()));
+                    if (result.source().ignoredDirs() > 0 || result.dest().ignoredDirs() > 0) {
+                        log("Ignored directories skipped: "
+                            + result.source().ignoredDirs() + " in source, "
+                            + result.dest().ignoredDirs() + " in destination.");
+                    }
+                    if (result.source().skippedLinks() > 0 || result.dest().skippedLinks() > 0) {
+                        log("Symlinks skipped (not hashed, not offered for copying): "
+                            + result.source().skippedLinks() + " in source, "
+                            + result.dest().skippedLinks() + " in destination.");
+                    }
+                    for (String warning : result.source().warnings()) {
+                        log("  warning: " + warning);
+                    }
+                } catch (Exception e) {
+                    String message = rootCauseMessage(e);
+                    statusLabel.setText("Scan failed: " + message);
+                    log("Scan failed: " + message);
+                } finally {
+                    scanning = false;
+                }
             }
         };
         worker.execute();
     }
 
+    private record ScanPair(DirectoryScanner.ScanResult source, DirectoryScanner.ScanResult dest) {
+    }
+
+    private static String rootCauseMessage(Throwable t) {
+        Throwable cause = t;
+        while (cause.getCause() != null && cause.getCause() != cause) {
+            cause = cause.getCause();
+        }
+        return cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+    }
+
     private void selectAll(DefaultListModel<DirectoryEntry> model, JList<DirectoryEntry> list, boolean select) {
         for (int i = 0; i < model.size(); i++) {
-            model.getElementAt(i).selected = select;
+            model.getElementAt(i).setSelected(select);
         }
         SwingUtilities.invokeLater(() -> list.repaint());
     }
 
     private void runJob() {
+        if (jobRunning) {
+            return;
+        }
+
         String sourcePath = sourcePathField.getText().trim();
         String destPath = destPathField.getText().trim();
 
@@ -489,99 +523,148 @@ public class FileVerifierFrame extends JFrame {
         File sourceDir = new File(sourcePath);
         File destDir = new File(destPath);
 
-        // Collect selected files as relative paths
+        if (!sourceDir.isDirectory()) {
+            JOptionPane.showMessageDialog(this, "Source directory does not exist: " + sourcePath,
+                "Invalid Source", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        if (!destDir.isDirectory()) {
+            JOptionPane.showMessageDialog(this, "Destination directory does not exist: " + destPath,
+                "Invalid Destination", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        // Selection is a set of relative paths straight from the scanner's FileEntry - an empty
+        // set means "no files", so it must never reach the engine.
         Set<String> selectedSource = new LinkedHashSet<>();
-        String sourceAbs = sourceDir.getAbsolutePath();
         for (int i = 0; i < sourceListModel.size(); i++) {
             DirectoryEntry entry = sourceListModel.getElementAt(i);
-            if (entry.selected) {
-                String rel = entry.path.startsWith(sourceAbs)
-                    ? entry.path.substring(sourceAbs.length())
-                    : entry.path;
-                if (rel.startsWith(File.separator)) rel = rel.substring(1);
-                rel = rel.replace(File.separator, "/");
-                selectedSource.add(rel);
+            if (entry.selected()) {
+                selectedSource.add(entry.relPath());
             }
         }
 
         Set<String> selectedDest = new LinkedHashSet<>();
-        String destAbs = destDir.getAbsolutePath();
         for (int i = 0; i < destListModel.size(); i++) {
             DirectoryEntry entry = destListModel.getElementAt(i);
-            if (entry.selected) {
-                String rel = entry.path.startsWith(destAbs)
-                    ? entry.path.substring(destAbs.length())
-                    : entry.path;
-                if (rel.startsWith(File.separator)) rel = rel.substring(1);
-                rel = rel.replace(File.separator, "/");
-                selectedDest.add(rel);
+            if (entry.selected()) {
+                selectedDest.add(entry.relPath());
             }
         }
 
         FileSyncEngine.JobType jobType = currentJobType;
 
+        if (selectedSource.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                "No source files are selected, so nothing would be copied or verified.\n"
+                    + "Tick at least one file, or use Select All.",
+                "Empty Selection", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (jobType == FileSyncEngine.JobType.VERIFY_ONLY) {
+            // Mirror the engine's work-set rule so the user gets a dialog instead of a failed job.
+            Set<String> destinationRows = new HashSet<>();
+            for (int i = 0; i < destListModel.size(); i++) {
+                destinationRows.add(destListModel.getElementAt(i).relPath());
+            }
+            int planned = 0;
+            for (String rel : selectedSource) {
+                if (selectedDest.contains(rel) || !destinationRows.contains(rel)) {
+                    planned++;
+                }
+            }
+            if (planned == 0) {
+                JOptionPane.showMessageDialog(this,
+                    "Verify Only would check 0 files: every selected source file exists in the "
+                        + "destination but is unticked in the destination list. Tick the destination "
+                        + "rows you want checked.",
+                    "Empty Selection", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+        }
+
         log("Starting " + (jobType == FileSyncEngine.JobType.COPY_AND_VERIFY ? "Copy & Verify" : "Verify Only") + " job...");
         log("Source: " + sourcePath);
         log("Destination: " + destPath);
         log("Selected source files: " + selectedSource.size());
-        log("Selected destination files: " + selectedDest.size());
+        if (jobType == FileSyncEngine.JobType.VERIFY_ONLY) {
+            log("Selected destination files: " + selectedDest.size());
+        }
 
+        jobRunning = true;
+        runButton.setEnabled(false);
         progressBar.setValue(0);
         progressBar.setString("Running...");
 
         FileSyncEngine.runJob(sourceDir, destDir, jobType, selectedSource, selectedDest,
             new FileSyncEngine.ProgressListener() {
                 @Override
-                public void onProgressUpdate(String message, int percent) {
+                public void onPhase(String message) {
+                    SwingUtilities.invokeLater(() -> log(message));
+                }
+
+                @Override
+                public void onProgress(int percent, String statusText) {
                     SwingUtilities.invokeLater(() -> {
-                        statusLabel.setText(message);
-                        log(message);
-                        if (percent >= 0) {
-                            progressBar.setValue(percent);
-                        }
+                        statusLabel.setText(statusText);
+                        progressBar.setValue(Math.max(0, Math.min(100, percent)));
                     });
                 }
 
                 @Override
-                public void onFileProcessed(String fileName, String status, String srcHash, String dstHash) {
+                public void onFileProcessed(String relPath, String status, String srcHash, String dstHash) {
                     SwingUtilities.invokeLater(() -> {
                         String icon = switch (status) {
-                            case "match" -> "[OK]";
-                            case "mismatch" -> "[MISMATCH]";
-                            case "missing" -> "[MISSING]";
-                            case "error" -> "[ERROR]";
-                            default -> "[INFO]";
+                            case "match" -> "[OK]       ";
+                            case "mismatch" -> "[MISMATCH] ";
+                            case "missing" -> "[MISSING]  ";
+                            case "copied" -> "[COPIED]   ";
+                            case "error" -> "[ERROR]    ";
+                            default -> "[INFO]     ";
                         };
-                        if (!srcHash.isEmpty() && !dstHash.isEmpty()) {
-                            log("  src: " + srcHash);
-                            log("  dst: " + dstHash);
+                        StringBuilder line = new StringBuilder("  ").append(icon).append(relPath);
+                        if (!srcHash.isEmpty()) {
+                            line.append("  src=").append(srcHash);
                         }
-                        log("  " + icon + " " + fileName);
+                        if (!dstHash.isEmpty()) {
+                            line.append("  dst=").append(dstHash);
+                        }
+                        log(line.toString());
                     });
                 }
 
                 @Override
                 public void onCompletion(FileSyncEngine.JobResult result) {
                     SwingUtilities.invokeLater(() -> {
-                        progressBar.setString(result.getStatus() == FileSyncEngine.JobStatus.COMPLETED ?
-                            "Complete" : "Failed");
-                        progressBar.setValue(result.getStatus() == FileSyncEngine.JobStatus.COMPLETED ? 100 : 0);
+                        jobRunning = false;
+                        runButton.setEnabled(true);
 
-                        if (result.getStatus() == FileSyncEngine.JobStatus.COMPLETED) {
-                            statusLabel.setText("Job completed successfully.");
-                            log("\n=== JOB COMPLETED ===");
-                            log("Files checked: " + result.getFilesChecked());
-                            log("Files matched: " + result.getFilesMatched());
-                            log("Files mismatched: " + result.getFilesMismatched());
-                            log("Files missing: " + result.getFilesMissing());
-                            log("Files copied: " + result.getFilesCopied());
+                        if (result.isSuccess()) {
+                            progressBar.setString("Complete");
+                            progressBar.setValue(100);
+                            statusLabel.setText("Job completed.");
+                            log("");
+                            log("=== JOB COMPLETED ===");
+                            log(result.message());
                         } else {
+                            progressBar.setString("Failed");
                             statusLabel.setText("Job failed.");
-                            log("\n=== JOB FAILED ===");
-                            log("Error: " + result.getMessage());
-                            for (String error : result.getErrors()) {
-                                log("  " + error);
+                            log("");
+                            log("=== JOB FAILED ===");
+                            log("Reason: " + result.message());
+                            if (result.rsyncExitCode() != 0) {
+                                log("rsync exit code: " + result.rsyncExitCode());
                             }
+                        }
+
+                        log(String.format("Totals: checked=%d copied=%d matched=%d mismatched=%d missing=%d",
+                            result.filesChecked(), result.filesCopied(), result.filesMatched(),
+                            result.filesMismatched(), result.filesMissing()));
+                        for (String warning : result.warnings()) {
+                            log("  warning: " + warning);
+                        }
+                        for (String error : result.errors()) {
+                            log("  error: " + error);
                         }
                     });
                 }
@@ -596,9 +679,6 @@ public class FileVerifierFrame extends JFrame {
     // Custom cell renderer for directory entries with checkboxes
     private class DirectoryCellRenderer extends JCheckBox implements ListCellRenderer<DirectoryEntry> {
 
-        private final Border selectedBorder = BorderFactory.createLineBorder(new Color(59, 130, 246), 1);
-        private final Border unselectedBorder = BorderFactory.createEmptyBorder(1, 1, 1, 1);
-
         public DirectoryCellRenderer() {
             setOpaque(true);
             setFont(new Font("SansSerif", Font.PLAIN, 12));
@@ -610,8 +690,8 @@ public class FileVerifierFrame extends JFrame {
                                                         int index,
                                                         boolean isSelected,
                                                         boolean cellHasFocus) {
-            setSelected(value.selected);
-            setText(value.path);
+            setSelected(value.selected());
+            setText(value.relPath());
 
             if (isSelected) {
                 setBackground(new Color(219, 234, 254));
@@ -625,19 +705,35 @@ public class FileVerifierFrame extends JFrame {
         }
     }
 
-    // Data class for directory entries
-    public static class DirectoryEntry {
-        public final String path;
-        public boolean selected;
+    /** List row: a scanned file plus its include/exclude state. */
+    public static final class DirectoryEntry {
+        private final FileEntry entry;
+        private boolean selected;
 
-        public DirectoryEntry(String path, boolean selected) {
-            this.path = path;
+        public DirectoryEntry(FileEntry entry, boolean selected) {
+            this.entry = entry;
+            this.selected = selected;
+        }
+
+        public FileEntry entry() {
+            return entry;
+        }
+
+        public String relPath() {
+            return entry.relPath();
+        }
+
+        public boolean selected() {
+            return selected;
+        }
+
+        public void setSelected(boolean selected) {
             this.selected = selected;
         }
 
         @Override
         public String toString() {
-            return path;
+            return entry.relPath();
         }
     }
 }

@@ -2,4 +2,5 @@ apache-maven-*/
 target/
 *.md
 !README.md
+!plan/*.md
 *.png
