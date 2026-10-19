@@ -205,3 +205,43 @@ Idle controls enabled → job started: Run/Scan/Browse/mode/timeout disabled, Ca
 ### Roadmap update
 
 Added 3.10 (true transfer progress via `rsync --progress` per-file completion) to Phase 3, since 2.4/finding 6 show that announcement-based progress cannot fill the bar during a long transfer.
+
+---
+
+## Phase 3 completion record (2026-10-18)
+
+**Done.** `mvn -B clean verify` is green: 75 tests (9 scanner, 6 hasher, 30 copy/verify semantics, 10 lifecycle, 10 scan options, 5 report exporter, 5 log buffer), 0 failures. The GUI was driven under Xvfb with a scratch harness: 27/27 checks pass.
+
+| Phase 3 item | Result |
+|---|---|
+| 3.1 chooser | `getSelectedFile()` is used (falling back to `getCurrentDirectory()`, then to the parent if a file was picked); the chooser starts in the directory already in that field, else the other field, else home; the redundant `capturedPath` listener is gone |
+| 3.2 preflight | `FileSyncEngine.validate(JobRequest)` runs before any work: source is a readable directory, destination is a readable directory (and writable for a copy), source ≠ destination and destination not inside source, and `rsync` present. A missing `rsync` is reported as "rsync was not found (looked for 'rsync'). Install rsync, or use Verify Only, which needs no rsync." This also closed the deferred Phase 0 matrix item #10 - the binary is now overridable (`setRsyncBinary`) and the case has a test |
+| 3.3 results + export | `FileOutcome(relPath, kind, sourceHash, destHash)` with **full** digests, capped at `MAX_OUTCOMES = 50_000`; a Results tab table (status, path, src hash, dst hash) with truncated hashes for display; *Only problems* filter; `ReportExporter.toCsv/toJson` (RFC 4180 quoting, JSON with totals/errors/warnings/outcomes, `null` for a hash that could not exist). CSV/JSON export buttons |
+| 3.4 destination-only files | `EXTRA` outcome + `filesExtra()` counter + "Report destination-only files" checkbox; extras are excluded when the user's destination list contains the row and left it unticked. D3's rule is now expressed as `Selection(selected, known)` instead of a bare ticked set; a full per-side selection mode is still open |
+| 3.5 scan options UI | `ScanOptions(ignorePatterns, includeHidden, symlinkPolicy)`; GUI fields for a comma-separated glob list, hidden toggle, and symlink policy (SKIP / LINK / FOLLOW). `Follow` passes `--copy-links`; `Link` keeps `-a` behaviour; `Skip` leaves links out and warns how many |
+| 3.6 log cap + large lists | `TailLog` keeps the newest 5000 lines, drops in 1000-line batches, tracks every line's length (including its own "(older log lines dropped…)" marker) and is unit-tested headlessly. Lists use a filtered view model over a flat row list, so a `JList` still paints only visible rows |
+| 3.7 hashing | only the work set is hashed in both modes; Copy & Verify hashes the source once *before* rsync and reuses those digests for post-copy verification; hashing runs on a bounded daemon pool (`min(MAX_HASH_THREADS, availableProcessors)`) that checks the cancel flag and the deadline per submitted unit |
+| 3.8 filter boxes | a filter field above each list narrows what is visible without changing what is ticked; the lists show relative paths |
+| 3.9 preferences | source, destination, ignore patterns, hidden flag, symlink policy, timeout, job mode and extra-file detection are saved and restored (`Preferences.userRoot().node("com/fileverifier")`) |
+| 3.10 real transfer progress | implemented as `rsync --info=progress2`: the copy phase of the bar follows the parsed transfer percentage (0-70%), not itemize announcements, so a single huge file moves the bar. Announcement counting no longer drives progress at all |
+
+### Findings that changed the design
+
+9. **The itemize grammar was being misread, so copied symlinks were never counted.** rsync reports a created/changed symlink as `cL+++++++++ link.txt -> a.txt` (update type `c` = local create/change, item type `L`), and the old classifier mapped any `c` line that was not `cd` to IGNORED. `classifyLine` now follows the man page's update-type × item-type matrix: `>f`/`<f`/`cL`/`hf`/`cD`/`>S` are copied items, `cd`/`>d`/`<d`/`.d` are directories, `.f` is an untouched item (not a transfer), and `*` message lines ("* Skipping any contents from this failed directory *") are surfaced as warnings instead of swallowed. `isDirectoryItemizeLine`'s treatment of `D` as a directory was wrong too - `D` is a device.
+10. **`--info=progress2` is the only honest copy-progress signal.** A probe showed itemize lines arriving before the data moved (finding 6), so announcement-based progress was removed rather than capped.
+11. **`JCheckBox` fires `ActionEvent` only for a real click.** A programmatic `setSelected()` fires a `ChangeEvent`, so `addActionListener` silently missed it; the hidden-files toggle and the *Only problems* filter were switched to `ChangeListener` after the harness exposed both.
+12. **Re-scanning has to remember unticks, not ticks.** Keeping the previously *ticked* paths made a file that had been filtered out and then came back reappear unticked (and therefore silently unverified). The frame now records which rows the user explicitly unticked and ticks everything else.
+13. **Scan options must not re-walk behind the user's back.** An auto-rescan on every option change (and per keystroke in a long ignore field) was removed; the frame says "Scan options changed - press Scan Files to apply them." once, when a completed scan has gone stale.
+14. **Measuring the log cap through `JTextArea.getLineCount()` is unreliable** - the display line cache lags behind document edits (it reported 41 lines while the buffer held ~5000), which is why the cap lives in `TailLog` with its own bookkeeping and headless tests instead of inline in the frame.
+15. **Persisted preferences make GUI tests non-deterministic**: job mode and symlink policy are preferences, so a leftover "Verify Only" from one harness run changed the next run's copy semantics. The harness clears the prefs node before starting.
+
+### GUI verification (Xvfb, scratch harness)
+
+Ignore globs honoured (`.git, node_modules, *.bin`) and reported; filter box narrows the visible list while every row stays selectable; option change reports a stale scan without rescanning; hidden off/on and SKIP/LINK applied by Scan Files; Copy & Verify over 5 rows (including a symlink) reported `5 checked, 5 copied, 5 matched` and kept the link a link; Results tab titled `Results (5)`; hashes displayed truncated; Verify Only reported 1 destination-only file and the table showed an `EXTRA` row; *Only problems* filtered 6 rows to 1; CSV export wrote 7 lines with full digests; 9000 log lines capped to the newest 5047 with a drop notice; chooser fell back to a real directory from a stale field; paths, ignore patterns and timeout restored in a second window.
+
+### Deferred / known limits
+
+- `Selection(selected, known)` models the per-side rule but there is still no separate per-side selection *mode* (3.4's original ambition).
+- `MAX_OUTCOMES = 50_000` bounds memory; a job larger than that keeps its counters but truncates the reportable outcomes (logged as a warning).
+- GUI hangs on truly enormous lists are mitigated (view model, log cap) but not measured at 100k files here.
+- `serialVersionUID` still missing on `FileVerifierFrame` and its cell renderer (Phase 4 hygiene).

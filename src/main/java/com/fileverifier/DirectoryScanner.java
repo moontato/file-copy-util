@@ -11,25 +11,34 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumSet;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 /**
  * Recursive file scanner producing {@link FileEntry} records.
  *
- * <p>Symlinks are neither followed nor reported: hashing would follow the target while
- * rsync (without {@code --links} semantics decisions made elsewhere) treats the link itself
- * as the payload, and following a link to an ancestor directory recurses forever. Ignored
- * directory names keep huge VCS/OS metadata trees out of the scan.
+ * <p>Contract:
+ * <ul>
+ *   <li>relative, {@code /}-separated, sorted paths - {@link FileEntry#relPath()} is the identity
+ *       used by the frame's selection, rsync's {@code --files-from} list, and the log;</li>
+ *   <li>{@link ScanOptions} decides what is ignored (exact names and glob patterns, matched against
+ *       both the relative path and the entry name), whether hidden entries are included, and what
+ *       happens to symlinks;</li>
+ *   <li>a missing or non-directory root scans as empty rather than throwing;</li>
+ *   <li>unreadable entries become {@link ScanResult#warnings()} instead of aborting the walk.</li>
+ * </ul>
  */
 public final class DirectoryScanner {
 
-    /** Directory names never descended into. */
-    public static final List<String> DEFAULT_IGNORES =
-            List.of(".git", ".svn", ".hg", ".bzr", "lost+found", ".Trash", "$RECYCLE.BIN");
+    /** Directory names never descended into (the default value of {@link ScanOptions#ignorePatterns()}). */
+    public static final List<String> DEFAULT_IGNORES = ScanOptions.DEFAULT_IGNORED_DIRS;
 
     public record ScanResult(List<FileEntry> files, int skippedLinks, int ignoredDirs, List<String> warnings) {
+        public ScanResult {
+            files = List.copyOf(files);
+            warnings = List.copyOf(warnings);
+        }
+
         public static ScanResult empty() {
             return new ScanResult(List.of(), 0, 0, List.of());
         }
@@ -38,42 +47,65 @@ public final class DirectoryScanner {
     private DirectoryScanner() {
     }
 
+    /** Scan with the defaults: ignore VCS/OS metadata, include hidden files, skip symlinks. */
     public static ScanResult scanFiles(Path root) {
-        return scanFiles(root, DEFAULT_IGNORES);
+        return scanFiles(root, ScanOptions.DEFAULTS);
     }
 
+    /** Defaults replaced by an explicit ignore list (used by tests and simple callers). */
     public static ScanResult scanFiles(Path root, List<String> ignoreDirNames) {
+        return scanFiles(root, new ScanOptions(ignoreDirNames, true, ScanOptions.SymlinkPolicy.SKIP));
+    }
+
+    public static ScanResult scanFiles(Path root, ScanOptions options) {
         if (root == null || !Files.isDirectory(root)) {
             return ScanResult.empty();
         }
         Path base = root.toAbsolutePath().normalize();
-        Collector collector = new Collector(base, new HashSet<>(ignoreDirNames));
+        Collector collector = new Collector(base, options);
         try {
-            Files.walkFileTree(base, EnumSet.noneOf(FileVisitOption.class), Integer.MAX_VALUE, collector);
+            Files.walkFileTree(base, collector.walkOptions(), Integer.MAX_VALUE, collector);
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to scan directory: " + base, e);
         }
         return collector.result();
     }
 
-    /** Relative, '/'-separated path of {@code file} under {@code base}. */
+    /** Relative, '/'-separated path of {@code file} under {@code base}, both sides normalized. */
     public static String relativize(Path base, Path file) {
-        Path rel = base.toAbsolutePath().normalize()
-                .relativize(file.toAbsolutePath().normalize());
+        Path rel = base.toAbsolutePath().normalize().relativize(file.toAbsolutePath().normalize());
         return rel.toString().replace(java.io.File.separatorChar, '/');
+    }
+
+    /** Convenience for callers that only need the file list. */
+    public static List<FileEntry> listFiles(Path root) {
+        return scanFiles(root).files();
     }
 
     private static final class Collector extends SimpleFileVisitor<Path> {
         private final Path base;
-        private final Set<String> ignores;
+        private final ScanOptions options;
+        private final List<ScanOptions.IgnoreRule> rules;
         private final List<FileEntry> files = new ArrayList<>();
         private final List<String> warnings = new ArrayList<>();
+        private final ScanOptions.SymlinkPolicy policy;
         private int skippedLinks;
         private int ignoredDirs;
 
-        Collector(Path base, Set<String> ignores) {
+        Collector(Path base, ScanOptions options) {
             this.base = base;
-            this.ignores = ignores;
+            this.options = options;
+            this.rules = options.compileRules();
+            this.policy = options.symlinkPolicy();
+        }
+
+        Set<FileVisitOption> walkOptions() {
+            // FOLLOW is the only policy that descends through symlinked directories, and it is the
+            // only one where a link cycle is possible; FileVisitOption.FOLLOW_LINKS makes the walk
+            // detect that cycle and report it instead of recursing forever.
+            return policy == ScanOptions.SymlinkPolicy.FOLLOW
+                    ? EnumSet.of(FileVisitOption.FOLLOW_LINKS)
+                    : EnumSet.noneOf(FileVisitOption.class);
         }
 
         @Override
@@ -81,38 +113,70 @@ public final class DirectoryScanner {
             if (dir.equals(base)) {
                 return FileVisitResult.CONTINUE;
             }
-            if (Files.isSymbolicLink(dir)) {
-                skippedLinks++;
-                return FileVisitResult.SKIP_SUBTREE;
-            }
-            if (ignores.contains(dir.getFileName().toString())) {
+            String rel = relativize(base, dir);
+            if (options.ignores(rel, rules)) {
                 ignoredDirs++;
                 return FileVisitResult.SKIP_SUBTREE;
+            }
+            if (!options.includeHidden() && ScanOptions.isHiddenName(dir.getFileName().toString())) {
+                ignoredDirs++;
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+            if (Files.isSymbolicLink(dir)) {
+                // Without FOLLOW_LINKS a symlinked directory reaches visitFile, not this method;
+                // it is reached here only in FOLLOW mode, where descending is the whole point.
+                skippedLinks++;
+                return FileVisitResult.CONTINUE;
             }
             return FileVisitResult.CONTINUE;
         }
 
         @Override
         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-            if (Files.isSymbolicLink(file)) {
-                skippedLinks++;
+            boolean link = Files.isSymbolicLink(file);
+            if (link) {
+                // Without FOLLOW_LINKS a symlinked directory arrives here rather than in
+                // preVisitDirectory. Under LINK it is still copied (as a link) but there is nothing
+                // to list under it and nothing meaningful to hash, so it is reported as skipped.
+                if (policy == ScanOptions.SymlinkPolicy.SKIP || Files.isDirectory(file)) {
+                    skippedLinks++;
+                    return FileVisitResult.CONTINUE;
+                }
+                if (!Files.exists(file)) {
+                    warnings.add("Dangling symlink: " + relativize(base, file));
+                    skippedLinks++;
+                    return FileVisitResult.CONTINUE;
+                }
+            }
+            String rel = relativize(base, file);
+            if (options.ignores(rel, rules)) {
                 return FileVisitResult.CONTINUE;
             }
-            if (attrs.isRegularFile()) {
-                files.add(new FileEntry(relativize(base, file), file));
+            if (!options.includeHidden() && ScanOptions.isHiddenName(file.getFileName().toString())) {
+                return FileVisitResult.CONTINUE;
             }
+            if (!link && !attrs.isRegularFile()) {
+                // Fifo, socket, device node: nothing meaningful to copy or hash.
+                return FileVisitResult.CONTINUE;
+            }
+            files.add(new FileEntry(rel, file));
             return FileVisitResult.CONTINUE;
         }
 
         @Override
         public FileVisitResult visitFileFailed(Path file, IOException exc) {
-            warnings.add("Unreadable during scan: " + relativize(base, file) + " (" + exc.getMessage() + ")");
+            boolean cycle = exc instanceof java.nio.file.FileSystemLoopException;
+            warnings.add((cycle ? "Symlink cycle: " : "Unreadable during scan: ")
+                    + relativize(base, file) + " (" + exc.getMessage() + ")");
+            if (cycle) {
+                ignoredDirs++;
+            }
             return FileVisitResult.CONTINUE;
         }
 
         ScanResult result() {
             files.sort(Comparator.comparing(FileEntry::relPath));
-            return new ScanResult(List.copyOf(files), skippedLinks, ignoredDirs, List.copyOf(warnings));
+            return new ScanResult(files, skippedLinks, ignoredDirs, warnings);
         }
     }
 }

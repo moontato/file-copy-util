@@ -2,93 +2,135 @@ package com.fileverifier;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Copy/verify engine with an owned job lifecycle. Free of any UI dependency so it can be driven
- * headlessly (see {@code FileSyncEngineTest} / {@code FileSyncEngineLifecycleTest}).
+ * Copy/verify engine. Pure logic with an owned job lifecycle and no Swing dependency, so the same
+ * code path the GUI drives can be driven from a unit test.
  *
- * <p><b>Path model.</b> Every file is identified by its {@link FileEntry#relPath()} - relative
- * to the scanned root, '/' separated. No absolute-path string arithmetic happens here.
+ * <p><b>Lifecycle.</b> An engine instance owns at most one job. {@link #start} submits one and
+ * refuses a second while it runs; {@link #execute} is the synchronous equivalent; {@link #cancel}
+ * requests termination of the running job (killing {@code rsync} and its children) and makes the
+ * job finish with {@link JobStatus#FAILED} and the partial counters it reached. Status walks
+ * {@code IDLE -> RUNNING -> COMPLETED/FAILED} and is exposed through {@link #status()}.
+ * {@link #close()} shuts the engine's threads down and rejects further jobs.
  *
- * <p><b>Selection semantics.</b> Callers pass the *selected* relative paths. An empty set means
- * "zero files", never "no filter"; an empty work set is refused. Copying everything requires an
- * explicit Select All.
+ * <p><b>Single path model.</b> A file's identity is its {@link FileEntry#relPath()} relative to the
+ * source directory, and that same string is what the frame's selection holds and what
+ * {@code rsync --files-from} consumes.
  *
- * <p><b>Work set.</b> COPY_AND_VERIFY: the source-side selection. VERIFY_ONLY: the source-side
- * selection, minus files whose row in the destination list the user explicitly unticked (see
- * {@link Selection}) - a file that is simply absent from the destination stays in the work set and
- * is reported as "missing".
+ * <p><b>Work set.</b> Every job is driven by the caller's {@link Selection}s:
+ * <ul>
+ *   <li>COPY_AND_VERIFY: selected source files (their directories are implied by
+ *       {@code --files-from}). Selected destination rows are ignored - copying is source-driven.</li>
+ *   <li>VERIFY_ONLY: selected source files, minus rows the user explicitly unticked in the
+ *       destination list; plus files found only at the destination when
+ *       {@link JobRequest#detectExtraFiles()} is on.</li>
+ * </ul>
+ * A file absent from the destination stays in the work set and is reported as "missing", so a
+ * destination list that is out of date can never silently skip a file the user asked to verify. A
+ * file present only at the destination is reported as "extra".
  *
- * <p><b>Counters are measured.</b> {@code filesCopied} counts rsync itemize transfer lines;
- * matched/mismatched/missing come from hashing exactly the work set, so
- * {@code filesChecked == filesMatched + filesMismatched + filesMissing}.
+ * <p><b>Verification is hash-based.</b> Copy &amp; Verify hashes each selected source file once,
+ * before {@code rsync} runs, and compares those digests against the copies after {@code rsync}
+ * exits; the source is therefore read exactly once per job. Verify Only hashes both sides. Hashing
+ * runs on a small bounded pool, but classification and per-file callbacks happen in work-set order
+ * so counters and log order stay deterministic.
  *
- * <p><b>Job lifecycle.</b> One engine owns at most one job: {@link JobStatus} moves
- * IDLE -&gt; RUNNING -&gt; COMPLETED/FAILED. {@link #start} is refused while a job runs,
- * {@link #cancel} terminates the live {@link Process} (and its descendants), and a watchdog
- * enforces an optional job timeout.
+ * <p><b>Progress.</b> Each file is one unit of the work-set size. The copy phase scales with
+ * {@code rsync --info=progress2}'s own transfer percentage; itemize announcements are counted for
+ * the copied total and logged, but never move the bar, because they appear long before the data has
+ * moved. Verification fills the rest. Progress and completion callbacks arrive on the engine's worker
+ * thread - the GUI must marshall them onto the EDT.
+ *
+ * <p><b>Watchdog.</b> A scheduled watchdog enforces the optional job deadline (killing the live
+ * {@code rsync} process past it) and records liveness - the last activity and when it happened -
+ * which lets the GUI report "still running, last activity Ns ago" instead of looking frozen.
  */
-public final class FileSyncEngine implements AutoCloseable {
+public class FileSyncEngine implements AutoCloseable {
 
-    public enum JobType {
-        COPY_AND_VERIFY,
-        VERIFY_ONLY
-    }
+    public enum JobType { COPY_AND_VERIFY, VERIFY_ONLY }
+    public enum JobStatus { IDLE, RUNNING, COMPLETED, FAILED }
 
-    public enum JobStatus {
-        IDLE,
-        RUNNING,
-        COMPLETED,
-        FAILED
-    }
-
-    /** Copy phase occupies 0..COPY_PROGRESS_END of the bar, verification the remainder. */
+    /** Copy phase occupies 0..70% of the bar, verification 70..100%. */
     static final int COPY_PROGRESS_END = 70;
-
-    /**
-     * rsync announces every itemize line before it moves the data (verified against rsync 3.2.7),
-     * so announcements alone can only carry the bar this far; the rest of the copy phase is earned
-     * when rsync actually exits.
-     */
-    static final int ANNOUNCE_PROGRESS_END = 40;
-
-    /** How often the watchdog checks the job timeout. */
+    /** Deadline enforcement granularity. */
     static final long WATCHDOG_PERIOD_MS = 250;
-
-    /** How long rsync may run before the watchdog terminates it; 0 disables the timeout. */
+    /** No deadline (default). */
     public static final long NO_TIMEOUT = 0L;
+    /** Hard ceiling on retained outcomes (and therefore on the results table) for huge jobs. */
+    static final int MAX_OUTCOMES = 50_000;
+
+    /** Hashing is CPU-bound; more threads than this is memory and noise, not speed. */
+    private static final int MAX_HASH_THREADS = 4;
+
+    /** rsync progress line, e.g. "  1,500,000,006  99%  975.13MB/s  0:00:01 (xfr#2, to-chk=2/4)". */
+    private static final Pattern RSYNC_PERCENT = Pattern.compile("^\\s+[\\d,]+\\s+(\\d{1,3})%");
+
+    private static final AtomicReference<String> RSYNC_BINARY = new AtomicReference<>("rsync");
+    private static final AtomicReference<Boolean> RSYNC_AVAILABLE = new AtomicReference<>();
+
+    public interface ProgressListener {
+        /** Called on phase transitions: "copying", "verifying", "done". */
+        default void onPhase(String phase) {
+        }
+
+        /** Progress update, 0-100 inclusive, computed against the work-set size. */
+        default void onProgress(int percent, String statusText) {
+        }
+
+        /**
+         * Per-file result. {@code kind} is one of {@code COPIED}, {@code OK}, {@code MISMATCH},
+         * {@code MISSING}, {@code EXTRA}; hashes are short prefixes for display, null when that side
+         * had no file to hash.
+         */
+        default void onFileProcessed(String relativePath, String kind, String sourceHash, String destHash) {
+        }
+
+        /** Called exactly once per job with the final result. The one callback a listener must have. */
+        void onCompletion(JobResult result);
+    }
 
     /**
-     * What the user's list looks like for one side: which rows are ticked, and which rows exist at
-     * all. {@code known} is what makes "unticked" distinguishable from "not in the list" - without
-     * it, a stale list would silently exclude files from verification.
+     * A list's selection state. {@code selected} are the ticked rows; {@code known} are the rows the
+     * list actually contains. The distinction matters: exclusion requires a row the user saw and
+     * left unticked, which is not the same as a file the list has never heard of.
      */
     public record Selection(Set<String> selected, Set<String> known) {
-        public static Selection of(String... relPaths) {
-            Set<String> s = new LinkedHashSet<>(java.util.Arrays.asList(relPaths));
-            return new Selection(s, s);
+        public Selection {
+            selected = Set.copyOf(selected);
+            known = Set.copyOf(known);
+        }
+
+        public static Selection of(Iterable<String> selectedRelPaths) {
+            Set<String> selected = new LinkedHashSet<>();
+            for (String rel : selectedRelPaths) {
+                selected.add(rel);
+            }
+            return new Selection(selected, selected);
         }
 
         public static Selection none() {
@@ -96,70 +138,71 @@ public final class FileSyncEngine implements AutoCloseable {
         }
     }
 
+    /** Everything one job needs, built by the frame (or a test) and immutable from then on. */
+    public record JobRequest(Path sourceDir, Path destDir, JobType jobType,
+                             Selection sourceSelection, Selection destinationSelection,
+                             ScanOptions scanOptions, boolean detectExtraFiles) {
+        public JobRequest {
+            scanOptions = scanOptions == null ? ScanOptions.DEFAULTS : scanOptions;
+        }
+    }
+
     /**
-     * Outcome of one job. For a FAILED job (cancelled, timed out, or rsync error) the counters are
-     * the partial progress that was actually reached, not zero.
-     *
-     * <p>{@code filesCopied} counts files rsync reported as transferring. When the job completes
-     * that equals the number transferred; for a cancelled or timed-out job it can overstate what
-     * actually finished, because rsync announces a file before its data has moved.
+     * One verified file's outcome, with full digests so a report can be exported from it. {@code kind}
+     * is {@code OK}, {@code MISMATCH}, {@code MISSING} or {@code EXTRA}; a hash is null when that side
+     * had no file. A COPIED event is not an outcome - it is a transfer, and the same file gets a
+     * verification outcome afterwards.
      */
-    public record JobResult(JobStatus status, String message, int filesChecked, int filesMatched,
-                            int filesMismatched, int filesMissing, int filesCopied, int rsyncExitCode,
-                            List<String> errors, List<String> warnings) {
+    public record FileOutcome(String relPath, String kind, String sourceHash, String destHash) {
+    }
+
+    public record JobResult(JobStatus status, String message,
+                            int filesChecked, int filesMatched, int filesMismatched,
+                            int filesMissing, int filesExtra, int filesCopied,
+                            int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
+                            List<String> warnings) {
+
+        public JobResult {
+            outcomes = List.copyOf(outcomes);
+            errors = List.copyOf(errors);
+            warnings = List.copyOf(warnings);
+        }
 
         public boolean isSuccess() {
             return status == JobStatus.COMPLETED;
         }
     }
 
-    /**
-     * Callbacks are invoked from the engine's worker thread; implementations must marshal
-     * to the UI thread themselves.
-     */
-    public interface ProgressListener {
-        /** Coarse, log-worthy milestone (job start, phase change, rsync finished). */
-        default void onPhase(String message) {
-        }
-
-        /** Progress bar + status label only; never log-worthy (see onPhase). */
-        default void onProgress(int percent, String statusText) {
-        }
-
-        /** Per-file result: status is one of copied | match | mismatch | missing. */
-        default void onFileProcessed(String relPath, String status, String srcHash, String dstHash) {
-        }
-
-        void onCompletion(JobResult result);
-    }
-
-    private final ExecutorService jobExecutor;
-    private final ScheduledExecutorService watchdogExecutor;
-
-    private final AtomicBoolean jobRunning = new AtomicBoolean(false);
     private final AtomicReference<JobStatus> status = new AtomicReference<>(JobStatus.IDLE);
-    private final AtomicReference<JobResult> lastResult = new AtomicReference<>();
+    private final AtomicBoolean jobRunning = new AtomicBoolean(false);
+    private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+    private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
+    private volatile boolean closed;
+    private final AtomicReference<Process> liveProcess = new AtomicReference<>();
+    private final AtomicLong deadline = new AtomicLong(0L);
+    private final AtomicLong startedAt = new AtomicLong(0L);
+    private final AtomicLong lastActivityAt = new AtomicLong(0L);
+    private final AtomicReference<String> lastActivity = new AtomicReference<>("");
 
-    private volatile Process process;
-    private volatile boolean cancelRequested;
-    private volatile boolean timedOut;
-    private volatile long jobStartedAtMs;
-    private volatile long jobTimeoutMs = NO_TIMEOUT;
+    private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "sync-watchdog");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ExecutorService jobWorker = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "sync-job");
+        thread.setDaemon(true);
+        return thread;
+    });
 
-    private volatile String lastActivity = "waiting to start";
-    private final AtomicLong lastActivityAtMs = new AtomicLong(System.currentTimeMillis());
+    private volatile JobResult lastResult;
+    private volatile long jobTimeoutMillis = NO_TIMEOUT;
+    /** Set by the job thread; read by the watchdog to tell a live transfer from a hung engine. */
+    private volatile String jobPhase = "idle";
 
     public FileSyncEngine() {
-        jobExecutor = Executors.newSingleThreadExecutor(daemonFactory("file-copy-util-job"));
-        watchdogExecutor = Executors.newSingleThreadScheduledExecutor(daemonFactory("file-copy-util-watchdog"));
-    }
-
-    private static ThreadFactory daemonFactory(String name) {
-        return runnable -> {
-            Thread thread = new Thread(runnable, name);
-            thread.setDaemon(true);
-            return thread;
-        };
+        watchdog.scheduleAtFixedRate(this::watchdogTick,
+                WATCHDOG_PERIOD_MS, WATCHDOG_PERIOD_MS, TimeUnit.MILLISECONDS);
     }
 
     // ---------------------------------------------------------------- lifecycle
@@ -173,513 +216,748 @@ public final class FileSyncEngine implements AutoCloseable {
     }
 
     public JobResult lastResult() {
-        return lastResult.get();
+        return lastResult;
     }
 
-    /** @param millis maximum job duration, or {@link #NO_TIMEOUT} (default). */
+    /** 0 disables the watchdog deadline. Set it while the engine is idle. */
     public void setJobTimeoutMillis(long millis) {
-        this.jobTimeoutMs = Math.max(NO_TIMEOUT, millis);
+        this.jobTimeoutMillis = Math.max(0L, millis);
     }
 
     public long jobTimeoutMillis() {
-        return jobTimeoutMs;
+        return jobTimeoutMillis;
     }
 
-    /** Milliseconds since the engine last saw rsync output or hashed a file (liveness display). */
+    /** ms since the engine last saw activity; Long.MAX_VALUE when no job has run. */
     public long millisSinceLastActivity() {
-        return System.currentTimeMillis() - lastActivityAtMs.get();
+        long at = lastActivityAt.get();
+        return at == 0L ? Long.MAX_VALUE : System.currentTimeMillis() - at;
     }
 
     public String lastActivityDescription() {
-        return lastActivity;
+        return lastActivity.get();
     }
 
     /**
-     * Starts a job on the engine's worker thread.
-     *
-     * @return false if a job is already running on this engine
+     * Submits a job. Returns false if a job is already running - there is no queue and no second
+     * job, by design.
      */
-    public boolean start(File sourceDir, File destDir, JobType jobType,
-                         Selection sourceSelection, Selection destSelection,
-                         ProgressListener listener) {
-        if (!jobRunning.compareAndSet(false, true)) {
+    public boolean start(JobRequest request, ProgressListener listener) {
+        if (closed || !jobRunning.compareAndSet(false, true)) {
             return false;
         }
-        status.set(JobStatus.RUNNING);
+        beginJob(request, listener);
         try {
-            jobExecutor.submit(() -> runGuarded(sourceDir, destDir, jobType,
-                    sourceSelection, destSelection, listener));
+            jobWorker.submit(() -> finishJob(runGuarded(request, listener), listener));
             return true;
-        } catch (RejectedExecutionException e) {
+        } catch (RuntimeException e) {
             jobRunning.set(false);
-            status.set(JobStatus.IDLE);
-            return false;
+            status.set(JobStatus.FAILED);
+            throw e;
+        }
+    }
+
+    /** Synchronous variant, for tests and headless callers. Blocks until the job finishes. */
+    public JobResult execute(JobRequest request, ProgressListener listener) {
+        if (closed) {
+            throw new IllegalStateException("Engine is closed");
+        }
+        if (!jobRunning.compareAndSet(false, true)) {
+            throw new IllegalStateException("Engine is busy: a job is already running");
+        }
+        beginJob(request, listener);
+        return finishJob(runGuarded(request, listener), listener);
+    }
+
+    /** One-shot convenience: private engine, single job, no reuse. */
+    public static JobResult runOnce(JobRequest request, ProgressListener listener) {
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            return engine.execute(request, listener);
         }
     }
 
     /**
-     * Requests cancellation of the running job: the flag is set and the live rsync process (plus
-     * its descendants) is killed. The job then completes through {@link ProgressListener#onCompletion}
-     * with a FAILED result carrying the counters gathered so far.
-     *
-     * @return true if a job was running
+     * Ask the running job to stop, and kill {@code rsync} if it is the one holding the job.
+     * Returns true when a job was actually running.
      */
     public boolean cancel() {
         if (!isRunning()) {
             return false;
         }
-        cancelRequested = true;
-        markActivity("cancellation requested");
-        killProcess();
+        cancelRequested.set(true);
+        markActivity("cancel requested");
+        terminateRsync();
         return true;
-    }
-
-    /** Runs the job on the calling thread. Throws if another job is already running. */
-    public JobResult execute(File sourceDir, File destDir, JobType jobType,
-                             Selection sourceSelection, Selection destSelection,
-                             ProgressListener listener) {
-        if (!jobRunning.compareAndSet(false, true)) {
-            throw new IllegalStateException("A job is already running on this engine");
-        }
-        status.set(JobStatus.RUNNING);
-        return runGuarded(sourceDir, destDir, jobType, sourceSelection, destSelection, listener);
-    }
-
-    /** One-shot convenience for headless callers: private engine, synchronous run, shut down. */
-    public static JobResult runOnce(File sourceDir, File destDir, JobType jobType,
-                                    Selection sourceSelection, Selection destSelection,
-                                    ProgressListener listener) {
-        try (FileSyncEngine engine = new FileSyncEngine()) {
-            return engine.execute(sourceDir, destDir, jobType, sourceSelection, destSelection, listener);
-        }
     }
 
     @Override
     public void close() {
+        closed = true;
         cancel();
-        jobExecutor.shutdownNow();
-        watchdogExecutor.shutdownNow();
+        watchdog.shutdownNow();
+        jobWorker.shutdownNow();
         try {
-            jobExecutor.awaitTermination(5, TimeUnit.SECONDS);
-            watchdogExecutor.awaitTermination(2, TimeUnit.SECONDS);
+            jobWorker.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        if (status.get() == JobStatus.RUNNING) {
-            status.set(JobStatus.FAILED);
-        }
-        jobRunning.set(false);
     }
 
-    private JobResult runGuarded(File sourceDir, File destDir, JobType jobType,
-                                 Selection sourceSelection, Selection destSelection,
-                                 ProgressListener listener) {
-        cancelRequested = false;
-        timedOut = false;
-        jobStartedAtMs = System.currentTimeMillis();
-        markActivity("starting");
+    private void beginJob(JobRequest request, ProgressListener listener) {
         status.set(JobStatus.RUNNING);
+        cancelRequested.set(false);
+        timeoutTriggered.set(false);
+        startedAt.set(System.nanoTime());
+        deadline.set(jobTimeoutMillis > 0
+                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(jobTimeoutMillis) : 0L);
+        markActivity("starting: " + request.jobType());
+    }
 
-        ScheduledFuture<?> watchdog = watchdogExecutor.scheduleAtFixedRate(
-                this::watchdogTick, WATCHDOG_PERIOD_MS, WATCHDOG_PERIOD_MS, TimeUnit.MILLISECONDS);
-        JobResult result = null;
-        try {
-            result = doExecute(sourceDir, destDir, jobType, sourceSelection, destSelection, listener);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            result = failure("Job interrupted: " + e.getMessage(), List.of(String.valueOf(e.getMessage())), 0);
-        } catch (IOException | NoSuchAlgorithmException | RuntimeException e) {
-            result = failure("Job failed: " + e.getMessage(), List.of(String.valueOf(e.getMessage())), 0);
-        } finally {
-            watchdog.cancel(false);
-            process = null;
-            if (result == null) {
-                result = failure("Job aborted unexpectedly.", List.of(), 0);
-            }
-            lastResult.set(result);
-            status.set(result.status());
-            jobRunning.set(false);
-        }
+    private JobResult finishJob(JobResult result, ProgressListener listener) {
+        lastResult = result;
+        status.set(result.status());
+        deadline.set(0L);
+        liveProcess.set(null);
+        jobPhase = "idle";
+        jobRunning.set(false);
         listener.onCompletion(result);
         return result;
     }
 
-    private void watchdogTick() {
-        if (!isRunning()) {
-            return;
-        }
-        long timeout = jobTimeoutMs;
-        if (timeout > NO_TIMEOUT && System.currentTimeMillis() - jobStartedAtMs > timeout) {
-            timedOut = true;
-            markActivity("timeout after " + timeout + " ms");
-            killProcess();
-        }
-    }
-
-    private void killProcess() {
-        Process live = process;
-        if (live == null || !live.isAlive()) {
-            return;
-        }
+    private JobResult runGuarded(JobRequest request, ProgressListener listener) {
         try {
-            live.descendants().forEach(handle -> handle.destroyForcibly());
-        } catch (RuntimeException ignored) {
-            // best effort
+            return doExecute(request, listener);
+        } catch (Exception e) {
+            return failure("Job aborted: " + e.getMessage(), List.of(String.valueOf(e)), List.of(), 0);
+        } finally {
+            liveProcess.set(null);
+            jobPhase = "idle";
         }
-        live.destroyForcibly();
     }
 
-    private void markActivity(String description) {
-        lastActivity = description;
-        lastActivityAtMs.set(System.currentTimeMillis());
+    // ---------------------------------------------------------------- preflight
+
+    /**
+     * Everything that can be checked before a job is worth starting; an empty list means go. The
+     * engine re-checks all of it itself, so a caller that shows this in a dialog is improving the UX,
+     * not providing the safety.
+     */
+    public static List<String> validate(JobRequest request) {
+        List<String> problems = new ArrayList<>();
+        Path source = request.sourceDir();
+        Path dest = request.destDir();
+        boolean copies = request.jobType() == JobType.COPY_AND_VERIFY;
+
+        if (source == null || !Files.isDirectory(source)) {
+            problems.add("Source is not a directory: " + source);
+        } else if (!Files.isReadable(source)) {
+            problems.add("Source directory is not readable: " + source);
+        }
+        if (dest == null || !Files.isDirectory(dest)) {
+            problems.add("Destination is not a directory: " + dest);
+        } else if (copies && !Files.isWritable(dest)) {
+            problems.add("Destination directory is not writable: " + dest);
+        } else if (!Files.isReadable(dest)) {
+            problems.add("Destination directory is not readable: " + dest);
+        }
+        if (source != null && dest != null) {
+            Path sourceKey = canonical(source);
+            Path destKey = canonical(dest);
+            if (sourceKey.equals(destKey)) {
+                problems.add("Source and destination are the same directory: " + source);
+            } else if (destKey.startsWith(sourceKey)) {
+                problems.add("Destination is inside the source directory, so the job would copy files into "
+                        + "the tree it is reading: " + dest);
+            }
+        }
+        if (copies && !isRsyncAvailable()) {
+            problems.add("rsync was not found (looked for '" + rsyncBinary()
+                    + "'). Install rsync, or use Verify Only, which needs no rsync.");
+        }
+        return problems;
+    }
+
+    /** Is the rsync binary present and runnable? Probed once and cached. */
+    public static boolean isRsyncAvailable() {
+        Boolean cached = RSYNC_AVAILABLE.get();
+        if (cached != null) {
+            return cached;
+        }
+        boolean available;
+        try {
+            // "Available" means runnable, not healthy: a missing binary fails to start at all, while
+            // a runnable one that exits non-zero is a problem the job itself should report.
+            Process probe = new ProcessBuilder(List.of(rsyncBinary(), "--version"))
+                    .redirectErrorStream(true)
+                    .start();
+            probe.getInputStream().close();
+            probe.waitFor(10, TimeUnit.SECONDS);
+            probe.destroy();
+            available = true;
+        } catch (IOException | InterruptedException e) {
+            available = false;
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        RSYNC_AVAILABLE.compareAndSet(null, available);
+        return available;
+    }
+
+    /** Test seam: point the engine at a different rsync (or a non-existent one). */
+    static void setRsyncBinary(String binary) {
+        RSYNC_BINARY.set(binary == null || binary.isBlank() ? "rsync" : binary);
+        RSYNC_AVAILABLE.set(null);
+    }
+
+    static String rsyncBinary() {
+        return RSYNC_BINARY.get();
+    }
+
+    private static Path canonical(Path path) {
+        try {
+            Path absolute = path.toAbsolutePath();
+            Path real = absolute.toRealPath();
+            return real.startsWith(absolute) ? absolute : real;
+        } catch (IOException e) {
+            return path.toAbsolutePath().normalize();
+        }
     }
 
     // ---------------------------------------------------------------- job body
 
-    private JobResult doExecute(File sourceDir, File destDir, JobType jobType,
-                                Selection sourceSelection, Selection destSelection,
-                                ProgressListener listener)
-            throws IOException, InterruptedException, NoSuchAlgorithmException {
+    private JobResult doExecute(JobRequest request, ProgressListener listener)
+            throws IOException, NoSuchAlgorithmException, InterruptedException {
 
-        if (sourceDir == null || destDir == null) {
-            return failure("Both source and destination directories must be set.", List.of(), 0);
-        }
-        Path source = sourceDir.toPath().toAbsolutePath().normalize();
-        Path dest = destDir.toPath().toAbsolutePath().normalize();
-        if (!Files.isDirectory(source)) {
-            return failure("Source directory does not exist: " + source, List.of(), 0);
-        }
-        if (!Files.isDirectory(dest)) {
-            return failure("Destination directory does not exist: " + dest, List.of(), 0);
-        }
-        if (source.equals(dest)) {
-            return failure("Source and destination are the same directory: " + source, List.of(), 0);
+        Path sourceDir = request.sourceDir().toAbsolutePath();
+        Path destDir = request.destDir().toAbsolutePath();
+
+        List<String> problems = validate(request);
+        if (!problems.isEmpty()) {
+            return failure("Preflight failed: " + String.join("; ", problems), problems, List.of(), 0);
         }
 
-        DirectoryScanner.ScanResult scan;
-        try {
-            scan = DirectoryScanner.scanFiles(source);
-        } catch (UncheckedIOException e) {
-            return failure("Could not scan source directory " + source + ": " + e.getMessage(),
-                    List.of(String.valueOf(e.getMessage())), 0);
+        Selection src = normalize(request.sourceSelection());
+        Selection dst = normalize(request.destinationSelection());
+        ScanOptions options = request.scanOptions();
+        boolean verifyOnly = request.jobType() == JobType.VERIFY_ONLY;
+
+        if (src.selected().isEmpty() && dst.selected().isEmpty()) {
+            return failure("No files were selected: an empty selection means no files, not all files.",
+                    List.of(), List.of(), 0);
         }
 
-        Selection src = normalize(sourceSelection);
-        Selection dst = normalize(destSelection);
+        markActivity("scanning " + sourceDir);
+        DirectoryScanner.ScanResult scan = DirectoryScanner.scanFiles(sourceDir, options);
+        DirectoryScanner.ScanResult destScan = verifyOnly ? DirectoryScanner.scanFiles(destDir, options) : null;
+        Set<String> sourceRels = new HashSet<>();
+        for (FileEntry entry : scan.files()) {
+            sourceRels.add(entry.relPath());
+        }
 
-        // Verify Only honours unticking a row in the destination list, but only for a row the
-        // user's list actually contains. A file that is merely absent from a stale destination
-        // list is not a deliberate untick, and must still be checked (this is also the "missing"
-        // case, so it has to stay reachable).
         List<FileEntry> workSet = new ArrayList<>();
         for (FileEntry entry : scan.files()) {
             String rel = entry.relPath();
             if (!src.selected().contains(rel)) {
                 continue;
             }
-            if (jobType == JobType.VERIFY_ONLY
-                    && dst.known().contains(rel)
-                    && !dst.selected().contains(rel)) {
+            // Exclusion requires a destination row the user actually saw and left unticked.
+            if (verifyOnly && dst.known().contains(rel) && !dst.selected().contains(rel)) {
                 continue;
             }
             workSet.add(entry);
         }
 
-        List<String> warnings = new ArrayList<>(scan.warnings());
-        if (workSet.isEmpty()) {
-            return failure("Nothing to do: the selection is empty, so no files were copied or verified. "
-                            + "Use Select All to include every file.",
-                    List.of("Empty selection (" + scan.files().size() + " file(s) in source)."), 0);
+        List<FileEntry> extras = new ArrayList<>();
+        if (destScan != null && request.detectExtraFiles()) {
+            for (FileEntry entry : destScan.files()) {
+                String rel = entry.relPath();
+                if (sourceRels.contains(rel)) {
+                    continue;
+                }
+                if (dst.known().contains(rel) && !dst.selected().contains(rel)) {
+                    continue;
+                }
+                extras.add(entry);
+            }
         }
 
-        listener.onPhase("Work set: " + workSet.size() + " selected file(s) of "
-                + scan.files().size() + " in source"
-                + (scan.ignoredDirs() > 0 ? "; " + scan.ignoredDirs() + " ignored dir(s)" : "")
-                + (scan.skippedLinks() > 0 ? "; " + scan.skippedLinks() + " symlink(s) skipped" : ""));
+        int workTotal = workSet.size() + extras.size();
+        if (workTotal == 0) {
+            return failure("Empty work set: 0 selected source files and 0 destination-only files survived "
+                            + "the selection, so there is nothing to do.",
+                    List.of(), List.of(), 0);
+        }
 
-        int copied = 0;
-        int rsyncExitCode = 0;
         List<String> errors = new ArrayList<>();
-
-        if (jobType == JobType.COPY_AND_VERIFY) {
-            listener.onPhase("Copying " + workSet.size() + " file(s) with rsync...");
-            RsyncRun run = runRsync(source, dest, workSet, listener);
-            copied = run.filesCopied();
-            rsyncExitCode = run.exitCode();
-            errors.addAll(run.errors());
-            warnings.addAll(run.warnings());
-
-            if (cancelRequested) {
-                return cancelled(copied, 0, 0, 0, 0, rsyncExitCode);
-            }
-            if (timedOut) {
-                return timeoutResult(copied, 0, 0, 0, 0, rsyncExitCode);
-            }
-            if (run.aborted()) {
-                return failure("rsync failed with exit code " + run.exitCode() + ".",
-                        run.errors(), run.exitCode());
-            }
-            listener.onPhase("rsync finished (exit " + run.exitCode() + "), " + copied
-                    + " file(s) transferred.");
+        List<String> warnings = new ArrayList<>(scan.warnings());
+        if (destScan != null) {
+            warnings.addAll(destScan.warnings());
+        }
+        if (scan.skippedLinks() > 0) {
+            warnings.add(scan.skippedLinks() + " symbolic link(s) in the source were ignored; change the "
+                    + "symlink policy to copy or verify them.");
         }
 
-        int matched = 0;
-        int mismatched = 0;
-        int missing = 0;
-        int done = 0;
-        boolean logMatches = jobType == JobType.VERIFY_ONLY;
+        int rsyncExitCode = 0;
+        ProgressReporter progress = new ProgressReporter(workTotal, listener);
+        List<FileOutcome> outcomes = new ArrayList<>();
+        Map<String, String> sourceHashes = Map.of();
 
-        listener.onPhase("Verifying " + workSet.size() + " file(s)...");
-        ProgressReporter progress = jobType == JobType.COPY_AND_VERIFY
-                ? new ProgressReporter(listener, workSet.size(), COPY_PROGRESS_END, 100 - COPY_PROGRESS_END)
-                : new ProgressReporter(listener, workSet.size(), 0, 100);
+        if (!verifyOnly) {
+            listener.onPhase("copying");
+            jobPhase = "copy";
+            progress.update(0, "Hashing " + workSet.size() + " source file(s) before copying...");
+            // Hashed once, before the copy: these same digests are reused for the comparison below.
+            sourceHashes = hashFiles(workSet, "source", warnings);
+
+            Path filesFrom = writeFilesFrom(workSet, warnings);
+            if (filesFrom == null) {
+                return failure("No selected file name could be handed to rsync (each contains a newline or "
+                        + "NUL byte); deselect them and retry.", errors, warnings, 0);
+            }
+            try {
+                Process process = new ProcessBuilder(buildRsyncCommand(sourceDir, destDir, filesFrom, options))
+                        .redirectErrorStream(true)
+                        .start();
+                liveProcess.set(process);
+
+                int copied = pumpRsyncOutput(process, progress, errors, warnings, listener);
+                rsyncExitCode = process.waitFor();
+                markActivity("rsync exit " + rsyncExitCode);
+
+                if (timeoutWasTriggered()) {
+                    return timeoutResult(progress, outcomes, errors, warnings);
+                }
+                if (cancelRequested.get()) {
+                    return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings);
+                }
+                if (!isSuccessfulExit(rsyncExitCode)) {
+                    errors.add("rsync exited with code " + rsyncExitCode);
+                    return failure("rsync failed (exit code " + rsyncExitCode + ")", errors, warnings,
+                            rsyncExitCode);
+                }
+                if (rsyncExitCode == 24) {
+                    warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
+                }
+                progress.copyComplete(copied);
+            } finally {
+                Files.deleteIfExists(filesFrom);
+            }
+        }
+
+        listener.onPhase("verifying");
+        jobPhase = "verify";
+        progress.verifyStart(!verifyOnly);
+
+        List<FileEntry> destTargets = new ArrayList<>();
+        for (FileEntry entry : concat(workSet, extras)) {
+            destTargets.add(new FileEntry(entry.relPath(), destDir.resolve(entry.relPath())));
+        }
+
+        Map<String, String> destHashes;
+        if (verifyOnly) {
+            sourceHashes = hashFiles(workSet, "source", warnings);
+            destHashes = hashFiles(destTargets, "destination", warnings);
+        } else {
+            destHashes = hashFiles(destTargets, "destination", warnings);
+        }
+        if (timeoutWasTriggered()) {
+            return timeoutResult(progress, outcomes, errors, warnings);
+        }
+        if (cancelRequested.get()) {
+            return cancelledDuringVerify(progress, outcomes, errors, warnings);
+        }
 
         for (FileEntry entry : workSet) {
-            if (cancelRequested) {
-                return cancelled(copied, done, matched, mismatched, missing, rsyncExitCode);
+            if (cancelRequested.get() || deadlineExceeded()) {
+                break;
             }
-            if (timedOut) {
-                return timeoutResult(copied, done, matched, mismatched, missing, rsyncExitCode);
-            }
-
             String rel = entry.relPath();
-            String srcHash;
+            String sourceHash = sourceHashes.get(rel);
+            String destHash = destHashes.get(rel);
+            markActivity("verified " + rel);
+            if (destHash != null && sourceHash != null && sourceHash.equals(destHash)) {
+                progress.countMatched();
+                recordOutcome(outcomes, listener, rel, "OK", sourceHash, destHash);
+            } else if (sourceHash == null && !Files.isRegularFile(entry.absolutePath())) {
+                progress.countMissing();
+                recordOutcome(outcomes, listener, rel, "MISSING", null, destHash);
+            } else if (destHash == null) {
+                progress.countMissing();
+                recordOutcome(outcomes, listener, rel, "MISSING", sourceHash, null);
+            } else {
+                progress.countMismatched();
+                recordOutcome(outcomes, listener, rel, "MISMATCH", sourceHash, destHash);
+            }
+            progress.verifiedFile(!verifyOnly);
+        }
+
+        for (FileEntry entry : extras) {
+            if (cancelRequested.get() || deadlineExceeded()) {
+                break;
+            }
+            progress.countExtra();
+            markActivity("verified " + entry.relPath());
+            recordOutcome(outcomes, listener, entry.relPath(), "EXTRA", null,
+                    destHashes.get(entry.relPath()));
+            progress.verifiedFile(!verifyOnly);
+        }
+
+        if (outcomes.size() >= MAX_OUTCOMES) {
+            warnings.add("Results list truncated at " + MAX_OUTCOMES + " entries; counters are still exact.");
+        }
+
+        if (timeoutWasTriggered()) {
+            return timeoutResult(progress, outcomes, errors, warnings);
+        }
+        if (cancelRequested.get()) {
+            return cancelledDuringVerify(progress, outcomes, errors, warnings);
+        }
+
+        progress.finish("Verification complete");
+        listener.onPhase("done");
+
+        StringBuilder message = new StringBuilder("Job complete: ")
+                .append(progress.matched()).append(" matched, ")
+                .append(progress.mismatched()).append(" mismatched, ")
+                .append(progress.missing()).append(" missing, ")
+                .append(progress.copied()).append(" copied");
+        if (progress.extra() > 0) {
+            message.append(", ").append(progress.extra()).append(" destination-only");
+        }
+        message.append(".");
+        return new JobResult(JobStatus.COMPLETED, message.toString(),
+                progress.processed(), progress.matched(), progress.mismatched(), progress.missing(),
+                progress.extra(), progress.copied(), rsyncExitCode, outcomes, errors, warnings);
+    }
+
+    /** Records one verification outcome and the matching streaming-log callback (short hashes). */
+    private static void recordOutcome(List<FileOutcome> outcomes, ProgressListener listener, String rel,
+                                      String kind, String sourceHash, String destHash) {
+        if (outcomes.size() < MAX_OUTCOMES) {
+            outcomes.add(new FileOutcome(rel, kind, sourceHash, destHash));
+        }
+        listener.onFileProcessed(rel, kind,
+                sourceHash == null ? null : FileHasher.shortHash(sourceHash),
+                destHash == null ? null : FileHasher.shortHash(destHash));
+    }
+
+    private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
+                                          int exitCode, List<String> errors, List<String> warnings) {
+        String message = "Job cancelled by the user after " + progress.copied() + " file(s) announced for "
+                + "copy and " + progress.processed() + " file(s) verified (matched: " + progress.matched()
+                + ", mismatched: " + progress.mismatched() + ", missing: " + progress.missing()
+                + "). rsync exit code: " + exitCode + ".";
+        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
+                progress.mismatched(), progress.missing(), progress.extra(), progress.copied(), exitCode,
+                outcomes, errors,
+                withWarning(warnings, "rsync was terminated; an interrupted transfer may leave a "
+                        + "hidden temporary file in the destination directory."));
+    }
+
+    private JobResult cancelledDuringVerify(ProgressReporter progress, List<FileOutcome> outcomes,
+                                            List<String> errors, List<String> warnings) {
+        String message = "Job cancelled during verification after " + progress.processed()
+                + " of " + progress.workTotal() + " file(s) were checked.";
+        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
+                progress.mismatched(), progress.missing(), progress.extra(), progress.copied(), 0,
+                outcomes, errors, warnings);
+    }
+
+    private JobResult timeoutResult(ProgressReporter progress, List<FileOutcome> outcomes,
+                                    List<String> errors, List<String> warnings) {
+        String message = "Job aborted: it exceeded the " + jobTimeoutMillis + " ms timeout after "
+                + progress.copied() + " file(s) copied and " + progress.processed() + " file(s) verified.";
+        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
+                progress.mismatched(), progress.missing(), progress.extra(), progress.copied(), 0,
+                outcomes, errors,
+                withWarning(warnings, "Increase or clear the job timeout if this job is expected to "
+                        + "take longer."));
+    }
+
+    private static List<String> withWarning(List<String> warnings, String text) {
+        List<String> extended = new ArrayList<>(warnings);
+        extended.add(text);
+        return extended;
+    }
+
+    private static List<FileEntry> concat(List<FileEntry> a, List<FileEntry> b) {
+        List<FileEntry> all = new ArrayList<>(a.size() + b.size());
+        all.addAll(a);
+        all.addAll(b);
+        return all;
+    }
+
+    /**
+     * Hashes a batch of files on a bounded pool. Files that are unreadable are omitted from the
+     * result and recorded in {@code warnings}; "missing" is then inferred by the caller from the
+     * absence of both a hash and a file.
+     */
+    private Map<String, String> hashFiles(List<FileEntry> entries, String side, List<String> warnings)
+            throws NoSuchAlgorithmException {
+        if (entries.isEmpty()) {
+            return Map.of();
+        }
+        int threads = Math.min(MAX_HASH_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
+        ExecutorService pool = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "hash-" + side);
+            thread.setDaemon(true);
+            return thread;
+        });
+        Map<String, Future<String>> futures = new LinkedHashMap<>();
+        try {
+            for (FileEntry entry : entries) {
+                if (cancelRequested.get() || deadlineExceeded()) {
+                    break;
+                }
+                Path path = entry.absolutePath();
+                futures.put(entry.relPath(), pool.submit(() -> {
+                    if (cancelRequested.get() || deadlineExceeded()) {
+                        return null;
+                    }
+                    return FileHasher.computeHash(path);
+                }));
+            }
+        } finally {
+            pool.shutdown();
+        }
+
+        Map<String, String> hashes = new LinkedHashMap<>();
+        NoSuchAlgorithmException pending = null;
+        for (Map.Entry<String, Future<String>> future : futures.entrySet()) {
             try {
-                srcHash = FileHasher.computeHash(entry.absolutePath());
-            } catch (IOException e) {
-                missing++;
-                warnings.add("Source file could not be read (vanished during job?): " + rel);
-                listener.onFileProcessed(rel, "missing", "", "");
-                progress.update(++done, statusText(done, workSet.size(), matched, mismatched, missing));
-                markActivity("verified " + rel);
+                String hash = future.getValue().get();
+                if (hash != null) {
+                    hashes.put(future.getKey(), hash);
+                }
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                    pending = algorithmException;
+                } else {
+                    warnings.add("Could not read " + side + " file: " + future.getKey()
+                            + " (" + e.getCause() + ")");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (pending != null) {
+            throw pending;
+        }
+        return hashes;
+    }
+
+    /**
+     * Writes the rsync {@code --files-from} list, or returns null when no selected name is usable.
+     * The file is UTF-8 and always deleted by the caller's finally block.
+     */
+    private Path writeFilesFrom(List<FileEntry> workSet, List<String> warnings) throws IOException {
+        List<String> relPaths = new ArrayList<>();
+        for (FileEntry entry : workSet) {
+            String rel = entry.relPath();
+            if (rel.indexOf('\n') >= 0 || rel.indexOf('\0') >= 0) {
+                warnings.add("Skipped from copy: file name contains a newline or NUL byte: " + rel);
                 continue;
             }
+            relPaths.add(rel);
+        }
+        if (relPaths.isEmpty()) {
+            return null;
+        }
+        Path listFile = Files.createTempFile("filecopy_list_", ".txt");
+        try (BufferedWriter writer = Files.newBufferedWriter(listFile, StandardCharsets.UTF_8)) {
+            for (String rel : relPaths) {
+                writer.write(rel);
+                writer.newLine();
+            }
+        }
+        return listFile;
+    }
 
-            Path destFile = dest.resolve(rel);
-            if (!Files.isRegularFile(destFile)) {
-                missing++;
-                listener.onFileProcessed(rel, "missing", FileHasher.shortHash(srcHash), "");
-            } else {
-                String destHash = FileHasher.computeHash(destFile);
-                if (destHash.equals(srcHash)) {
-                    matched++;
-                    if (logMatches) {
-                        listener.onFileProcessed(rel, "match", FileHasher.shortHash(srcHash),
-                                FileHasher.shortHash(destHash));
+    private List<String> buildRsyncCommand(Path sourceDir, Path destDir, Path filesFrom, ScanOptions options) {
+        List<String> command = new ArrayList<>();
+        command.add(rsyncBinary());
+        command.add("-a");
+        command.add("--checksum");
+        command.add("--itemize-changes");
+        command.add("--info=progress2");
+        if (options.symlinkPolicy() == ScanOptions.SymlinkPolicy.FOLLOW) {
+            command.add("--copy-links");
+        }
+        command.add("--files-from=" + filesFrom);
+        command.add(sourceDir.toString());
+        command.add(destDir.toString());
+        return command;
+    }
+
+    /**
+     * Reads merged rsync stdout/stderr until the process exits, reporting copy progress as it goes.
+     * Returns the number of files rsync announced as transferring.
+     */
+    private int pumpRsyncOutput(Process process, ProgressReporter progress, List<String> errors,
+                                List<String> warnings, ProgressListener listener) throws IOException {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (cancelRequested.get() || timeoutWasTriggered()) {
+                    // The process is being killed; stop reading and stop counting announcements.
+                    break;
+                }
+                int percent = rsyncTransferPercent(line);
+                if (percent >= 0) {
+                    // rsync's own global percentage: the only trustworthy copy-progress signal, since
+                    // itemize lines appear before the file's data has moved.
+                    progress.rsyncPercent(percent);
+                    markActivity(line.trim());
+                    continue;
+                }
+                switch (classifyLine(line)) {
+                    case COPY -> {
+                        progress.countCopied();
+                        String rel = itemizePath(line);
+                        if (rel != null) {
+                            listener.onFileProcessed(rel, "COPIED", null, null);
+                        }
+                        markActivity(line.trim());
                     }
-                } else {
-                    mismatched++;
-                    listener.onFileProcessed(rel, "mismatch", FileHasher.shortHash(srcHash),
-                            FileHasher.shortHash(destHash));
+                    case DIRECTORY -> {
+                        // Directory creation is implied by --files-from; nothing to count.
+                    }
+                    case ERROR -> {
+                        String message = line.trim();
+                        errors.add(message);
+                        markActivity(message);
+                    }
+                    case WARNING -> {
+                        warnings.add(line.trim());
+                        markActivity(line.trim());
+                    }
+                    case IGNORED -> {
+                        // no action
+                    }
                 }
             }
-            progress.update(++done, statusText(done, workSet.size(), matched, mismatched, missing));
-            markActivity("verified " + rel);
-
-            // A single large hash can overrun the deadline; catch it as soon as the work unit ends
-            // instead of waiting for the next iteration (or never).
-            if (cancelRequested) {
-                return cancelled(copied, done, matched, mismatched, missing, rsyncExitCode);
+        } catch (IOException e) {
+            if (!cancelRequested.get() && !deadlineExceeded()) {
+                throw e;
             }
-            if (timedOut) {
-                return timeoutResult(copied, done, matched, mismatched, missing, rsyncExitCode);
-            }
+            // Cancel/timeout killed the process: a closed pipe is expected, not a job failure.
         }
-        progress.complete(statusText(done, workSet.size(), matched, mismatched, missing));
+        return progress.copied();
+    }
 
-        if (cancelRequested) {
-            return cancelled(copied, done, matched, mismatched, missing, rsyncExitCode);
+    /**
+     * Extracts the relative path from an itemize line, or null when the line carries no name.
+     *
+     * <p>The itemize column is space-free but not fixed-length across rsync flavours
+     * ({@code >f+++++++++ a.txt}, {@code >f.st.... sub/a.txt}), so the split point is the first
+     * space rather than a hard-coded offset.
+     */
+    static String itemizePath(String line) {
+        String trimmed = line.trim();
+        if (!trimmed.startsWith(">") && !trimmed.startsWith("<")) {
+            return null;
         }
-        if (timedOut) {
-            return timeoutResult(copied, done, matched, mismatched, missing, rsyncExitCode);
+        int space = trimmed.indexOf(' ');
+        if (space < 0) {
+            return null;
         }
-
-        String message = jobType == JobType.COPY_AND_VERIFY
-                ? String.format("Copy & Verify Complete: %d file(s) checked, %d copied, %d matched, %d mismatched, %d missing",
-                    workSet.size(), copied, matched, mismatched, missing)
-                : String.format("Verification Complete: %d file(s) checked, %d matched, %d mismatched, %d missing",
-                    workSet.size(), matched, mismatched, missing);
-
-        return new JobResult(JobStatus.COMPLETED, message, done, matched, mismatched, missing,
-                copied, rsyncExitCode, errors, warnings);
+        String path = trimmed.substring(space + 1).trim();
+        return path.isEmpty() ? null : path.replaceAll("/$", "");
     }
 
-    private static String statusText(int done, int total, int matched, int mismatched, int missing) {
-        return String.format("Verifying %d/%d - matched: %d, mismatched: %d, missing: %d",
-                done, total, matched, mismatched, missing);
-    }
-
-    private JobResult cancelled(int copied, int checked, int matched, int mismatched, int missing,
-                                int rsyncExitCode) {
-        String message = String.format(
-                "Job cancelled by the user after %d file(s) copied and %d file(s) verified "
-                        + "(matched: %d, mismatched: %d, missing: %d).",
-                copied, checked, matched, mismatched, missing);
-        return new JobResult(JobStatus.FAILED, message, checked, matched, mismatched, missing, copied,
-                rsyncExitCode, List.of(),
-                List.of("rsync was terminated; an interrupted transfer may leave a hidden "
-                        + "temporary file in the destination directory."));
-    }
-
-    private JobResult timeoutResult(int copied, int checked, int matched, int mismatched, int missing,
-                                    int rsyncExitCode) {
-        String message = String.format(
-                "Job aborted: it exceeded the %d ms timeout after %d file(s) copied and %d file(s) verified. "
-                        + "rsync was terminated.",
-                jobTimeoutMs, copied, checked);
-        return new JobResult(JobStatus.FAILED, message, checked, matched, mismatched, missing, copied,
-                rsyncExitCode, List.of(), List.of("Increase or clear the job timeout if this job is "
-                        + "expected to take longer."));
-    }
-
-    private static JobResult failure(String message, List<String> errors, int rsyncExitCode) {
-        return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, rsyncExitCode, errors, List.of());
-    }
-
-    // ---------------------------------------------------------------- rsync
-
-    private record RsyncRun(int exitCode, int filesCopied, int dirsCreated, boolean aborted,
-                            List<String> errors, List<String> warnings) {
-    }
-
-    static boolean isSuccessfulExit(int exitCode) {
-        // 0 = ok, 24 = "some files vanished before they could be transferred" (warning only).
-        return exitCode == 0 || exitCode == 24;
+    /** Percent from an rsync progress line, or -1 when the line is not one. */
+    static int rsyncTransferPercent(String line) {
+        Matcher matcher = RSYNC_PERCENT.matcher(line);
+        if (!matcher.find()) {
+            return -1;
+        }
+        try {
+            return Math.min(100, Integer.parseInt(matcher.group(1)));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     enum LineKind { COPY, DIRECTORY, ERROR, WARNING, IGNORED }
 
+    /**
+     * Classifies one rsync output line. With {@code -i} each change line is an update type followed by
+     * the item type: update type {@code >} (received), {@code <} (sent), {@code c} (local create or
+     * change, which is how a created directory and a changed symlink are reported), {@code h} (hard
+     * link), {@code .} (not updated) or {@code *} (a message); item type {@code f} file, {@code d}
+     * directory, {@code L} symlink, {@code D} device, {@code S} special file. So a created symlink is
+     * {@code cL}, a created directory is {@code cd}, and a local copy of a file is {@code >f}. rsync
+     * writes problems as {@code rsync: ...} or {@code rsync error: ...}; a line starting with
+     * whitespace is a {@code --info=progress2} progress line.
+     */
     static LineKind classifyLine(String line) {
         if (line == null || line.isBlank()) {
             return LineKind.IGNORED;
         }
-        // Local copies report the receiver side (">f"), pushes report the sender side ("<f").
-        if (line.startsWith(">f") || line.startsWith("<f")) {
-            return LineKind.COPY;
-        }
-        if (line.startsWith("cd") || line.startsWith(">d") || line.startsWith("<d")) {
-            return LineKind.DIRECTORY;
-        }
-        if (line.startsWith("rsync: ") || line.startsWith("rsync error")) {
+        String trimmed = line.trim();
+        if (trimmed.startsWith("rsync error:")) {
             return LineKind.ERROR;
         }
-        if (line.startsWith("rsync warning")) {
+        if (trimmed.startsWith("rsync warning:")) {
             return LineKind.WARNING;
         }
-        return LineKind.IGNORED;
+        if (trimmed.startsWith("rsync:")) {
+            // rsync reports per-file problems with a bare "rsync:" prefix, and not all of them are
+            // warnings ("rsync: ... some files vanished ..." is one).
+            return trimmed.contains("failed:") || trimmed.contains("error")
+                    ? LineKind.ERROR : LineKind.WARNING;
+        }
+        char update = line.charAt(0);
+        char type = line.length() > 1 ? line.charAt(1) : 0;
+        switch (update) {
+            case '>':
+            case '<':
+            case 'c':
+            case 'h':
+                // An entry rsync created or changed. A directory is bookkeeping, everything else is a
+                // copied item - a symlink counts even though no file data moves.
+                if (type == 'd') {
+                    return LineKind.DIRECTORY;
+                }
+                return type == 'f' || type == 'L' || type == 'D' || type == 'S'
+                    ? LineKind.COPY : LineKind.IGNORED;
+            case '.':
+                // Nothing was transferred; only attributes may have been set.
+                return type == 'd' ? LineKind.DIRECTORY : LineKind.IGNORED;
+            case '*':
+                // A message line such as "*deleting   old.txt"; only reachable with --delete.
+                return LineKind.WARNING;
+            default:
+                return LineKind.IGNORED;
+        }
     }
 
-    /** The path printed after the itemize prefix; it is relative to the transfer root. */
-    static String itemizePath(String line) {
-        int space = line.indexOf(' ');
-        return space < 0 || space == line.length() - 1 ? "" : line.substring(space + 1).trim();
+    /** rsync exit codes 0 and 24 are success for our purposes; 24 is reported as a warning. */
+    static boolean isSuccessfulExit(int exitCode) {
+        return exitCode == 0 || exitCode == 24;
     }
 
-    private RsyncRun runRsync(Path source, Path dest, List<FileEntry> workSet, ProgressListener listener)
-            throws IOException, InterruptedException {
-
-        List<FileEntry> listable = new ArrayList<>();
-        List<String> warnings = new ArrayList<>();
-        for (FileEntry entry : workSet) {
-            String rel = entry.relPath();
-            if (rel.indexOf('\n') >= 0 || rel.indexOf('\0') >= 0) {
-                warnings.add("Not passed to rsync (name contains a newline or NUL byte): " + rel);
+    /** Normalizes caller-supplied relative paths to the FileEntry form. */
+    static Set<String> normalize(Set<String> relPaths) {
+        Set<String> normalized = new HashSet<>();
+        for (String rel : relPaths) {
+            if (rel == null) {
                 continue;
             }
-            listable.add(entry);
-        }
-        List<String> errors = new ArrayList<>();
-        if (listable.isEmpty()) {
-            return new RsyncRun(-1, 0, 0, true,
-                    List.of("No file name could be safely passed to rsync --files-from."), warnings);
-        }
-        if (cancelRequested) {
-            return new RsyncRun(-1, 0, 0, true, List.of(), warnings);
-        }
-
-        Path listFile = Files.createTempFile("file-copy-util-files-", ".txt");
-        int exitCode = -1;
-        int copied = 0;
-        int dirsCreated = 0;
-        try {
-            try (BufferedWriter writer = Files.newBufferedWriter(listFile, StandardCharsets.UTF_8)) {
-                for (FileEntry entry : listable) {
-                    writer.write(entry.relPath());
-                    writer.newLine();
-                }
+            String trimmed = rel.replace(java.io.File.separatorChar, '/').trim();
+            while (trimmed.startsWith("/")) {
+                trimmed = trimmed.substring(1);
             }
-
-            // --relative and --dirs are implied by --files-from in rsync 3.x, so the directory
-            // structure of each listed path is recreated under the destination.
-            List<String> cmd = List.of("rsync", "-a", "--checksum", "--itemize-changes",
-                    "--files-from=" + listFile.toAbsolutePath(),
-                    source.toString(), dest.toString());
-
-            Process started;
-            try {
-                ProcessBuilder pb = new ProcessBuilder(cmd);
-                pb.redirectErrorStream(true);
-                started = pb.start();
-            } catch (IOException e) {
-                return new RsyncRun(-1, 0, 0, true, List.of(
-                        "Could not start rsync (" + e.getMessage() + "). Is rsync installed and on PATH?"),
-                        warnings);
-            }
-            process = started;
-
-            ProgressReporter progress = new ProgressReporter(listener, listable.size(), 0, ANNOUNCE_PROGRESS_END);
-            int processed = 0;
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(started.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    markActivity("rsync: " + line.trim());
-                    switch (classifyLine(line)) {
-                        case COPY -> {
-                            copied++;
-                            processed++;
-                            listener.onFileProcessed(itemizePath(line), "copied", "", "");
-                        }
-                        case DIRECTORY -> {
-                            dirsCreated++;
-                            processed++;
-                        }
-                        case ERROR -> errors.add(line.trim());
-                        case WARNING -> warnings.add(line.trim());
-                        case IGNORED -> {
-                        }
-                    }
-                    progress.update(processed, "Copying: " + copied + " transferred, "
-                            + dirsCreated + " dir(s) created");
-                    if (cancelRequested || timedOut) {
-                        killProcess();
-                        break;
-                    }
-                }
-            } catch (IOException e) {
-                // Expected when the process is killed: the pipe closes mid-read.
-                if (!cancelRequested && !timedOut) {
-                    errors.add("Failed reading rsync output: " + e.getMessage());
-                }
-            }
-            exitCode = started.waitFor();
-            if (isSuccessfulExit(exitCode)) {
-                progress.finishAt(COPY_PROGRESS_END, "rsync finished; preparing verification");
-            }
-        } finally {
-            process = null;
-            try {
-                Files.deleteIfExists(listFile);
-            } catch (IOException ignored) {
-                // best effort
+            if (!trimmed.isEmpty()) {
+                normalized.add(trimmed);
             }
         }
-
-        boolean aborted = !cancelRequested && !timedOut && !isSuccessfulExit(exitCode);
-        return new RsyncRun(exitCode, copied, dirsCreated, aborted, errors, warnings);
+        return normalized;
     }
-
-    // ---------------------------------------------------------------- helpers
 
     static Selection normalize(Selection selection) {
         if (selection == null) {
@@ -688,67 +966,182 @@ public final class FileSyncEngine implements AutoCloseable {
         return new Selection(normalize(selection.selected()), normalize(selection.known()));
     }
 
-    /** Normalizes caller-supplied relative paths to the FileEntry form. */
-    static Set<String> normalize(Set<String> relPaths) {
-        Set<String> out = new LinkedHashSet<>();
-        if (relPaths == null) {
-            return out;
+    // ---------------------------------------------------------------- watchdog
+
+    private void watchdogTick() {
+        if (!isRunning()) {
+            return;
         }
-        for (String p : relPaths) {
-            if (p == null) {
-                continue;
-            }
-            String s = p.trim().replace(java.io.File.separatorChar, '/');
-            while (s.startsWith("/")) {
-                s = s.substring(1);
-            }
-            if (!s.isEmpty()) {
-                out.add(s);
-            }
+        long deadlineNanos = deadline.get();
+        if (deadlineNanos != 0L && System.nanoTime() > deadlineNanos) {
+            timeoutTriggered.set(true);
+            cancelRequested.set(true);
+            markActivity("timeout after " + jobTimeoutMillis + " ms in phase " + jobPhase);
+            terminateRsync();
         }
-        return out;
     }
 
     /**
-     * Emits progress only when the integer percentage changes, so a 100k-file job produces at
-     * most 101 callbacks instead of one per file.
+     * True when the watchdog, not the user, ended the job. The watchdog also sets the cancel flag, so
+     * without this the two abort reasons would be indistinguishable in the result.
+     */
+    private boolean timeoutWasTriggered() {
+        return timeoutTriggered.get();
+    }
+
+    private void markActivity(String description) {
+        lastActivityAt.set(System.currentTimeMillis());
+        lastActivity.set(description == null ? "" : description);
+    }
+
+    private boolean deadlineExceeded() {
+        long deadlineNanos = deadline.get();
+        return deadlineNanos != 0L && System.nanoTime() > deadlineNanos;
+    }
+
+    /** Kills the live rsync process and everything it spawned. Safe to call more than once. */
+    private void terminateRsync() {
+        Process process = liveProcess.get();
+        if (process == null) {
+            return;
+        }
+        process.descendants().forEach(handle -> {
+            try {
+                handle.destroyForcibly();
+            } catch (IllegalStateException | SecurityException e) {
+                // Already gone, or not ours to kill.
+            }
+        });
+        process.destroy();
+        try {
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode) {
+        return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, 0, exitCode, List.of(), errors,
+                warnings);
+    }
+
+    /**
+     * Progress bookkeeping against the work-set size, with integer-percent coalescing and a
+     * monotonic bar (progress never moves backwards within a job).
      */
     private static final class ProgressReporter {
+
+        private final int workTotal;
         private final ProgressListener listener;
-        private final int total;
-        private final int phaseStart;
-        private final int phaseSpan;
+        private int processed;
+        private int matched;
+        private int mismatched;
+        private int missing;
+        private int extra;
+        private int copied;
+        private int rsyncPercent = -1;
         private int lastPercent = -1;
 
-        ProgressReporter(ProgressListener listener, int total, int phaseStart, int phaseSpan) {
+        ProgressReporter(int workTotal, ProgressListener listener) {
+            this.workTotal = workTotal;
             this.listener = listener;
-            this.total = total;
-            this.phaseStart = phaseStart;
-            this.phaseSpan = phaseSpan;
         }
 
-        void update(int done, String statusText) {
-            int percent = total <= 0 ? phaseStart
-                    : phaseStart + (int) Math.round((double) Math.min(done, total) / total * phaseSpan);
-            percent = Math.max(0, Math.min(100, percent));
-            if (percent == lastPercent) {
+        int workTotal() {
+            return workTotal;
+        }
+
+        int processed() {
+            return processed;
+        }
+
+        int matched() {
+            return matched;
+        }
+
+        int mismatched() {
+            return mismatched;
+        }
+
+        int missing() {
+            return missing;
+        }
+
+        int extra() {
+            return extra;
+        }
+
+        int copied() {
+            return copied;
+        }
+
+        void countCopied() {
+            copied++;
+        }
+
+        void countMatched() {
+            processed++;
+            matched++;
+        }
+
+        void countMismatched() {
+            processed++;
+            mismatched++;
+        }
+
+        void countMissing() {
+            processed++;
+            missing++;
+        }
+
+        void countExtra() {
+            processed++;
+            extra++;
+        }
+
+        void update(int percent, String label) {
+            emit(percent, label);
+        }
+
+        /** Copy progress driven by rsync's own transfer percentage (0..100 of the copy phase). */
+        void rsyncPercent(int percent) {
+            rsyncPercent = Math.max(rsyncPercent, percent);
+            emit((int) Math.round(rsyncPercent * COPY_PROGRESS_END / 100.0),
+                    "Copying: " + copied + " announced, " + rsyncPercent + "% transferred");
+        }
+
+        void copyComplete(int copied) {
+            emit(COPY_PROGRESS_END, "Copy complete: " + copied + " file(s) transferred");
+        }
+
+        void verifyStart(boolean afterCopy) {
+            emit(afterCopy ? COPY_PROGRESS_END : 0, "Verified 0 of " + workTotal);
+        }
+
+        void verifiedFile(boolean afterCopy) {
+            double ratio = processed / (double) workTotal;
+            int percent = afterCopy
+                    ? (int) Math.round(COPY_PROGRESS_END + ratio * (100 - COPY_PROGRESS_END))
+                    : (int) Math.round(ratio * 100);
+            emit(percent, "Verified " + processed + " of " + workTotal);
+        }
+
+        void finish(String label) {
+            emit(100, label);
+        }
+
+        private void emit(int percent, String label) {
+            int clamped = Math.max(0, Math.min(100, percent));
+            if (clamped < lastPercent) {
+                clamped = lastPercent;
+            }
+            if (clamped == lastPercent) {
                 return;
             }
-            lastPercent = percent;
-            listener.onProgress(percent, statusText);
-        }
-
-        void complete(String statusText) {
-            finishAt(100, statusText);
-        }
-
-        /** Emits a phase milestone; never goes backwards and never duplicates a percentage. */
-        void finishAt(int percent, String statusText) {
-            if (percent <= lastPercent) {
-                return;
-            }
-            lastPercent = percent;
-            listener.onProgress(percent, statusText);
+            lastPercent = clamped;
+            listener.onProgress(clamped, label);
         }
     }
 }

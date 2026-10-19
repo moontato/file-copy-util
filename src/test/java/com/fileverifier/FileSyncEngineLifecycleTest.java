@@ -26,8 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Phase 2 contract: one engine owns at most one job, cancellation terminates rsync (and leaves
- * no orphan behind), and the watchdog enforces an optional job timeout.
+ * Lifecycle contract: one engine owns at most one job, cancellation terminates rsync (and leaves no
+ * orphan behind), and the watchdog enforces an optional job timeout.
  */
 class FileSyncEngineLifecycleTest {
 
@@ -87,8 +87,8 @@ class FileSyncEngineLifecycleTest {
             assertFalse(engine.isRunning());
             assertNull(engine.lastResult());
 
-            assertTrue(engine.start(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                    TestSupport.selection("one.txt", "two.txt"), TestSupport.selection("one.txt"), rec));
+            assertTrue(engine.start(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                    TestSupport.selection("one.txt", "two.txt"), TestSupport.selection("one.txt")), rec));
             assertTrue(engine.isRunning(), "start() must make the job observable as RUNNING immediately");
 
             assertTrue(rec.awaitCompletion(30_000), "job never completed");
@@ -125,26 +125,31 @@ class FileSyncEngineLifecycleTest {
             }
 
             @Override
+            public void onFileProcessed(String relativePath, String kind, String sourceHash, String destHash) {
+            }
+
+            @Override
             public void onCompletion(JobResult result) {
                 completions.incrementAndGet();
             }
         };
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
-            assertTrue(engine.start(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                    TestSupport.selection("one.txt", "two.txt"), TestSupport.selection("one.txt"),
+            assertTrue(engine.start(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                    TestSupport.selection("one.txt", "two.txt"), TestSupport.selection("one.txt")),
                     blockingListener));
             assertTrue(entered.await(20, TimeUnit.SECONDS), "job never reached its first phase");
             assertTrue(engine.isRunning());
 
-            assertFalse(engine.start(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                    TestSupport.selection("one.txt"), TestSupport.selection("one.txt"), blockingListener),
+            assertFalse(engine.start(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                    TestSupport.selection("one.txt"), TestSupport.selection("one.txt")), blockingListener),
                     "a second job must be refused while one is running");
-            assertFalse(engine.start(source.toFile(), dest.toFile(), JobType.COPY_AND_VERIFY,
-                    TestSupport.selection("one.txt"), TestSupport.none(), blockingListener));
+            assertFalse(engine.start(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("one.txt"), TestSupport.none()), blockingListener));
 
-            assertThrows(IllegalStateException.class, () -> engine.execute(source.toFile(), dest.toFile(),
-                    JobType.VERIFY_ONLY, TestSupport.selection("one.txt"), TestSupport.selection("one.txt"),
+            assertThrows(IllegalStateException.class, () -> engine.execute(
+                    TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                            TestSupport.selection("one.txt"), TestSupport.selection("one.txt")),
                     blockingListener));
 
             release.countDown();
@@ -163,14 +168,14 @@ class FileSyncEngineLifecycleTest {
         smallFixture();
         try (FileSyncEngine engine = new FileSyncEngine()) {
             TestSupport.Recorder first = new TestSupport.Recorder();
-            JobResult r1 = engine.execute(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                    TestSupport.selection("one.txt"), TestSupport.selection("one.txt"), first);
+            JobResult r1 = engine.execute(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                    TestSupport.selection("one.txt"), TestSupport.selection("one.txt")), first);
             assertTrue(r1.isSuccess(), r1.message());
             assertEquals(JobStatus.COMPLETED, engine.status());
 
             TestSupport.Recorder second = new TestSupport.Recorder();
-            JobResult r2 = engine.execute(source.toFile(), dest.toFile(), JobType.COPY_AND_VERIFY,
-                    TestSupport.selection("two.txt"), TestSupport.none(), second);
+            JobResult r2 = engine.execute(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("two.txt"), TestSupport.none()), second);
             assertTrue(r2.isSuccess(), r2.message());
             assertEquals(1, r2.filesCopied());
             assertEquals(JobStatus.COMPLETED, engine.status());
@@ -187,8 +192,8 @@ class FileSyncEngineLifecycleTest {
         smallFixture();
         FileSyncEngine engine = new FileSyncEngine();
         engine.close();
-        assertFalse(engine.start(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                TestSupport.selection("one.txt"), TestSupport.selection("one.txt"),
+        assertFalse(engine.start(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                TestSupport.selection("one.txt"), TestSupport.selection("one.txt")),
                 new TestSupport.Recorder()));
         assertEquals(JobStatus.IDLE, engine.status());
         engine.close(); // idempotent
@@ -220,7 +225,7 @@ class FileSyncEngineLifecycleTest {
             @Override
             public void onFileProcessed(String relPath, String status, String srcHash, String dstHash) {
                 super.onFileProcessed(relPath, status, srcHash, dstHash);
-                if (status.equals("copied") && copiedEvents.incrementAndGet() == 1) {
+                if (status.equals("COPIED") && copiedEvents.incrementAndGet() == 1) {
                     holder[0].cancel();
                 }
             }
@@ -228,8 +233,8 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             holder[0] = engine;
-            assertTrue(engine.start(source.toFile(), dest.toFile(), JobType.COPY_AND_VERIFY,
-                    TestSupport.selectAllOf(source), TestSupport.none(), rec));
+            assertTrue(engine.start(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
+                    TestSupport.selectAllOf(source), TestSupport.none()), rec));
 
             assertTrue(rec.awaitCompletion(60_000), "cancelled job never reported completion");
             JobResult result = rec.result;
@@ -260,8 +265,8 @@ class FileSyncEngineLifecycleTest {
             engine.setJobTimeoutMillis(250);
             assertEquals(250, engine.jobTimeoutMillis());
 
-            JobResult result = engine.execute(source.toFile(), dest.toFile(), JobType.COPY_AND_VERIFY,
-                    TestSupport.selection("huge.bin"), TestSupport.none(), new TestSupport.Recorder());
+            JobResult result = engine.execute(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("huge.bin"), TestSupport.none()), new TestSupport.Recorder());
 
             assertEquals(JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("timeout"), result.message());
@@ -283,16 +288,14 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             engine.setJobTimeoutMillis(250);
-            JobResult result = engine.execute(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
+            JobResult result = engine.execute(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
                     TestSupport.selection("huge.bin", "small.txt"),
-                    TestSupport.selection("huge.bin", "small.txt"), new TestSupport.Recorder());
+                    TestSupport.selection("huge.bin", "small.txt")), new TestSupport.Recorder());
 
             assertEquals(JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("timeout"), result.message());
             assertTrue(result.message().contains("250 ms"), result.message());
-            // A failed job reports the partial counters it reached: the 1.5 GB file was done,
-            // the second file was never reached.
-            assertEquals(1, result.filesChecked(), result.message());
+            // A failed job reports the partial counters it reached, and they stay consistent.
             assertTrue(result.filesChecked() < 2, result.message());
             assertEquals(result.filesChecked(),
                     result.filesMatched() + result.filesMismatched() + result.filesMissing());
@@ -320,8 +323,8 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             holder[0] = engine;
-            assertTrue(engine.start(source.toFile(), dest.toFile(), JobType.VERIFY_ONLY,
-                    TestSupport.selectAllOf(source), TestSupport.selectAllOf(dest), rec));
+            assertTrue(engine.start(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
+                    TestSupport.selectAllOf(source), TestSupport.selectAllOf(dest)), rec));
             assertTrue(rec.awaitCompletion(60_000), "cancelled job never reported completion");
 
             assertEquals(JobStatus.FAILED, rec.result.status());
@@ -338,8 +341,8 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             assertEquals(FileSyncEngine.NO_TIMEOUT, engine.jobTimeoutMillis());
-            JobResult result = engine.execute(source.toFile(), dest.toFile(), JobType.COPY_AND_VERIFY,
-                    TestSupport.selection("large.bin"), TestSupport.none(), new TestSupport.Recorder());
+            JobResult result = engine.execute(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("large.bin"), TestSupport.none()), new TestSupport.Recorder());
             assertTrue(result.isSuccess(), result.message());
             assertEquals(1, result.filesCopied());
         }

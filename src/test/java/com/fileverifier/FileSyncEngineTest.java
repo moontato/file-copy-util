@@ -1,5 +1,7 @@
 package com.fileverifier;
 
+import com.fileverifier.FileSyncEngine.JobResult;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -14,6 +16,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -29,6 +32,9 @@ class FileSyncEngineTest {
     @TempDir
     Path dest;
 
+    @TempDir
+    Path tools;
+
     private TestSupport.Recorder rec;
 
     @BeforeEach
@@ -36,8 +42,15 @@ class FileSyncEngineTest {
         rec = new TestSupport.Recorder();
     }
 
-    private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel, FileSyncEngine.Selection dstSel) {
-        return FileSyncEngine.runOnce(source.toFile(), dest.toFile(), type, srcSel, dstSel, rec);
+    private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel,
+                                         FileSyncEngine.Selection dstSel) {
+        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel), rec);
+    }
+
+    private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel,
+                                         FileSyncEngine.Selection dstSel, boolean detectExtraFiles) {
+        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel,
+                ScanOptions.DEFAULTS, detectExtraFiles), rec);
     }
 
     private static void assumeRsync() {
@@ -54,7 +67,7 @@ class FileSyncEngineTest {
         FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.none(), TestSupport.none());
 
         assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
-        assertTrue(result.message().contains("selection is empty"), result.message());
+        assertTrue(result.message().contains("empty selection"), result.message());
         assertEquals(0, result.filesChecked());
         assertEquals(0, result.filesCopied());
         try (var entries = Files.list(dest)) {
@@ -113,7 +126,7 @@ class FileSyncEngineTest {
         assertEquals(1, result.filesMatched());
         assertEquals(1, result.filesMissing());
         assertEquals(0, result.filesMismatched());
-        assertEquals("missing", rec.eventFor("absent.txt").status());
+        assertEquals("MISSING", rec.eventFor("absent.txt").status());
     }
 
     @Test
@@ -225,16 +238,23 @@ class FileSyncEngineTest {
 
         TestSupport.Recorder.FileEvent missing = rec.eventFor("missing.txt");
         assertNotNull(missing);
-        assertEquals("missing", missing.status());
+        assertEquals("MISSING", missing.status());
         assertEquals(FileHasher.SHORT_HASH_LENGTH, missing.srcHash().length());
-        assertEquals("", missing.dstHash());
+        assertNull(missing.dstHash(), "a file with no destination copy has no destination hash");
 
         TestSupport.Recorder.FileEvent mismatch = rec.eventFor("mismatch.txt");
         assertNotNull(mismatch);
-        assertEquals("mismatch", mismatch.status());
+        assertEquals("MISMATCH", mismatch.status());
         assertEquals(FileHasher.SHORT_HASH_LENGTH, mismatch.srcHash().length());
         assertEquals(FileHasher.SHORT_HASH_LENGTH, mismatch.dstHash().length());
         assertFalse(mismatch.srcHash().equals(mismatch.dstHash()));
+
+        assertEquals(3, result.outcomes().size(), "one outcome per checked file");
+        assertEquals(result.filesChecked(), result.outcomes().size());
+        assertEquals("MISMATCH", result.outcomes().stream()
+                .filter(o -> o.relPath().equals("mismatch.txt")).findFirst().orElseThrow().kind());
+        assertNotNull(result.outcomes().stream()
+                .filter(o -> o.relPath().equals("match.txt")).findFirst().orElseThrow().sourceHash());
     }
 
     @Test
@@ -254,8 +274,8 @@ class FileSyncEngineTest {
         assertEquals(0, result.filesMismatched());
         assertEquals(0, result.filesMissing());
         assertEquals("source version\n", Files.readString(dest.resolve("stale.txt")));
-        assertEquals("copied", rec.eventFor("stale.txt").status());
-        assertEquals("copied", rec.eventFor("keep.txt").status());
+        assertEquals("COPIED", rec.eventFor("stale.txt").status());
+        assertEquals("COPIED", rec.eventFor("keep.txt").status());
     }
 
     // ---------------------------------------------------------------- B5
@@ -276,9 +296,9 @@ class FileSyncEngineTest {
         assertEquals(1, result.filesMatched());
         assertEquals(100, rec.lastPercent());
         rec.assertProgressIsCoarse();
-        assertTrue(rec.statusTexts.stream().allMatch(s -> s.contains("/1 ")),
+        assertTrue(rec.statusTexts.stream().allMatch(s -> s.contains("of 1")),
                 "progress text must count against the work set: " + rec.statusTexts);
-        assertTrue(rec.statusTexts.stream().noneMatch(s -> s.contains("/41")), rec.statusTexts.toString());
+        assertTrue(rec.statusTexts.stream().noneMatch(s -> s.contains("of 41")), rec.statusTexts.toString());
     }
 
     @Test
@@ -293,25 +313,105 @@ class FileSyncEngineTest {
         assertTrue(result.isSuccess(), result.message());
         assertEquals(100, rec.lastPercent());
         rec.assertProgressIsCoarse();
-        assertTrue(rec.phases.stream().anyMatch(p -> p.contains("rsync finished")), rec.phases.toString());
-        assertTrue(rec.phases.stream().anyMatch(p -> p.startsWith("Work set: 2 selected")), rec.phases.toString());
-        assertTrue(rec.files.stream().anyMatch(f -> f.status().equals("copied")), rec.files.toString());
+        assertEquals(List.of("copying", "verifying", "done"), rec.phases, rec.phases.toString());
+        assertTrue(rec.files.stream().anyMatch(f -> f.status().equals("COPIED")), rec.files.toString());
+        assertTrue(rec.percents.contains(FileSyncEngine.COPY_PROGRESS_END),
+                "the bar must reach the end of the copy phase: " + rec.percents);
     }
 
     @Test
-    void copyPhaseProgressIsAnnouncementBoundedThenVerified() throws Exception {
+    void copyPhaseProgressFollowsTheRsyncTransferPercentage() throws Exception {
+        // Driven by a scripted stand-in rsync so the sequence is exact instead of timing-dependent:
+        // rsync's 30% and 60% must land inside the 0..70 copy band, not be reported as done.
+        TestSupport.write(source.resolve("one.txt"), "1\n");
+        Path fake = TestSupport.copyingFakeRsync(tools,
+                ">f+++++++++ one.txt\n"
+                        + "              3   0%    0.00kB/s    0:00:00\n"
+                        + "      100,000,000  30%   10.00MB/s    0:00:01\n"
+                        + "      200,000,000  60%   10.00MB/s    0:00:02\n"
+                        + "      333,333,333 100%   10.00MB/s    0:00:03 (xfr#1, to-chk=0/1)");
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try {
+            FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("one.txt"), TestSupport.none());
+
+            assertTrue(result.isSuccess(), result.message());
+            assertEquals(1, result.filesCopied(), "one itemize line, one copied file");
+            assertEquals(1, result.filesMatched());
+            // 0 (pre-copy hashing), 21 (30% of the 70-point copy band), 42 (60%), 70 (complete),
+            // 100 (verified).
+            assertEquals(List.of(0, 21, 42, FileSyncEngine.COPY_PROGRESS_END, 100), rec.percents,
+                    rec.percents.toString());
+            assertTrue(rec.statusTexts.stream().anyMatch(s -> s.contains("30% transferred")),
+                    rec.statusTexts.toString());
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    // ---------------------------------------------------------------- destination-only files
+
+    @Test
+    void destinationOnlyFilesAreReportedAsExtraWhenDetectionIsOn() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("orphan.txt"), "not in the source\n");
+
+        JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selection("a.txt"), TestSupport.selection("a.txt"), true);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(2, result.filesChecked());
+        assertEquals(1, result.filesMatched());
+        assertEquals(1, result.filesExtra());
+        assertEquals("EXTRA", rec.eventFor("orphan.txt").status());
+        assertTrue(rec.eventFor("orphan.txt").srcHash() == null, "an extra file has no source hash");
+        assertTrue(result.message().contains("destination-only"), result.message());
+        assertEquals(result.filesChecked(), result.filesMatched() + result.filesMismatched()
+                + result.filesMissing() + result.filesExtra());
+    }
+
+    @Test
+    void destinationOnlyDetectionIsOptOut() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("orphan.txt"), "not in the source\n");
+
+        JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selection("a.txt"), TestSupport.selection("a.txt"), false);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(1, result.filesChecked());
+        assertEquals(0, result.filesExtra());
+    }
+
+    @Test
+    void aDestinationOnlyFileCanBeExcludedByUntickingItsRow() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("a.txt"), "a\n");
+        TestSupport.write(dest.resolve("orphan.txt"), "not in the source\n");
+
+        JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selection("a.txt"),
+                TestSupport.knownRows(Set.of("a.txt", "orphan.txt"), "a.txt"), true);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(1, result.filesChecked());
+        assertEquals(0, result.filesExtra(), "the row was visible in the list and deliberately unticked");
+    }
+
+    @Test
+    void copyModeNeverReportsExtras() throws Exception {
         assumeRsync();
         TestSupport.write(source.resolve("a.txt"), "a\n");
-        TestSupport.write(source.resolve("b.txt"), "b\n");
+        TestSupport.write(dest.resolve("orphan.txt"), "not in the source\n");
 
-        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
-                TestSupport.selectAllOf(source), TestSupport.none());
+        JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("a.txt"), TestSupport.none(), true);
+
         assertTrue(result.isSuccess(), result.message());
-
-        // 2 files announced over 0..ANNOUNCE_PROGRESS_END, then the bar may only reach
-        // COPY_PROGRESS_END once rsync has actually exited, then 70..100 for verification.
-        assertEquals(List.of(20, 40, FileSyncEngine.COPY_PROGRESS_END, 85, 100), rec.percents,
-                rec.percents.toString());
+        assertEquals(1, result.filesChecked());
+        assertEquals(0, result.filesExtra(), "copying is source-driven; the destination list is not verified");
     }
 
     // ---------------------------------------------------------------- B7
@@ -327,7 +427,7 @@ class FileSyncEngineTest {
     }
 
     @Test
-    void unwritableDestinationFailsWithTheRsyncExitCode() throws Exception {
+    void unwritableDestinationIsRefusedBeforeRsyncRuns() throws Exception {
         assumeRsync();
         TestSupport.write(source.resolve("file.txt"), "payload\n");
         Files.setPosixFilePermissions(dest, EnumSet.of(
@@ -337,10 +437,10 @@ class FileSyncEngineTest {
                     TestSupport.selection("file.txt"), TestSupport.none());
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
-            assertTrue(result.message().contains("rsync failed"), result.message());
-            assertEquals(23, result.rsyncExitCode(), result.errors().toString());
-            assertFalse(result.errors().isEmpty(), "rsync stderr must be surfaced");
-            assertTrue(result.errors().stream().anyMatch(e -> e.startsWith("rsync:")), result.errors().toString());
+            assertTrue(result.message().contains("not writable"), result.message());
+            assertEquals(0, result.rsyncExitCode(), "preflight must reject this before starting rsync");
+            assertEquals(0, result.filesCopied());
+            assertFalse(result.errors().isEmpty());
         } finally {
             Files.setPosixFilePermissions(dest, EnumSet.of(
                     PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
@@ -349,17 +449,91 @@ class FileSyncEngineTest {
     }
 
     @Test
-    void validationRejectsMissingDirectoriesAndIdenticalPaths() {
-        FileSyncEngine.JobResult sameDir = FileSyncEngine.runOnce(source.toFile(), source.toFile(),
-                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), TestSupport.none(), rec);
-        assertEquals(FileSyncEngine.JobStatus.FAILED, sameDir.status());
-        assertTrue(sameDir.message().contains("same directory"), sameDir.message());
+    void preflightReportsEachProblemInWordsTheUserCanActOn() throws Exception {
+        TestSupport.write(source.resolve("one.txt"), "1\n");
 
-        rec = new TestSupport.Recorder();
-        FileSyncEngine.JobResult missing = FileSyncEngine.runOnce(source.resolve("nope").toFile(), dest.toFile(),
-                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("x"), TestSupport.none(), rec);
-        assertEquals(FileSyncEngine.JobStatus.FAILED, missing.status());
-        assertTrue(missing.message().contains("Source directory does not exist"), missing.message());
+        List<String> sameDir = FileSyncEngine.validate(
+                TestSupport.request(source, source, FileSyncEngine.JobType.VERIFY_ONLY,
+                        TestSupport.selection("one.txt"), TestSupport.none()));
+        assertTrue(sameDir.stream().anyMatch(p -> p.contains("same directory")), sameDir.toString());
+
+        Path nested = source.resolve("inside/dest");
+        Files.createDirectories(nested);
+        List<String> nestedProblems = FileSyncEngine.validate(
+                TestSupport.request(source, nested, FileSyncEngine.JobType.COPY_AND_VERIFY,
+                        TestSupport.selection("one.txt"), TestSupport.none()));
+        assertTrue(nestedProblems.stream().anyMatch(p -> p.contains("inside the source")),
+                nestedProblems.toString());
+
+        List<String> missingSource = FileSyncEngine.validate(
+                TestSupport.request(source.resolve("nope"), dest, FileSyncEngine.JobType.VERIFY_ONLY,
+                        TestSupport.selection("one.txt"), TestSupport.none()));
+        assertTrue(missingSource.stream().anyMatch(p -> p.contains("Source is not a directory")),
+                missingSource.toString());
+
+        List<String> ok = FileSyncEngine.validate(
+                TestSupport.request(source, dest, FileSyncEngine.JobType.VERIFY_ONLY,
+                        TestSupport.selection("one.txt"), TestSupport.none()));
+        assertEquals(List.of(), ok, "a valid job must have no problems");
+
+        JobResult refused = FileSyncEngine.runOnce(
+                TestSupport.request(source.resolve("nope"), dest, FileSyncEngine.JobType.VERIFY_ONLY,
+                        TestSupport.selection("one.txt"), TestSupport.none()), rec);
+        assertEquals(FileSyncEngine.JobStatus.FAILED, refused.status());
+        assertTrue(refused.message().startsWith("Preflight failed:"), refused.message());
+        assertFalse(refused.errors().isEmpty(), "the same problems are reported as errors");
+    }
+
+    @Test
+    void missingRsyncBinaryIsReportedAsAMissingDependencyNotAFailureMystery() throws Exception {
+        TestSupport.write(source.resolve("one.txt"), "1\n");
+        FileSyncEngine.setRsyncBinary("definitely-not-an-installed-rsync");
+        try {
+            FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("one.txt"), TestSupport.none());
+
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
+            assertTrue(result.message().contains("rsync was not found"), result.message());
+            assertTrue(result.message().contains("Verify Only"),
+                    "the message must offer the mode that needs no rsync: " + result.message());
+            assertFalse(result.message().contains("rsync failed"), result.message());
+            assertEquals(0, result.filesChecked());
+
+            // Verify Only must still work without rsync.
+            TestSupport.write(dest.resolve("one.txt"), "1\n");
+            rec = new TestSupport.Recorder();
+            FileSyncEngine.JobResult verifyOnly = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                    TestSupport.selection("one.txt"), TestSupport.selection("one.txt"));
+            assertTrue(verifyOnly.isSuccess(), verifyOnly.message());
+            assertEquals(1, verifyOnly.filesMatched());
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    @Test
+    void rsyncFailureSurfacesItsExitCodeAndOwnErrorLines() throws Exception {
+        TestSupport.write(source.resolve("one.txt"), "1\n");
+        Path fake = TestSupport.fakeRsync(tools,
+                ">f+++++++++ one.txt\n"
+                        + "rsync: [receiver] mkstemp \"dest/.one.txt.XXXXXX\" failed: Permission denied (13)\n"
+                        + "rsync error: some files/attrs were not transferred (see previous errors) (code 23)",
+                23);
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try {
+            FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("one.txt"), TestSupport.none());
+
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
+            assertEquals(23, result.rsyncExitCode(), result.errors().toString());
+            assertTrue(result.message().contains("rsync failed (exit code 23)"), result.message());
+            assertTrue(result.errors().stream().anyMatch(e -> e.contains("rsync exited with code 23")),
+                    result.errors().toString());
+            assertTrue(result.errors().stream().anyMatch(e -> e.startsWith("rsync: [") && e.contains("failed:")),
+                    "rsync's own per-file error line must be surfaced: " + result.errors());
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
     }
 
     // ---------------------------------------------------------------- B9
@@ -392,6 +566,17 @@ class FileSyncEngineTest {
         assertEquals(FileSyncEngine.LineKind.COPY, FileSyncEngine.classifyLine("<f.st....  sub/two.txt"));
         assertEquals(FileSyncEngine.LineKind.DIRECTORY, FileSyncEngine.classifyLine("cd+++++++++ sub/deep/"));
         assertEquals(FileSyncEngine.LineKind.DIRECTORY, FileSyncEngine.classifyLine(">d+++++++++ sub"));
+        assertEquals(FileSyncEngine.LineKind.DIRECTORY, FileSyncEngine.classifyLine(".d..t....  sub"));
+        // rsync's itemize format is <update type><item type>: 'c' means "local create or change", which
+        // is how a created directory AND a changed/created symlink are reported. 'L' is a symlink, so a
+        // copied link shows up as cL - counting it matters because -a copies symlinks as links.
+        assertEquals(FileSyncEngine.LineKind.COPY, FileSyncEngine.classifyLine("cL+++++++++ link.txt -> a.txt"));
+        assertEquals(FileSyncEngine.LineKind.COPY, FileSyncEngine.classifyLine("hf+++++++++ hard.txt"));
+        assertEquals(FileSyncEngine.LineKind.COPY, FileSyncEngine.classifyLine("cD+++++++++ node"));
+        assertEquals(FileSyncEngine.LineKind.COPY, FileSyncEngine.classifyLine(">S+++++++++ fifo"));
+        // An item that was only touched (attributes changed) was not transferred.
+        assertEquals(FileSyncEngine.LineKind.IGNORED, FileSyncEngine.classifyLine(".f..t....  same.txt"));
+        assertEquals(FileSyncEngine.LineKind.WARNING, FileSyncEngine.classifyLine("*deleting   gone.txt"));
         assertEquals(FileSyncEngine.LineKind.ERROR,
                 FileSyncEngine.classifyLine("rsync: [sender] link_stat \"/x/nope.txt\" failed: No such file or directory (2)"));
         assertEquals(FileSyncEngine.LineKind.ERROR,
@@ -400,12 +585,88 @@ class FileSyncEngineTest {
                 FileSyncEngine.classifyLine("rsync warning: some files vanished before they could be transferred (code 24)"));
         assertEquals(FileSyncEngine.LineKind.IGNORED, FileSyncEngine.classifyLine(""));
         assertEquals(FileSyncEngine.LineKind.IGNORED, FileSyncEngine.classifyLine(null));
-        assertEquals(FileSyncEngine.LineKind.IGNORED,
+        // rsync's '*'-message lines are notable ("* Skipping any contents from this failed directory")
+        // and must reach the user as a warning, not be swallowed.
+        assertEquals(FileSyncEngine.LineKind.WARNING,
                 FileSyncEngine.classifyLine("*** Skipping any contents from this failed directory ***"));
 
         assertEquals("one.txt", FileSyncEngine.itemizePath(">f+++++++++ one.txt"));
         assertEquals("sub/deep/three.txt", FileSyncEngine.itemizePath(">f.st.... sub/deep/three.txt"));
-        assertEquals("", FileSyncEngine.itemizePath(">f+++++++++ "));
+        assertNull(FileSyncEngine.itemizePath(">f+++++++++ "), "a line with no name has no path");
+        assertNull(FileSyncEngine.itemizePath("cd+++++++++ sub/"), "directory lines carry no file to count");
+    }
+
+    @Test
+    void linkPolicyCopiesASymlinkAsALinkAndCountsIt() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha");
+        Files.createSymbolicLink(source.resolve("link.txt"), source.resolve("a.txt"));
+        ScanOptions linkMode = new ScanOptions(ScanOptions.DEFAULTS.ignorePatterns(), true,
+                ScanOptions.SymlinkPolicy.LINK);
+
+        JobResult result = FileSyncEngine.runOnce(TestSupport.request(source, dest,
+                FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("a.txt", "link.txt"),
+                TestSupport.none(), linkMode, false), rec);
+
+        assertTrue(result.isSuccess(), result.message());
+        // -a copies a link as a link, and rsync reports it as 'cL' - a link is a copied item even
+        // though no file data moves, so it has to be counted.
+        assertEquals(2, result.filesCopied(), result.toString());
+        assertEquals(2, result.filesMatched());
+        assertTrue(Files.isSymbolicLink(dest.resolve("link.txt")), "the link must stay a link");
+        assertTrue(result.warnings().isEmpty(), String.valueOf(result.warnings()));
+    }
+
+    @Test
+    void followPolicyCopiesTheTargetInsteadOfTheLink() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha");
+        Files.createSymbolicLink(source.resolve("link.txt"), source.resolve("a.txt"));
+        ScanOptions followMode = new ScanOptions(ScanOptions.DEFAULTS.ignorePatterns(), true,
+                ScanOptions.SymlinkPolicy.FOLLOW);
+
+        JobResult result = FileSyncEngine.runOnce(TestSupport.request(source, dest,
+                FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("a.txt", "link.txt"),
+                TestSupport.none(), followMode, false), rec);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(2, result.filesCopied(), result.toString());
+        assertEquals(2, result.filesMatched());
+        assertTrue(Files.isRegularFile(dest.resolve("link.txt")) && !Files.isSymbolicLink(dest.resolve("link.txt")),
+                "FOLLOW must hand over the target contents, not a dangling link");
+        assertEquals("alpha", Files.readString(dest.resolve("link.txt")));
+    }
+
+    @Test
+    void skipPolicyLeavesTheLinkOutAndSaysSo() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha");
+        Files.createSymbolicLink(source.resolve("link.txt"), source.resolve("a.txt"));
+
+        JobResult result = FileSyncEngine.runOnce(TestSupport.request(source, dest,
+                FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("a.txt", "link.txt"),
+                TestSupport.none(), ScanOptions.DEFAULTS, false), rec);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(1, result.filesChecked(), "the skipped link is not in the work set");
+        assertEquals(0, result.filesMissing());
+        assertTrue(result.warnings().stream().anyMatch(w -> w.contains("symbolic link")),
+                String.valueOf(result.warnings()));
+        assertFalse(Files.exists(dest.resolve("link.txt")));
+    }
+
+    @Test
+    void rsyncTransferPercentageIsParsedFromProgressLines() {
+        // Real rsync 3.2.7 --info=progress2 lines.
+        assertEquals(0, FileSyncEngine.rsyncTransferPercent(
+                "              3   0%    0.00kB/s    0:00:00 (xfr#1, to-chk=3/4)"));
+        assertEquals(91, FileSyncEngine.rsyncTransferPercent(
+                "  1,366,917,123  91%    1.27GB/s    0:00:00  "));
+        assertEquals(100, FileSyncEngine.rsyncTransferPercent(
+                "  1,500,000,006 100%  975.13MB/s    0:00:01 (xfr#3, to-chk=0/4)"));
+        assertEquals(-1, FileSyncEngine.rsyncTransferPercent(">f+++++++++ one.txt"));
+        assertEquals(-1, FileSyncEngine.rsyncTransferPercent("rsync error: something (code 23)"));
+        assertEquals(-1, FileSyncEngine.rsyncTransferPercent(""));
     }
 
     @Test

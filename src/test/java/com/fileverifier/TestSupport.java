@@ -20,18 +20,65 @@ final class TestSupport {
     }
 
     static boolean rsyncAvailable() {
-        try {
-            Process process = new ProcessBuilder("rsync", "--version")
-                    .redirectErrorStream(true)
-                    .start();
-            process.getInputStream().readAllBytes();
-            return process.waitFor() == 0;
-        } catch (IOException | InterruptedException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            return false;
-        }
+        return FileSyncEngine.isRsyncAvailable();
+    }
+
+    /** A job request with default scan options and no destination-only detection. */
+    static FileSyncEngine.JobRequest request(Path source, Path dest, FileSyncEngine.JobType type,
+                                             FileSyncEngine.Selection sourceSelection,
+                                             FileSyncEngine.Selection destSelection) {
+        return request(source, dest, type, sourceSelection, destSelection, ScanOptions.DEFAULTS, false);
+    }
+
+    static FileSyncEngine.JobRequest request(Path source, Path dest, FileSyncEngine.JobType type,
+                                             FileSyncEngine.Selection sourceSelection,
+                                             FileSyncEngine.Selection destSelection,
+                                             ScanOptions options, boolean detectExtraFiles) {
+        return new FileSyncEngine.JobRequest(source, dest, type, sourceSelection, destSelection,
+                options, detectExtraFiles);
+    }
+
+    /**
+     * Writes a stand-in rsync that prints the given lines and exits with the given code, so the
+     * engine's failure handling can be tested without a real transfer.
+     */
+    static Path fakeRsync(Path dir, String output, int exitCode) throws IOException {
+        Path script = dir.resolve("fake-rsync");
+        Files.writeString(script, "#!/bin/sh\nprintf '%s\\n' " + shellQuote(output) + "\nexit " + exitCode + "\n",
+                StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
+    private static String shellQuote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
+    }
+
+    /**
+     * A stand-in rsync that prints a scripted output (progress lines included) and then really
+     * copies the tree, so progress scaling and verification can be tested with an exact,
+     * timing-independent sequence. The engine always passes source and destination as the last two
+     * arguments, which is what this script reads.
+     */
+    static Path copyingFakeRsync(Path dir, String output) throws IOException {
+        Path script = dir.resolve("fake-copy-rsync");
+        String body = """
+                #!/bin/sh
+                printf '%%s\\n' %s
+                src=$(eval echo "\\${$(($#-1))}")
+                dst=$(eval echo "\\${$#}")
+                cp -R "$src/." "$dst/"
+                exit 0
+                """.formatted(shellQuote(output));
+        Files.writeString(script, body, StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
     }
 
     static Path write(Path file, String content) throws IOException {
