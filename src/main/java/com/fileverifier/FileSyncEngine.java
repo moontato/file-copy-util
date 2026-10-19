@@ -7,8 +7,10 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -16,6 +18,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -84,6 +87,7 @@ public class FileSyncEngine implements AutoCloseable {
     public static final long NO_TIMEOUT = 0L;
     /** Hard ceiling on retained outcomes (and therefore on the results table) for huge jobs. */
     static final int MAX_OUTCOMES = 50_000;
+    static final int NAMED_EXCLUSIONS = 5;
 
     /** Hashing is CPU-bound; more threads than this is memory and noise, not speed. */
     private static final int MAX_HASH_THREADS = 4;
@@ -519,7 +523,7 @@ public class FileSyncEngine implements AutoCloseable {
                 continue;
             }
             // Exclusion requires a destination row the user actually saw and left unticked.
-            if (verifyOnly && dst.known().contains(rel) && !dst.selected().contains(rel)) {
+            if (excludedAtDestination(dst, rel, verifyOnly)) {
                 continue;
             }
             workSet.add(entry);
@@ -822,7 +826,7 @@ public class FileSyncEngine implements AutoCloseable {
             }
             // An unticked destination row the user actually saw is an exclusion; a file that was never
             // in the list is not.
-            if (dst.known().contains(rel) && !dst.selected().contains(rel)) {
+            if (excludedAtDestination(dst, rel, true)) {
                 continue;
             }
             extras.add(entry);
@@ -1245,6 +1249,92 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /** Normalizes caller-supplied relative paths to the FileEntry form. */
+    /**
+     * The destination side's exclusion rule, in one place so a preview of a job and the job itself cannot
+     * drift: only a row the user was shown and left unticked excludes a file, and only for Verify Only.
+     */
+    static boolean excludedAtDestination(Selection destination, String relPath, boolean verifyOnly) {
+        return verifyOnly && destination.known().contains(relPath) && !destination.selected().contains(relPath);
+    }
+
+    /**
+     * What a job would process, decided by the rule the job uses rather than by a second guess. The GUI
+     * shows this before Run is pressed, so the two checkbox lists cannot mean one thing on screen and
+     * something else in the engine.
+     */
+    /**
+     * @param untickedNames the first few excluded paths, enough to name a handful; the count above it is
+     *                      always exact whatever the cap is.
+     */
+    public record WorkSetPlan(int selectedAtSource, int untickedAtDestination, int willProcess,
+                              List<String> untickedNames) {
+
+        public WorkSetPlan {
+            untickedNames = List.copyOf(untickedNames);
+        }
+
+        @SuppressFBWarnings(value = "EI_EXPOSE_REP",
+                justification = "The canonical constructor stores a List.copyOf, so this is an immutable "
+                        + "list the plan owns, never a caller's list.")
+        @Override
+        public List<String> untickedNames() {
+            return untickedNames;
+        }
+
+        /** The excluded paths, or null if there are too many to list usefully. */
+        public String describeUnticked() {
+            if (untickedNames.isEmpty() || untickedNames.size() < untickedAtDestination) {
+                return null;
+            }
+            return String.join(", ", untickedNames);
+        }
+    }
+
+    /**
+     * The same preview for a caller that can answer "is this path a ticked source row?" in constant time:
+     * the GUI, which keeps its list indexed by path. Equivalent to the overload above by construction, and
+     * tested against it, because recomputing a work set from scratch on every checkbox click is what makes
+     * a 100000 row list feel sluggish.
+     */
+    static WorkSetPlan planWorkSet(int selectedAtSource, Iterable<String> untickedAtDestination,
+                                   Predicate<String> tickedAtSource) {
+        int excluded = 0;
+        List<String> names = new ArrayList<>();
+        for (String rel : untickedAtDestination) {
+            if (!tickedAtSource.test(rel)) {
+                continue;
+            }
+            excluded++;
+            if (names.size() < NAMED_EXCLUSIONS) {
+                names.add(rel);
+            }
+        }
+        return new WorkSetPlan(selectedAtSource, excluded, selectedAtSource - excluded, List.copyOf(names));
+    }
+
+    static WorkSetPlan planWorkSet(Collection<String> scannedSourcePaths, Selection source,
+                                   Selection destination, JobType type) {
+        Selection src = normalize(source);
+        Selection dst = normalize(destination);
+        boolean verifyOnly = type == JobType.VERIFY_ONLY;
+        int atSource = 0;
+        int excluded = 0;
+        List<String> names = new ArrayList<>();
+        for (String rel : scannedSourcePaths) {
+            if (!src.selected().contains(rel)) {
+                continue;
+            }
+            atSource++;
+            if (excludedAtDestination(dst, rel, verifyOnly)) {
+                excluded++;
+                if (names.size() < NAMED_EXCLUSIONS) {
+                    names.add(rel);
+                }
+            }
+        }
+        return new WorkSetPlan(atSource, excluded, atSource - excluded, List.copyOf(names));
+    }
+
     static Set<String> normalize(Set<String> relPaths) {
         Set<String> normalized = new HashSet<>();
         for (String rel : relPaths) {

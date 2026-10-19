@@ -12,7 +12,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -81,6 +84,7 @@ public final class FileVerifierFrame extends JFrame {
     private boolean scanning = false;
     private boolean scanOptionsStale = false;
     private FileSyncEngine.JobType currentJobType = FileSyncEngine.JobType.COPY_AND_VERIFY;
+    private JLabel workSetLabel;
 
     /** One engine per window: it owns at most one job at a time. */
     private final FileSyncEngine engine = new FileSyncEngine();
@@ -251,6 +255,20 @@ public final class FileVerifierFrame extends JFrame {
         modeAndScan.add(scanButton);
         panel.add(modeAndScan, gbc);
 
+        // 5.6: what the two checkbox lists add up to, in the engine's own rule, shown before Run is
+        // pressed. A second list of "effective" files would have been another thing to keep in sync
+        // (and another thing to get wrong); a line that says which rule applied is enough.
+        gbc.gridy++;
+        gbc.gridwidth = 2;
+        gbc.weightx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        workSetLabel = new JLabel("Work set: nothing scanned yet");
+        workSetLabel.setFont(workSetLabel.getFont().deriveFont(Font.ITALIC));
+        workSetLabel.setToolTipText("How many files the selected operation would process, using the same "
+            + "rule the job uses: Copy & Verify follows the source ticks; Verify Only follows the source "
+            + "ticks minus destination rows that were shown and left unticked.");
+        panel.add(workSetLabel, gbc);
+
         return panel;
     }
 
@@ -290,9 +308,10 @@ public final class FileVerifierFrame extends JFrame {
         filterField.getDocument().addDocumentListener(new SimpleDocumentFilter(
             () -> model.setFilter(filterField.getText()), list));
         filterRow.add(filterField, BorderLayout.CENTER);
-        JLabel countLabel = new JLabel("0 files");
+        JLabel countLabel = new JLabel("0 files, 0 selected");
         filterRow.add(countLabel, BorderLayout.EAST);
         model.setCountLabel(countLabel);
+        model.setOnChange(this::updateWorkSetSummary);
         panel.add(filterRow, BorderLayout.NORTH);
 
         panel.add(new JScrollPane(list), BorderLayout.CENTER);
@@ -320,8 +339,7 @@ public final class FileVerifierFrame extends JFrame {
             public void mouseClicked(MouseEvent e) {
                 int index = list.locationToIndex(e.getPoint());
                 if (index >= 0 && SwingUtilities.isLeftMouseButton(e)) {
-                    DirectoryEntry entry = model.get(index);
-                    entry.setSelected(!entry.selected());
+                    model.toggle(index);
                     Rectangle bounds = list.getCellBounds(index, index);
                     if (bounds != null) {
                         list.repaint(bounds);
@@ -577,6 +595,7 @@ public final class FileVerifierFrame extends JFrame {
         for (FileEntry entry : scan.files()) {
             model.add(new DirectoryEntry(entry, !unticked.contains(entry.relPath())));
         }
+        model.refresh();
     }
 
     private void logScanDetails(DirectoryScanner.ScanResult scan, String side) {
@@ -613,6 +632,47 @@ public final class FileVerifierFrame extends JFrame {
         boolean copyMode = jobType == FileSyncEngine.JobType.COPY_AND_VERIFY;
         styleModeButton(copyVerifyButton, copyMode);
         styleModeButton(verifyOnlyButton, !copyMode);
+        updateWorkSetSummary();
+    }
+
+    /**
+     * Recomputes the work-set line. Uses {@link FileSyncEngine#planWorkSet}, i.e. the engine's own
+     * exclusion rule, so the preview cannot disagree with the job it previews.
+     */
+    private void updateWorkSetSummary() {
+        if (workSetLabel == null) {
+            return;
+        }
+        int sourceRows = sourceModel.total();
+        if (sourceRows == 0) {
+            workSetLabel.setText("Work set: nothing scanned yet");
+            return;
+        }
+        // A copy ignores the destination ticks, so for one the unticked set is empty by definition. The
+        // lookups keep this proportional to how many rows the user actually unticked, not to list size.
+        Iterable<String> untickedAtDestination = currentJobType == FileSyncEngine.JobType.COPY_AND_VERIFY
+            ? List.of()
+            : destModel.untickedPaths();
+        FileSyncEngine.WorkSetPlan plan = FileSyncEngine.planWorkSet(sourceModel.selectedCount(),
+            untickedAtDestination, rel -> {
+                DirectoryEntry row = sourceModel.find(rel);
+                return row != null && row.selected();
+            });
+        StringBuilder text = new StringBuilder("Work set: ").append(plan.willProcess()).append(" file(s)");
+        if (currentJobType == FileSyncEngine.JobType.COPY_AND_VERIFY) {
+            text.append(" - source ticks only; a copy ignores the destination list");
+        } else if (plan.untickedAtDestination() > 0) {
+            text.append(" - ").append(plan.selectedAtSource()).append(" ticked at source, ")
+                .append(plan.untickedAtDestination()).append(" unticked at the destination");
+            String named = plan.describeUnticked();
+            if (named != null) {
+                text.append(" (").append(named).append(")");
+            }
+        } else {
+            text.append(" - all ").append(plan.selectedAtSource())
+                .append(" ticked source files, nothing excluded at the destination");
+        }
+        workSetLabel.setText(text.toString());
     }
 
     private static void styleModeButton(JButton button, boolean active) {
@@ -985,6 +1045,12 @@ public final class FileVerifierFrame extends JFrame {
         private final DefaultListModel<DirectoryEntry> view = new DefaultListModel<>();
         private String filter = "";
         private JLabel countLabel;
+        private Runnable onChange;
+        /** Maintained incrementally: a 100000 row scan must not recount the list per row. */
+        private int selectedCount;
+        /** Rows in list order by relative path, so a preview can look one up instead of scanning. */
+        private final Map<String, DirectoryEntry> byPath = new HashMap<>();
+        private final Set<String> unticked = new HashSet<>();
 
         DefaultListModel<DirectoryEntry> view() {
             return view;
@@ -998,6 +1064,45 @@ public final class FileVerifierFrame extends JFrame {
             this.countLabel = label;
         }
 
+        /** Notified whenever the rows or their ticks change, so the work-set line can follow. */
+        void setOnChange(Runnable onChange) {
+            this.onChange = onChange;
+        }
+
+        int selectedCount() {
+            return selectedCount;
+        }
+
+        /** Toggles a visible row and keeps the selection count exact. */
+        void toggle(int viewIndex) {
+            DirectoryEntry entry = view.getElementAt(viewIndex);
+            entry.setSelected(!entry.selected());
+            if (entry.selected()) {
+                selectedCount++;
+                unticked.remove(entry.relPath());
+            } else {
+                selectedCount--;
+                unticked.add(entry.relPath());
+            }
+            fireSelectionChange();
+        }
+
+        /** The row for a relative path, or null if this side does not have it. */
+        DirectoryEntry find(String relPath) {
+            return byPath.get(relPath);
+        }
+
+        /**
+         * Rows this side has and the user left unticked. Exposed as the live set rather than a copy:
+         * a copy per click is exactly the cost this exists to avoid, and the only reader iterates it.
+         */
+        @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(value = "EI_EXPOSE_REP",
+                justification = "Deliberate: the preview iterates it; copying a 100000 entry set per "
+                        + "click would undo the point of maintaining it.")
+        Set<String> untickedPaths() {
+            return unticked;
+        }
+
         int total() {
             return all.size();
         }
@@ -1008,15 +1113,30 @@ public final class FileVerifierFrame extends JFrame {
 
         void clear() {
             all.clear();
+            byPath.clear();
+            unticked.clear();
+            selectedCount = 0;
             rebuild();
+            fireSelectionChange();
         }
 
+        /** Cheap on purpose: a scan adds one row at a time and refresh() reports the result once. */
         void add(DirectoryEntry entry) {
             all.add(entry);
+            byPath.put(entry.relPath(), entry);
+            if (entry.selected()) {
+                selectedCount++;
+            } else {
+                unticked.add(entry.relPath());
+            }
             if (matches(entry)) {
                 view.addElement(entry);
             }
-            updateCount();
+        }
+
+        /** Call once after a bulk add so the labels and the work-set line see the finished list. */
+        void refresh() {
+            fireSelectionChange();
         }
 
         void setFilter(String text) {
@@ -1028,6 +1148,18 @@ public final class FileVerifierFrame extends JFrame {
             for (DirectoryEntry entry : all) {
                 entry.setSelected(selected);
             }
+            selectedCount = selected ? all.size() : 0;
+            unticked.clear();
+            if (!selected) {
+                for (DirectoryEntry entry : all) {
+                    unticked.add(entry.relPath());
+                }
+            }
+            fireSelectionChange();
+        }
+
+        private boolean matches(DirectoryEntry entry) {
+            return filter.isEmpty() || entry.relPath().toLowerCase(Locale.ROOT).contains(filter);
         }
 
         private void rebuild() {
@@ -1037,18 +1169,23 @@ public final class FileVerifierFrame extends JFrame {
                     view.addElement(entry);
                 }
             }
-            updateCount();
+            updateLabel();
         }
 
-        private boolean matches(DirectoryEntry entry) {
-            return filter.isEmpty() || entry.relPath().toLowerCase(Locale.ROOT).contains(filter);
-        }
-
-        private void updateCount() {
+        private void updateLabel() {
             if (countLabel != null) {
-                countLabel.setText(view.size() == all.size()
+                String shown = view.size() == all.size()
                     ? all.size() + " files"
-                    : view.size() + " / " + all.size() + " files");
+                    : view.size() + " / " + all.size() + " files";
+                countLabel.setText(shown + ", " + selectedCount + " selected");
+            }
+        }
+
+        /** A selection or row-set change: refresh the count and the work-set line. */
+        private void fireSelectionChange() {
+            updateLabel();
+            if (onChange != null) {
+                onChange.run();
             }
         }
     }

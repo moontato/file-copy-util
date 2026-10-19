@@ -326,7 +326,7 @@ Owner constraint for this phase: **limit large and frequent writes** (the work r
 |---|---|---|
 | 5.4 measure 100k-file scale | open | Scan + Verify Only timing and memory with ~100k files, GUI included. `MAX_OUTCOMES` and the coalesced progress are unproven at that size |
 | 5.5 rsync version matrix | open | Itemize parsing and `xfr#` verified only against 3.2.7. Needs a container matrix (3.1.x, 3.3.x) before claiming portability |
-| 5.6 per-side selection mode in the GUI | open | `Selection.selected`/`known` already model it; the GUI has one shared selection. Decide the UI before writing code |
+| 5.6 per-side selection mode in the GUI | done | Rule in one place, stated on screen as a work-set line plus per-list selection counts, `--exclude-dest` on the CLI; GUI cost measured at 100k and 300k rows |
 | 5.7 polish | partially done | `--bwlimit` shipped; static analysis (error-prone/SpotBugs) and a longer `--help` with examples still open |
 
 ---
@@ -415,3 +415,45 @@ annotations dependency is `provided`, so it is not in the jar).
 
 **Open after Group A:** 5.5 (rsync version matrix, needs container pulls), 5.6 (per-side GUI selection,
 needs an owner decision on the UI), streaming export, and a GUI knob for the results bound.
+
+### Group B: 5.6 per-side selection made visible (2026-10-19)
+
+Owner's decision, taken before coding: **no third list.** The two checkbox lists stay; what they mean
+together is stated in words. A derived "effective files" list would have been a second thing to keep in
+sync while still hiding the rule that produced it.
+
+Shipped:
+
+- Per-list counts: `100000 files, 100000 selected`.
+- A work-set line under the mode buttons, e.g.
+  `Work set: 99000 file(s) - 100000 ticked at source, 1000 unticked at the destination`, or for a copy
+  `Work set: 100000 file(s) - source ticks only; a copy ignores the destination list`. It follows the mode
+  button you are on, so switching modes re-explains the same tick state instead of silently changing numbers.
+- Excluded paths named when few (cap `NAMED_EXCLUSIONS = 5`); with 9 exclusions nothing is named, because
+  naming 5 of 9 implies the rest are unimportant.
+- `--exclude-dest a.txt,...` for the CLI: the equivalent of an unticked destination row. On a copy it prints
+  that it does not apply rather than doing nothing silently; naming the whole selection is a usage error.
+- `FileSyncEngine.excludedAtDestination` is now the single statement of the rule, called by the job (both the
+  work-set filter and the destination-only filter) and by both preview forms.
+
+30. **The obvious implementation was 245 ms per click.** Computing the preview the direct way - rebuild the
+    selection sets, normalize them, walk the source list - cost a quarter second per checkbox click in a
+    100k row list, i.e. the feature made the GUI worse than the confusion it fixed. Measured before fixing
+    it, then fixed: rows are indexed by relative path and unticked rows are tracked incrementally, and the
+    engine has an equivalent fast form whose cost is proportional to how many rows the user *unticked*.
+    After: 0 ms per click, 2-3 ms Select All, 0 ms mode switch, at 100k and 300k rows alike.
+31. **Equivalence, not duplication.** Two forms of one rule is the kind of thing that drifts, so a test
+    compares them over four random tick patterns on a 400 path list (counts and named exclusions), and
+    another test compares the preview's numbers with the counters of the job it previewed - including the
+    trap that running the copy first repairs the mismatch the Verify Only preview was predicting.
+32. **GUI cost at scale, finally measured** (previously only mitigated): scan 1.3 s / 7.1 s for 100k / 300k
+    rows; filter 15 ms / 26 ms; 382 MB resident right after a 100k scan, 489 MB peak; 573 MB / 706 MB at
+    300k. Responsiveness is fine; the memory is the honest limit, and it is now written in DESIGN.md.
+    The cross-check also caught a *harness* bug first (the authoritative comparison used sets captured
+    before the untick loop, so it disagreed with the badge for the wrong reason).
+33. **Records holding a `List` were handing out the stored list** (`EI_EXPOSE_REP`, and `..._REP2` for
+    storing a caller's list). Fixed with a defensive `List.copyOf` in the canonical constructor and an
+    annotated accessor. Note the Java detail: a compact constructor for a `public` nested record must itself
+    be declared `public`, or javac rejects it as "attempting to assign stronger access privileges".
+
+**Open after Group B:** 5.5 (rsync version matrix), streaming export, a GUI knob for the results bound.

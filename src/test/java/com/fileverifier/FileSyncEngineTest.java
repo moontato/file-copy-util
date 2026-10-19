@@ -9,7 +9,9 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
@@ -114,6 +116,110 @@ class FileSyncEngineTest {
         try (var entries = Files.list(dest)) {
             assertEquals(0, entries.count(), "an empty selection must not copy the source tree");
         }
+    }
+
+    @Test
+    void theWorkSetPreviewPredictsTheJobItPreviews() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+        TestSupport.write(source.resolve("c.txt"), "c");
+        TestSupport.write(dest.resolve("a.txt"), "a");
+        TestSupport.write(dest.resolve("b.txt"), "different");
+
+        List<String> scanned = List.of("a.txt", "b.txt", "c.txt");
+        var srcSel = TestSupport.selection("a.txt", "b.txt", "c.txt");
+        var dstSel = TestSupport.knownRows(Set.of("a.txt", "b.txt"), "a.txt");
+
+        FileSyncEngine.WorkSetPlan copy =
+            FileSyncEngine.planWorkSet(scanned, srcSel, dstSel, FileSyncEngine.JobType.COPY_AND_VERIFY);
+        assertEquals(3, copy.selectedAtSource());
+        assertEquals(0, copy.untickedAtDestination(), "a copy does not honour destination ticks");
+        assertEquals(3, copy.willProcess());
+
+        FileSyncEngine.WorkSetPlan verify =
+            FileSyncEngine.planWorkSet(scanned, srcSel, dstSel, FileSyncEngine.JobType.VERIFY_ONLY);
+        assertEquals(1, verify.untickedAtDestination());
+        assertEquals(2, verify.willProcess());
+        assertEquals("b.txt", verify.describeUnticked());
+
+        // The preview is only worth showing if the job agrees with it. Verify first, because the copy
+        // would repair the very mismatch this test set up.
+        FileSyncEngine.JobResult verifyJob = run(FileSyncEngine.JobType.VERIFY_ONLY, srcSel, dstSel);
+        assertEquals(verify.willProcess(), verifyJob.filesChecked(), verifyJob.message());
+        assertEquals(1, verifyJob.filesMatched(), verifyJob.message());
+        assertEquals(1, verifyJob.filesMissing(), "c.txt is absent at the destination");
+        assertEquals(0, verifyJob.filesMismatched(), "the mismatched b.txt was the excluded one");
+
+        FileSyncEngine.JobResult copyJob = run(FileSyncEngine.JobType.COPY_AND_VERIFY, srcSel, dstSel);
+        assertEquals(copy.willProcess(), copyJob.filesChecked(), copyJob.message());
+        assertEquals(2, copyJob.filesCopied(), "b.txt differs and c.txt is missing: " + copyJob.message());
+        assertEquals(3, copyJob.filesMatched(), copyJob.message());
+    }
+
+    @Test
+    void theConstantTimePreviewAgreesWithTheFullOne() {
+        // The GUI counts exclusions by looking up each unticked destination row; the engine's other
+        // overload walks the source list. Same rule, so the same numbers, whatever the tick pattern is.
+        for (long seed : new long[] {1L, 7L, 42L, 1234L}) {
+            java.util.Random random = new java.util.Random(seed);
+            List<String> scanned = new ArrayList<>();
+            for (int i = 0; i < 400; i++) {
+                scanned.add("f" + i + ".txt");
+            }
+            Set<String> srcSelected = new HashSet<>();
+            for (String rel : scanned) {
+                if (random.nextInt(100) < 70) {
+                    srcSelected.add(rel);
+                }
+            }
+            Set<String> destKnown = new HashSet<>();
+            for (String rel : scanned) {
+                if (random.nextInt(100) < 60) {
+                    destKnown.add(rel);
+                }
+            }
+            Set<String> destSelected = new HashSet<>();
+            for (String rel : destKnown) {
+                if (random.nextInt(100) < 40) {
+                    destSelected.add(rel);
+                }
+            }
+            Set<String> destUnticked = new HashSet<>(destKnown);
+            destUnticked.removeAll(destSelected);
+
+            FileSyncEngine.WorkSetPlan full = FileSyncEngine.planWorkSet(scanned,
+                new FileSyncEngine.Selection(srcSelected, new HashSet<>(scanned)),
+                new FileSyncEngine.Selection(destSelected, destKnown),
+                FileSyncEngine.JobType.VERIFY_ONLY);
+            FileSyncEngine.WorkSetPlan fast = FileSyncEngine.planWorkSet(srcSelected.size(), destUnticked,
+                srcSelected::contains);
+
+            assertEquals(full.selectedAtSource(), fast.selectedAtSource(), "seed " + seed);
+            assertEquals(full.untickedAtDestination(), fast.untickedAtDestination(), "seed " + seed);
+            assertEquals(full.willProcess(), fast.willProcess(), "seed " + seed);
+            if (full.describeUnticked() != null && fast.describeUnticked() != null) {
+                assertEquals(Set.copyOf(full.untickedNames()), Set.copyOf(fast.untickedNames()), "seed " + seed);
+            }
+        }
+    }
+
+    @Test
+    void aPreviewNamesFewExclusionsButNotThousands() {
+        List<String> scanned = new ArrayList<>();
+        Set<String> known = new HashSet<>();
+        for (int i = 0; i < 9; i++) {
+            scanned.add("f" + i + ".txt");
+            known.add("f" + i + ".txt");
+        }
+        FileSyncEngine.WorkSetPlan plan = FileSyncEngine.planWorkSet(scanned,
+            TestSupport.selection(scanned.toArray(new String[0])),
+            TestSupport.knownRows(known), FileSyncEngine.JobType.VERIFY_ONLY);
+
+        assertEquals(9, plan.selectedAtSource());
+        assertEquals(9, plan.untickedAtDestination());
+        assertEquals(0, plan.willProcess());
+        // Naming 5 of 9 would imply the rest are unimportant, so nothing is named and only the count is.
+        assertTrue(plan.describeUnticked() == null);
     }
 
     @Test

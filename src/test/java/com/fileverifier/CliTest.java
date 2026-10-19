@@ -106,6 +106,52 @@ class CliTest {
     }
 
     @Test
+    void excludeDestLeavesNamedFilesOutOfTheComparison() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+        TestSupport.write(source.resolve("c.txt"), "c");
+        TestSupport.write(dest.resolve("a.txt"), "a");
+        TestSupport.write(dest.resolve("b.txt"), "different");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--verify-only", "--exclude-dest", "b.txt");
+
+        // Without the flag this job would report the mismatched b.txt; the flag is the unticked row.
+        assertEquals(Cli.EXIT_VERIFICATION_PROBLEMS, exit);
+        assertTrue(o.out().contains("checked=2"), o.out());
+        assertTrue(o.out().contains("mismatched=0"), o.out());
+        assertTrue(o.out().contains("missing=1"), o.out());
+
+        Cli.Options options = Cli.parse(new String[]{"--cli", "--source", source.toString(),
+                "--dest", dest.toString(), "--all", "--verify-only", "--exclude-dest", "b.txt"});
+        assertEquals(java.util.Set.of("b.txt"), options.request().destinationSelection().known());
+        assertTrue(options.request().destinationSelection().selected().isEmpty());
+    }
+
+    @Test
+    void excludeDestOnACopyIsAnnouncedInsteadOfQuietlyIgnored() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+
+        Output o = new Output();
+        assertEquals(Cli.EXIT_OK, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--exclude-dest", "b.txt"));
+        assertTrue(o.err().contains("does not apply to a copy"), o.err());
+        assertTrue(Files.exists(dest.resolve("b.txt")), "a copy follows the source selection");
+    }
+
+    @Test
+    void excludeDestCannotRemoveTheWholeJob() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+
+        Output o = new Output();
+        assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--verify-only", "--exclude-dest", "a.txt"));
+        assertTrue(o.err().contains("nothing left to verify"), o.err());
+    }
+
+    @Test
     void allExpandsToTheScannedSelectionAndExcludeRemovesFromIt() throws Exception {
         TestSupport.write(source.resolve("a.txt"), "a");
         TestSupport.write(source.resolve("sub/b.txt"), "b");

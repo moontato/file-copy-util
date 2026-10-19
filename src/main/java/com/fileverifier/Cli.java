@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
 /**
  * Headless front end for {@link FileSyncEngine} (roadmap 4.6): the same engine, the same selection
@@ -44,6 +45,8 @@ public final class Cli {
           --files a.txt,sub/b.txt   relative paths to include; repeatable
           --all                     every file the scan finds (see --exclude)
           --exclude a.txt,...       drop these relative paths from --all; repeatable
+          --exclude-dest a.txt,...  --verify-only only: leave these files out of the comparison, as
+                                    unticking their row does in the window
           --ignore "GLOB,GLOB"      add ignore patterns to the default list (%s)
           --no-default-ignore       start from an empty ignore list instead
           --no-hidden               exclude hidden files (they are included by default)
@@ -69,6 +72,8 @@ public final class Cli {
           --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
           --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
           --cli --source /data/src --dest /backup/dst --all --exclude "*.tmp" --no-hidden --symlinks link
+          --cli --source /data/src --dest /backup/dst --all --verify-only --exclude-dest old.bin
+                                    compare everything except a file known to be stale at the destination
           --cli --source /data/src --dest /backup/dst --all --timeout 600 --bwlimit 20000
 
         The counters: checked = matched + mismatched + missing. copied counts items rsync created or
@@ -97,7 +102,20 @@ public final class Cli {
 
     /** A parsed command line: one job request plus how to run and report it. */
     public record Options(JobRequest request, long timeoutMillis, long bandwidthLimitKbps,
-                          int maxResults, Path csvPath, Path jsonPath, boolean quiet) {
+                          int maxResults, Path csvPath, Path jsonPath, boolean quiet,
+                          List<String> destinationExcluded) {
+
+        public Options {
+            destinationExcluded = List.copyOf(destinationExcluded);
+        }
+
+        @SuppressFBWarnings(value = "EI_EXPOSE_REP",
+                justification = "The canonical constructor stores a List.copyOf, so this is an immutable "
+                        + "list the parsed command line owns.")
+        @Override
+        public List<String> destinationExcluded() {
+            return destinationExcluded;
+        }
     }
 
     /** True when the command line is meant for the headless mode rather than the GUI. */
@@ -123,6 +141,7 @@ public final class Cli {
         JobType jobType = JobType.COPY_AND_VERIFY;
         List<String> fileArgs = new ArrayList<>();
         List<String> excludeArgs = new ArrayList<>();
+        List<String> excludeDestArgs = new ArrayList<>();
         boolean all = false;
         List<String> extraIgnores = new ArrayList<>();
         boolean useDefaultIgnores = true;
@@ -155,6 +174,14 @@ public final class Cli {
                     i++;
                 }
                 case "--verify-only" -> jobType = JobType.VERIFY_ONLY;
+                case "--exclude-dest" -> {
+                    String value = value(args, i, arg);
+                    if (value.isBlank()) {
+                        throw new UsageException("--exclude-dest needs at least one relative path");
+                    }
+                    excludeDestArgs.add(value);
+                    i++;
+                }
                 case "--files", "--exclude" -> {
                     String value = value(args, i, arg);
                     if ("--files".equals(arg)) {
@@ -287,11 +314,26 @@ public final class Cli {
             throw new UsageException("The selection resolved to 0 files: nothing to do.");
         }
 
+        // A CLI user cannot tick rows, so a named path is taken to mean exactly what an unticked row
+        // means in the window: the file is known at the destination and deliberately left out.
+        Set<String> excludedAtDestination = new LinkedHashSet<>();
+        for (String raw : excludeDestArgs) {
+            excludedAtDestination.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(splitList(raw))));
+        }
+        if (excludedAtDestination.containsAll(selected)) {
+            throw new UsageException("--exclude-dest removes every selected file from the job: nothing left "
+                    + "to verify.");
+        }
+        Selection destination = excludedAtDestination.isEmpty()
+            ? Selection.none()
+            : new Selection(Set.of(), excludedAtDestination);
+
         JobRequest request = new JobRequest(sourceDir, destDir, jobType,
-                new Selection(selected, selected), Selection.none(), scanOptions, detectExtra, dryRun);
+                new Selection(selected, selected), destination, scanOptions, detectExtra, dryRun);
         return new Options(request, timeoutMillis, bandwidthLimitKbps, maxResults,
                 csvPath == null ? null : Path.of(csvPath),
-                jsonPath == null ? null : Path.of(jsonPath), quiet);
+                jsonPath == null ? null : Path.of(jsonPath), quiet,
+                List.copyOf(excludedAtDestination));
     }
 
     private static List<String> splitList(String value) {
@@ -334,6 +376,13 @@ public final class Cli {
             err.println();
             err.println(usage());
             return EXIT_USAGE;
+        }
+
+        if (!options.destinationExcluded().isEmpty()
+                && options.request().jobType() != JobType.VERIFY_ONLY) {
+            // Say it rather than let a flag quietly do nothing.
+            err.println("Note: --exclude-dest does not apply to a copy; a copy follows the source "
+                    + "selection. Use --verify-only to leave files out of the comparison.");
         }
 
         FileSyncEngine engine = new FileSyncEngine();

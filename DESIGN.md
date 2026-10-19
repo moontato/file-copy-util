@@ -88,7 +88,27 @@ rsync -a --checksum --itemize-changes --info=progress2 [--dry-run] [--bwlimit=N]
   something `xfr#` never counts). Progress follows the percentage, never the announcements; a
   `--dry-run` announces a meaningless 100% instantly, so its percentage is ignored.
 
-## 5. Counters, progress and memory
+## 5. Two lists, one rule, and the line that explains them
+
+The window has a source list and a destination list, and they mean different things in different modes: a
+copy follows the source ticks and ignores the destination entirely, while Verify Only follows the source
+ticks minus the destination rows the user was actually shown and left unticked. That is subtle enough to
+get wrong silently, so it is stated on screen: each list says how many rows it has and how many are ticked,
+and a line under the mode buttons says how many files the selected operation would process, which rule
+produced that number, and - when it is a handful - which paths were excluded. A third "effective" list was
+considered and rejected: it would be another thing to keep in sync, and it would show a derived fact while
+hiding the rule that derived it.
+
+The rule lives in one place, `FileSyncEngine.excludedAtDestination`, and both the job and the preview call
+it, so the preview cannot promise a work set the job then ignores. Because the preview is recomputed on
+every click, the engine also has an equivalent fast form: given the number of ticked source rows and the
+set of paths unticked at the destination, it counts exclusions by asking "is this a ticked source row?"
+through the window's path index. Cost is then proportional to how many rows the user unticked, not to how
+many exist - a single click in a 100000 row list costs nothing instead of a quarter of a second. The two
+forms are tested against each other over several tick patterns, which is what makes an equivalent
+implementation acceptable instead of a second rule.
+
+## 6. Counters, progress and memory
 
 Verification decides one file at a time: hash whatever still needs hashing, compare, report, and let the
 digests go. It is deliberately not "hash every source file into a map, hash every destination file into a
@@ -134,7 +154,7 @@ count means "would be copied", its message starts `Dry run - nothing was written
 warning saying no file was written. A dry run is not a separate mode of thinking for the engine: it is
 the same job with one flag.
 
-## 6. Job lifecycle
+## 7. Job lifecycle
 
 `FileSyncEngine` is an instance and `AutoCloseable` and owns at most one job, guarded by an
 `AtomicBoolean` CAS:
@@ -154,7 +174,7 @@ the same job with one flag.
 - `close()` refuses further jobs. Status is `IDLE → RUNNING → COMPLETED/FAILED`; the GUI's "still
   running, last activity Ns ago" line is driven by a Swing timer, not by the rsync reader.
 
-## 7. Two front ends, one engine
+## 8. Two front ends, one engine
 
 `FileSyncEngine` has no Swing dependency. `FileVerifierFrame` (GUI) and `Cli` (headless, `--cli`) are
 both thin adapters over `JobRequest` + `ProgressListener`, so the semantics are implemented once. The
@@ -164,7 +184,7 @@ CLI maps the outcome onto exit codes: `0` nothing to report, `1` job failed (pre
 rule than the GUI. `--dry-run` and `--bwlimit` map onto the same `JobRequest.dryRun` /
 `setBandwidthLimitKbps` the GUI uses.
 
-## 8. Scanning
+## 9. Scanning
 
 `Files.walkFileTree` with `ScanOptions(ignorePatterns, includeHidden, symlinkPolicy)`:
 
@@ -177,14 +197,14 @@ rule than the GUI. `--dry-run` and `--bwlimit` map onto the same `JobRequest.dry
 - Results are sorted by relative path; the scan reports how many entries were ignored and how many links
   were skipped.
 
-## 9. Bounded UI
+## 10. Bounded UI
 
 The log keeps its newest 5000 lines (`TailLog`, which tracks every line's length so trimming removes
 whole lines and batches the removals). Outcomes are capped at `MAX_OUTCOMES = 50_000`; beyond that the
 counters remain exact and the report is truncated with a warning. Lists hold a flat row model with a
 filtered view for the filter boxes.
 
-## 10. Known limits
+## 11. Known limits
 
 - A selection large enough to exhaust the heap fails the job with that advice; the tool does not spill to
   disk or stream the report. Measured ceiling on this build: 300k files needs ~256 MB for Verify Only and
@@ -198,6 +218,11 @@ filtered view for the filter boxes.
   user removes them or re-runs the copy (a re-run starts a fresh temporary file, so leftovers from
   several interrupted runs can accumulate — each is reported).
 - The GUI does not show per-file transfer progress within one large file beyond the global percentage.
+- A 300000 row list in the window costs about 710 MB of resident memory (573 MB right after the scan, the
+  rest being the preview index and the table). It stays responsive - a click costs nothing, Select All
+  3 ms, filter 26 ms - but it is not a low-memory design.
+- The fast work-set preview is proportional to how many destination rows are unticked. If half of a
+  300000 row destination is unticked, the preview costs a few hundred milliseconds per click.
 - Older rsync 3.1.x renders itemize paths differently; behaviour here is verified against 3.2.7.
 - The per-side selection rule is modelled (`Selection.selected`/`known`) but the GUI has no separate
   per-side selection mode yet.

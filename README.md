@@ -78,7 +78,8 @@ The CLI runs the same engine with the same selection rules: either `--files` or 
 | 2 | bad command line |
 | 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
 
-Other CLI options: `--verify-only`, `--dry-run`, `--exclude a.txt,...` (with `--all`), `--ignore "GLOB,GLOB"`
+Other CLI options: `--verify-only`, `--dry-run`, `--exclude a.txt,...` (with `--all`),
+`--exclude-dest a.txt,...` (with `--verify-only`), `--ignore "GLOB,GLOB"`
 (adds to the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
 `--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--max-results N`, `--quiet`.
 
@@ -135,10 +136,10 @@ or, when rsync cleaned up after itself, `No partial rsync file was left in the d
 Measured on this build, on a tree of 100 directories x 1000 files (hard links, so the fixture itself
 costs kilobytes):
 
-| Tree | Scan | Verify Only | Copy & Verify | Heap needed |
-|---|---|---|---|---|
-| 100k files | ~1 s | ~2.4 s | ~6 s (dry run) | fits in 128 MB |
-| 300k files | ~3.6 s | ~7 s | ~17 s (dry run) | ~256 MB verify, ~320 MB copy |
+| Tree | Scan | Verify Only | Copy & Verify | Heap needed | Window scan / rows resident |
+|---|---|---|---|---|---|
+| 100k files | ~1 s | ~2.4 s | ~6 s (dry run) | fits in 128 MB | 1.3 s, ~490 MB |
+| 300k files | ~3.6 s | ~7 s | ~17 s (dry run) | ~256 MB verify, ~320 MB copy | 7.1 s, ~710 MB |
 
 Time scales linearly. Memory is the constraint, and it is deliberately bounded: results are decided one
 file at a time (no digest map per side), the destination is scanned only when destination-only reporting
@@ -152,7 +153,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-109 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the CLI front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
+115 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the CLI front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. `mvn verify` also runs the static-analysis gates: `javac -Xlint:all -Werror` and SpotBugs at Medium
 severity. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged
 jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the jar to a GitHub Release.

@@ -63,6 +63,26 @@ there is now a test suite that says what it is supposed to do.
   `--dry-run` and still compares hashes, so you see what the job would copy and what already mismatches
   without writing anything. Its count means "would be copied" and its message says nothing was written.
 - **`--bwlimit KB/s`** caps the transfer rate.
+### Per-side selection made visible (Phase 5, Group B)
+
+- **The window states what its two checkbox lists mean.** Each list now reads `100000 files, 100000
+  selected`, and a line under the mode buttons states the work set and the rule that produced it: "source
+  ticks only; a copy ignores the destination list", or "100000 ticked at source, 1 unticked at the
+  destination (old.bin)". Excluded paths are named while they are few, and never named when they are many,
+  because listing 5 of 9000 would imply the rest do not matter.
+- **`--exclude-dest a.txt,...`** is the command line's unticked destination row. On a copy it says so
+  rather than doing nothing quietly. Naming every selected file is a usage error.
+- **The preview uses the engine's own exclusion rule**, `excludedAtDestination`, so it cannot promise a
+  work set the job then ignores; a test compares a job's counters with the numbers its preview showed.
+- **Measured GUI cost** (100k and 300k hard-linked trees): scan 1.3 s / 7.1 s; Select All 2-3 ms; a single
+  row click 0 ms; filter 15-26 ms; 490 MB / 710 MB resident. The first version of the preview recomputed
+  the whole work set per click and cost ~245 ms per click at 100k rows; the preview now indexes rows by
+  path and tracks unticked rows incrementally, with an engine test that the fast form and the walk-the-list
+  form agree.
+- Records that held a `List` were storing and returning it directly (SpotBugs `EI_EXPOSE_REP`/`EI_EXPOSE_REP2`);
+  both now copy in the canonical constructor.
+- 115 tests.
+
 ### Scale and static analysis (Phase 5, Group A)
 
 - **Measured on 100k and 300k file trees** (scan ~1 s / ~3.6 s, Verify Only ~2.4 s / ~7 s). Time is linear;
