@@ -36,6 +36,7 @@ public class FileVerifierFrame extends JFrame {
     private static final String PREF_HIDDEN = "includeHidden";
     private static final String PREF_SYMLINKS = "symlinkPolicy";
     private static final String PREF_TIMEOUT = "timeoutSeconds";
+    private static final String PREF_DRY_RUN = "dryRun";
     private static final String PREF_EXTRA = "detectExtra";
     private static final String PREF_JOB_TYPE = "jobType";
 
@@ -74,6 +75,7 @@ public class FileVerifierFrame extends JFrame {
     private JButton exportCsvButton;
     private JButton exportJsonButton;
     private JTextField jobTimeoutField;
+    private JCheckBox dryRunCheck;
     private Timer livenessTimer;
 
     private boolean scanning = false;
@@ -392,6 +394,10 @@ public class FileVerifierFrame extends JFrame {
         panel.add(outputTabs, BorderLayout.CENTER);
 
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 5));
+        dryRunCheck = new JCheckBox("Dry run (write nothing)");
+        dryRunCheck.setToolTipText("Run rsync with --dry-run and still compare hashes: shows what the job "
+            + "would do without writing or changing anything.");
+        controls.add(dryRunCheck);
         controls.add(new JLabel("Timeout (s, 0 = none):"));
         jobTimeoutField = new JTextField("0");
         jobTimeoutField.setPreferredSize(new Dimension(50, 28));
@@ -434,6 +440,7 @@ public class FileVerifierFrame extends JFrame {
         extraCheck.setSelected(prefs.getBoolean(PREF_EXTRA, true));
         symlinkCombo.setSelectedItem(policyFromName(prefs.get(PREF_SYMLINKS, "SKIP")));
         jobTimeoutField.setText(prefs.get(PREF_TIMEOUT, "0"));
+        dryRunCheck.setSelected(prefs.getBoolean(PREF_DRY_RUN, false));
         selectJobType(prefs.get(PREF_JOB_TYPE, "COPY_AND_VERIFY").equals("VERIFY_ONLY")
             ? FileSyncEngine.JobType.VERIFY_ONLY : FileSyncEngine.JobType.COPY_AND_VERIFY);
     }
@@ -446,6 +453,7 @@ public class FileVerifierFrame extends JFrame {
         prefs.putBoolean(PREF_EXTRA, extraCheck.isSelected());
         prefs.put(PREF_SYMLINKS, selectedPolicy().name());
         prefs.put(PREF_TIMEOUT, jobTimeoutField.getText().trim());
+        prefs.putBoolean(PREF_DRY_RUN, dryRunCheck.isSelected());
         prefs.put(PREF_JOB_TYPE, currentJobType.name());
     }
 
@@ -634,6 +642,7 @@ public class FileVerifierFrame extends JFrame {
         copyVerifyButton.setEnabled(idle);
         verifyOnlyButton.setEnabled(idle);
         jobTimeoutField.setEnabled(idle);
+        dryRunCheck.setEnabled(idle);
         ignoreField.setEnabled(idle);
         hiddenCheck.setEnabled(idle);
         extraCheck.setEnabled(idle);
@@ -687,7 +696,8 @@ public class FileVerifierFrame extends JFrame {
         FileSyncEngine.Selection destSelection = selectionModelOf(destModel);
         FileSyncEngine.JobRequest request = new FileSyncEngine.JobRequest(
             Path.of(sourcePath), Path.of(destPath), currentJobType,
-            sourceSelection, destSelection, currentScanOptions(), extraCheck.isSelected());
+            sourceSelection, destSelection, currentScanOptions(), extraCheck.isSelected(),
+            dryRunCheck.isSelected());
 
         // Preflight before touching anything, so the user gets one clear dialog instead of a
         // failed job in the log. The engine repeats every check itself.

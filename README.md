@@ -22,6 +22,9 @@ counters) and [CHANGELOG.md](CHANGELOG.md) for what changed in 1.1.0.
 - **Preflight Checks** — Source readable, destination writable, source not equal to or containing the destination, and `rsync` present, all checked before anything is touched
 - **Safe Scanning** — Unreadable subdirectories become warnings instead of aborting the scan; symlink cycles are reported, not followed
 - **Bounded Log** — The on-screen log keeps its newest 5000 lines; the export is the archive
+- **Dry Run** — *Dry run (write nothing)* runs `rsync --dry-run` and still compares hashes: you see what the job would copy and what already mismatches, and nothing is written
+- **Partial-Transfer Reporting** — after a cancelled or timed-out copy, the engine looks for the hidden partial files `rsync` left behind and names them with their sizes; it never deletes them
+- **Bandwidth Cap** — `--bwlimit KB/s` caps the transfer rate
 - **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode and extra-file detection are restored in the next window
 - **Smart Directory Selection** — The chooser starts in the directory already in that field (falling back to the other field, then home) and takes the directory you actually clicked
 - **Headless CLI** — `--cli` runs the same engine without a display, with CSV/JSON export and exit codes for scripting
@@ -58,6 +61,7 @@ java -jar target/file-verifier-1.1.0.jar
 java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
 java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
 java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
 java -jar target/file-verifier-1.1.0.jar --cli --help
 ```
 
@@ -69,11 +73,11 @@ The CLI runs the same engine with the same selection rules: either `--files` or 
 | 0 | job completed, nothing mismatched or missing |
 | 1 | the job failed: preflight problem, rsync error, cancellation |
 | 2 | bad command line |
-| 3 | job completed, but files mismatched or were missing at the destination |
+| 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
 
-Other CLI options: `--verify-only`, `--exclude a.txt,...` (with `--all`), `--ignore "GLOB,GLOB"` (adds to
-the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
-`--no-report-extra`, `--timeout SECONDS`, `--quiet`.
+Other CLI options: `--verify-only`, `--dry-run`, `--exclude a.txt,...` (with `--all`), `--ignore "GLOB,GLOB"`
+(adds to the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
+`--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--quiet`.
 
 ### Workflow
 
@@ -83,7 +87,7 @@ the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip
 4. **Scan Files** — Click "Scan Files" to recursively scan both directories and populate the file lists. Changing an option afterwards says the scan is stale; press **Scan Files** again to apply it
 5. **Select Files** — Use checkboxes to include/exclude files. "Select All" / "Deselect All" for convenience; a filter box narrows what you see without changing what is ticked
 6. **Choose Job Type** — Toggle between "Copy & Verify" and "Verify Only"
-7. **Run Job** — Start the operation. While a job runs, the other controls are locked; use **Cancel** to stop it, or set **Timeout (s, 0 = none)** before starting to cap how long the job may take
+7. **Run Job** — Start the operation. Tick **Dry run (write nothing)** first to see what the job would do. While a job runs, the other controls are locked; use **Cancel** to stop it, or set **Timeout (s, 0 = none)** before starting to cap how long the job may take
 8. **Read the Results tab** — One row per outcome with full hashes; tick *Only problems* to see just mismatches, missing and extra files, or export CSV/JSON
 
 ### Job Types
@@ -105,14 +109,23 @@ Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0
 ```
 
 - **checked** — the selected files that were verified (`checked = matched + mismatched + missing`, extras counted separately)
-- **copied** — items `rsync` reported as creating or changing at the destination (a copied symbolic link counts, an unchanged file does not). On a cancelled job this can overstate what actually finished, because rsync announces a file before its data has moved
+- **copied** — items `rsync` created or changed at the destination (a copied symbolic link counts, an unchanged file does not). rsync announces a file before its data has moved, so on a job that was cut short this is capped by rsync's own completed-transfer count (`xfr#`) and the message says "announced N, of which at most M finished"
 - **mismatch** — present at both ends with different SHA-256 (`src=` / `dst=` prefixes are shown)
 - **missing** — selected in the source, not present at the destination
 - **destination-only** (`EXTRA`) — present at the destination, not in the source selection (Verify Only, when *Report destination-only files* is on)
 
 A **failed** job (cancelled, timed out, or an rsync error) reports the partial counters it reached rather than zeros.
 
-`rsync` exit code 24 ("some files vanished before they could be transferred") is reported as a warning, not a failure; any other non-zero exit code fails the job and `rsync`'s own error lines are logged. Cancelling or timing out kills the `rsync` process (exit 137) and may leave a hidden temporary file in the destination directory.
+`rsync` exit code 24 ("some files vanished before they could be transferred") is reported as a warning, not a failure; any other non-zero exit code fails the job and `rsync`'s own error lines are logged.
+
+An interrupted transfer is written to a hidden temporary name (`.big.bin.QafPvi`) that is renamed only when the transfer completes. After a cancelled or timed-out copy the engine reports what it finds:
+
+```
+warning: 1 partial rsync file(s) left in the destination: .big.bin.QafPvi (for big.bin, 3.8 MB).
+         They are incomplete transfers - delete them or re-run the copy to finish them.
+```
+
+or, when rsync cleaned up after itself, `No partial rsync file was left in the destination.` The engine never deletes them: whether a hidden file in your directory is junk is your call.
 
 ## Tests
 
@@ -120,7 +133,7 @@ A **failed** job (cancelled, timed out, or an rsync error) reports the partial c
 mvn test
 ```
 
-93 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout), the CLI front end, the bounded log buffer, and the CSV/JSON report exporter. The rsync-dependent tests are skipped automatically if `rsync` is not installed. The lifecycle tests create 1.5 GB sparse files, so that suite takes a few seconds. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged jar.
+104 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the CLI front end, the bounded log buffer, and the CSV/JSON report exporter. The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged jar.
 
 ## Project Structure
 

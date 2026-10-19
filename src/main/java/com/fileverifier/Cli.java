@@ -52,6 +52,8 @@ public final class Cli {
                                     or copy the file they point at
           --no-report-extra         do not report files that exist only at the destination
           --timeout SECONDS         kill a job that runs longer than this (default: no limit)
+          --bwlimit KB/s            cap the transfer rate (rsync --bwlimit); 0 = unlimited
+          --dry-run                 show what would happen and write nothing (rsync --dry-run)
           --csv PATH                write the job report as CSV
           --json PATH               write the job report as JSON
           --quiet                   no progress output
@@ -72,8 +74,9 @@ public final class Cli {
         }
     }
 
-    /** A parsed command line: one job request plus how to report it. */
-    public record Options(JobRequest request, long timeoutMillis, Path csvPath, Path jsonPath, boolean quiet) {
+    /** A parsed command line: one job request plus how to run and report it. */
+    public record Options(JobRequest request, long timeoutMillis, long bandwidthLimitKbps,
+                          Path csvPath, Path jsonPath, boolean quiet) {
     }
 
     /** True when the command line is meant for the headless mode rather than the GUI. */
@@ -104,6 +107,8 @@ public final class Cli {
         ScanOptions.SymlinkPolicy policy = ScanOptions.SymlinkPolicy.SKIP;
         boolean detectExtra = true;
         long timeoutMillis = FileSyncEngine.NO_TIMEOUT;
+        long bandwidthLimitKbps = 0L;
+        boolean dryRun = false;
         String csvPath = null;
         String jsonPath = null;
         boolean quiet = false;
@@ -165,6 +170,21 @@ public final class Cli {
                         throw new UsageException("--timeout cannot be negative");
                     }
                     timeoutMillis = seconds == 0 ? FileSyncEngine.NO_TIMEOUT : seconds * 1000L;
+                }
+                case "--dry-run" -> dryRun = true;
+                case "--bwlimit" -> {
+                    String value = value(args, i, arg);
+                    i++;
+                    long kbps;
+                    try {
+                        kbps = Long.parseLong(value);
+                    } catch (NumberFormatException e) {
+                        throw new UsageException("--bwlimit must be KB/s, got '" + value + "'");
+                    }
+                    if (kbps < 0) {
+                        throw new UsageException("--bwlimit cannot be negative");
+                    }
+                    bandwidthLimitKbps = kbps;
                 }
                 case "--csv", "--json" -> {
                     String value = value(args, i, arg);
@@ -230,8 +250,8 @@ public final class Cli {
         }
 
         JobRequest request = new JobRequest(sourceDir, destDir, jobType,
-                new Selection(selected, selected), Selection.none(), scanOptions, detectExtra);
-        return new Options(request, timeoutMillis,
+                new Selection(selected, selected), Selection.none(), scanOptions, detectExtra, dryRun);
+        return new Options(request, timeoutMillis, bandwidthLimitKbps,
                 csvPath == null ? null : Path.of(csvPath),
                 jsonPath == null ? null : Path.of(jsonPath), quiet);
     }
@@ -280,6 +300,7 @@ public final class Cli {
 
         FileSyncEngine engine = new FileSyncEngine();
         engine.setJobTimeoutMillis(options.timeoutMillis());
+        engine.setBandwidthLimitKbps(options.bandwidthLimitKbps());
         ProgressReporter reporter = new ProgressReporter(out, options.quiet());
         JobResult result;
         try {

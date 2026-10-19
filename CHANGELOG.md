@@ -26,6 +26,17 @@ there is now a test suite that says what it is supposed to do.
   Skipping says how many links were left out.
 - **A stale destination list can no longer silently exclude files from Verify Only.** Exclusion now
   requires a row the list actually contains and leaves unticked.
+- **`copied` on a job that was cut short is capped by rsync's own completed-transfer count.** rsync
+  announces a file before its data moves, so a cancelled job used to report every announced file as
+  copied. It now reports "announced N, of which at most M finished", where M comes from rsync's `xfr#`
+  counter.
+- **After a cancelled or timed-out copy, the engine reports the partial files `rsync` left behind**, by
+  name and size (`.big.bin.QafPvi (for big.bin, 3.8 MB)`), or says explicitly that none were left. It
+  does not delete them.
+- **A job that ran past its deadline can no longer be reported as complete.** The deadline was enforced
+  by a watchdog on a 250 ms period, so a phase that finished between two ticks fell through and reported
+  `COMPLETED` - and a half-finished verification reported files it had not hashed as `missing`. The check
+  now records the timeout itself, in every work loop, and kills a live `rsync` from any thread.
 - `rsync` exit 24 is a warning, not a failure. Any other non-zero exit fails the job and rsync's own
   error lines are reported.
 
@@ -48,7 +59,12 @@ there is now a test suite that says what it is supposed to do.
 - **Headless CLI**: `java -jar file-verifier.jar --cli --source DIR --dest DIR --all` (or `--files`)
   with the same engine and semantics, plus CSV/JSON export and exit codes
   (0 nothing to report, 1 job failed, 2 bad command line, 3 files mismatched or missing).
-- 93 tests, headless, driven against real `rsync` when it is installed.
+- **Dry run** (`--dry-run` in the CLI, *Dry run (write nothing)* in the GUI): runs rsync with
+  `--dry-run` and still compares hashes, so you see what the job would copy and what already mismatches
+  without writing anything. Its count means "would be copied" and its message says nothing was written.
+- **`--bwlimit KB/s`** caps the transfer rate.
+- 104 tests, headless, driven against real `rsync` when it is installed. Tests that kill a transfer
+  throttle rsync with `--bwlimit`, so they write a few megabytes instead of gigabytes.
 
 ### Fixed
 

@@ -290,3 +290,32 @@ one-way door in one direction only:
 
 - The per-side selection *mode* (3.4's original ambition) is still modelled only as `Selection.selected`/`known`.
 - GUI behaviour at 100k+ files is mitigated (view model, log cap, coalesced progress, `MAX_OUTCOMES`) but never measured at that size.
+
+---
+
+## Phase 5 completion record (2026-10-19)
+
+Owner constraint for this phase: **limit large and frequent writes** (the work runs on the owner's SSD). That shaped both the features and the test suite.
+
+| Item | Result |
+|---|---|
+| 5.1 partial-transfer reporting | after a cancelled or timed-out copy the engine lists the directories this job would have written to (no destination walk) and matches `.name.XXXXXX` against the names in the work set. Leftovers are reported with size - `1 partial rsync file(s) left in the destination: .big.bin.QafPvi (for big.bin, 3.8 MB). They are incomplete transfers - delete them or re-run the copy to finish them.` - and when rsync cleaned up, the warning says so explicitly. Nothing is deleted |
+| 5.2 completed-transfer accounting | `--info=progress2` carries `xfr#N`, rsync's count of transfers it has **finished**. A cut-short job now reports `min(announced, xfr#)` with the message "announced N file(s) for copy, of which at most M finished". If rsync never reported a count, the announcement count is kept and the wording stays "announced" |
+| 5.3 dry run | `JobRequest.dryRun` → `rsync --dry-run`, same work set, same hashing, same comparison. GUI: *Dry run (write nothing)* checkbox (persisted). CLI: `--dry-run`. Message `Dry run - nothing was written: 0 matched, 0 mismatched, 5 missing, 5 would be copied.` plus a warning that nothing was written. `copied` means "would be copied"; CLI exit 3 means "there *would* be problems" |
+| also shipped | `--bwlimit KB/s` (`setBandwidthLimitKbps`), used by the tests to keep writes bounded and available to users for a slow link |
+
+### Findings that changed the design
+
+21. **`xfr#` counts finished transfers, itemize lines announce started ones** (measured with `--bwlimit`: at 49% of a 25 MB job the counter read `xfr#1` with one 12 MB file complete and the second announced). Capping by `xfr#` is right for cut-short jobs but wrong for completed ones: `xfr#` never counts locally created links and devices (`cL`, `cD`), and Phase 3 established that a copied symlink *is* a copied item. So a completed job keeps the itemize count and only an interrupted job is capped.
+22. **Leftovers are conditional, so they must be detected rather than assumed.** A gracefully SIGTERM'd rsync removed its partial file and exited 20 in one measured case; killing the process group left `.big.bin.YC9p2z` (11.2 MB) behind in another. The README used to warn "may leave a hidden temporary file"; the engine now looks and reports which case happened. It never deletes anything.
+23. **`rsync --dry-run` is not a normal run with the writes removed.** It writes nothing and prints the same itemize lines, but its progress line claims 100% instantly (`23.44GB/s`), so a dry run ignores rsync's percentage instead of driving the bar from it.
+24. **Unbounded test I/O was worth fixing on its own.** The lifecycle suite used 1.5 GB sparse sources that rsync copied at full speed (a sparse file becomes real data at the destination). It now uses 300 MB sparse files with `--bwlimit=2000`, which bounds each interrupted transfer to a few megabytes and cut the suite from 10.3 s to 3.0 s. Test I/O discipline is now part of the design, not an afterthought.
+
+### Verification
+
+- `mvn -B clean verify`: 104 tests, 0 failures (40 semantics incl. dry runs, leftover detection and the `xfr#` cap; 10 lifecycle; 19 CLI).
+- Packaged jar, real trees: dry run left `dst` with 0 entries; a 2 s timeout against a 300 MB sparse file at 2 MB/s reported `announced 2, at most 1 finished` and named `.big.bin.QafPvi (for big.bin, 3.8 MB)`; a second interrupted run reported both leftovers. Total bytes written across the whole verification: under 10 MB.
+- GUI under Xvfb: 32/32 checks, including a dry-run job over 5 rows reporting `5 would be copied` with 0 files written to the destination, and the dry-run checkbox disabled while a job runs.
+- CI smoke sequence run locally end to end, including "dry run exits non-zero and leaves the destination empty".
+
+25. **A latent lifecycle bug surfaced while building 5.1-5.3: a job could run past its deadline and be reported `COMPLETED`.** The deadline was enforced only by the watchdog (250 ms period), while the work loops merely *stopped* on `deadlineExceeded()`. So a phase that finished between two ticks fell through to the success path - and a verification whose hashing had been cut short reported the unhashed files as `missing`, i.e. a job that never happened reported as one that found problems. Fixed by making the check itself authoritative: `deadlineExceeded()` records the timeout the moment it sees the deadline passed, `abortRequested()` (used by every loop, on every thread) also kills a live `rsync`, and the watchdog is reduced to what only it can do - a blocked `process.waitFor()` or one huge file being hashed. Found because a test that looked flaky was rewritten to be deterministic: making it deterministic made the bug visible.

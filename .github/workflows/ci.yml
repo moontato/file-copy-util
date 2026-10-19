@@ -40,6 +40,13 @@ jobs:
           java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --csv /tmp/smoke/report.csv
           test -f /tmp/smoke/dst/a.txt && test -f /tmp/smoke/dst/sub/b.txt
           test -s /tmp/smoke/report.csv
+          # A dry run must write nothing, and must still report what would be missing (exit 3).
+          rm -rf /tmp/smoke/dry && mkdir -p /tmp/smoke/dry
+          if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dry --all --dry-run; then
+            echo "expected a dry run with missing files to exit non-zero" >&2
+            exit 1
+          fi
+          test -z "$(ls -A /tmp/smoke/dry)"
           java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only
           echo "alpha changed" > /tmp/smoke/dst/a.txt
           if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only; then

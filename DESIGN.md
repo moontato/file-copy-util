@@ -67,7 +67,8 @@ each unit of work.
 One command, always, for a copy job:
 
 ```
-rsync -a --checksum --itemize-changes --info=progress2 --files-from=<temp file> <source>/ <dest>/
+rsync -a --checksum --itemize-changes --info=progress2 [--dry-run] [--bwlimit=N] [--copy-links] \
+      --files-from=<temp file> <source>/ <dest>/
 ```
 
 - The selection is written to a temporary UTF-8 file and deleted in a `finally`. `--files-from` implies
@@ -81,9 +82,11 @@ rsync -a --checksum --itemize-changes --info=progress2 --files-from=<temp file> 
 - Exit codes: 0 and 24 are success (24 becomes a warning: "some files vanished"); anything else fails
   the job with rsync's own error lines attached.
 - **Announcements are not transfers.** rsync prints the itemize line for a file before its data has
-  moved, so `copied` counts announced items (exact for a completed job, potentially overstated for a
-  cancelled one — documented in `JobResult`), and progress follows the `--info=progress2` percentage
-  instead.
+  moved. `--info=progress2` carries rsync's own counter of transfers it has *finished* — the `xfr#N`
+  field — so a job that is cut short reports `min(announced, rsync's completed count)` and says so,
+  while a completed job reports the itemize count (which includes locally created links and devices,
+  something `xfr#` never counts). Progress follows the percentage, never the announcements; a
+  `--dry-run` announces a meaningless 100% instantly, so its percentage is ignored.
 
 ## 5. Counters and progress
 
@@ -94,6 +97,31 @@ checked = matched + mismatched + missing        (destination-only files counted 
 Progress is a percentage of the work set: copy phase 0–70%, verification 70–100%, with updates
 coalesced to whole percentage changes so a 100k-file job does not spam the UI or the log.
 
+### Interrupted transfers
+
+rsync writes a file into a hidden temporary name (`.big.bin.QafPvi`) and renames it into place only when
+the transfer completes. Measured on rsync 3.2.7: a gracefully SIGTERM'd rsync usually removes that file
+and exits 20; a killed process or killed child does not, and the partial stays. So the engine does not
+assume either way — after a cancelled or timed-out copy it lists the directories this job would have
+written to and reports the partials whose names match `.name.XXXXXX` for a file in the work set, with
+sizes:
+
+```
+1 partial rsync file(s) left in the destination: .big.bin.QafPvi (for big.bin, 3.8 MB). They are
+incomplete transfers - delete them or re-run the copy to finish them.
+```
+
+or `No partial rsync file was left in the destination.` when there is nothing to report. The engine
+never deletes them: deciding that a hidden file in someone's directory is junk is the user's call.
+
+### Dry run
+
+`dryRun` on a `JobRequest` adds `--dry-run` to the rsync command and keeps everything else — same work
+set, same hashing, same comparison — so a preview reports exactly what a real run would. Its `copied`
+count means "would be copied", its message starts `Dry run - nothing was written:`, and it carries a
+warning saying no file was written. A dry run is not a separate mode of thinking for the engine: it is
+the same job with one flag.
+
 ## 6. Job lifecycle
 
 `FileSyncEngine` is an instance and `AutoCloseable` and owns at most one job, guarded by an
@@ -102,11 +130,15 @@ coalesced to whole percentage changes so a 100k-file job does not spam the UI or
 - `start(...)` submits asynchronously and returns `false` if the engine is busy.
 - `execute(...)` is the synchronous equivalent and throws if the engine is busy.
 - `cancel()` sets the flag, kills the live `rsync` process and `process.descendants()`, and the loops
-  stop at the next unit of work. A cancelled job ends `FAILED` with the counters it reached and a note
-  that rsync may leave a hidden temporary file behind.
-- A watchdog (250 ms period) enforces an optional deadline; a timed-out job fails with a timeout
-  message distinct from cancellation. The deadline is checked per work unit, not just at loop tops — a
-  1 s timeout that only fired between files did not stop a job whose hashing overran it.
+  stop at the next unit of work. A cancelled job ends `FAILED` with the counters it reached and a report
+  of the partial files the interrupted `rsync` actually left behind.
+- An optional deadline is enforced from two sides. Every work loop calls `abortRequested()`, which records
+  the timeout the moment the deadline passes and kills a live `rsync` from any thread; a watchdog (250 ms
+  period) covers the places a loop cannot check itself — a blocked `process.waitFor()`, or one huge file
+  being hashed. Recording the timeout at the check matters for the *result*, not just for stopping the
+  work: a phase that ran past the deadline used to fall through and report the job `COMPLETED`, and a
+  half-finished verification reported files it never hashed as `missing`. A timed-out job fails with a
+  message distinct from cancellation.
 - `close()` refuses further jobs. Status is `IDLE → RUNNING → COMPLETED/FAILED`; the GUI's "still
   running, last activity Ns ago" line is driven by a Swing timer, not by the rsync reader.
 
@@ -115,8 +147,10 @@ coalesced to whole percentage changes so a 100k-file job does not spam the UI or
 `FileSyncEngine` has no Swing dependency. `FileVerifierFrame` (GUI) and `Cli` (headless, `--cli`) are
 both thin adapters over `JobRequest` + `ProgressListener`, so the semantics are implemented once. The
 CLI maps the outcome onto exit codes: `0` nothing to report, `1` job failed (preflight, rsync error),
-`2` bad command line, `3` files mismatched or missing. `--all` expands to an explicit selection by
-scanning first — the CLI does not get a weaker selection rule than the GUI.
+`2` bad command line, `3` files mismatched or missing (for `--dry-run`: would be mismatched or missing).
+`--all` expands to an explicit selection by scanning first — the CLI does not get a weaker selection
+rule than the GUI. `--dry-run` and `--bwlimit` map onto the same `JobRequest.dryRun` /
+`setBandwidthLimitKbps` the GUI uses.
 
 ## 8. Scanning
 
@@ -140,8 +174,12 @@ filtered view for the filter boxes.
 
 ## 10. Known limits
 
-- `copied` is rsync's announcement count, so a cancelled job can overstate completed transfers.
-- A cancelled or timed-out `rsync` can leave a hidden `.~rsyncXXXX` temporary file in the destination.
+- On a cut-short job, `copied` is capped by rsync's completed-transfer count; if rsync never reported
+  one, the announcement count is kept and the wording says "announced". A cap can understate locally
+  created links (`xfr#` does not count them).
+- Interrupted transfers are reported, not cleaned up: partial files stay in the destination until the
+  user removes them or re-runs the copy (a re-run starts a fresh temporary file, so leftovers from
+  several interrupted runs can accumulate — each is reported).
 - The GUI does not show per-file transfer progress within one large file beyond the global percentage.
 - Older rsync 3.1.x renders itemize paths differently; behaviour here is verified against 3.2.7.
 - The per-side selection rule is modelled (`Selection.selected`/`known`) but the GUI has no separate

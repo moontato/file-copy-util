@@ -31,8 +31,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 class FileSyncEngineLifecycleTest {
 
-    /** Big enough that rsync is provably still transferring when the job is killed. */
-    private static final long BIG_FILE_BYTES = 1_500_000_000L;
+    /**
+     * Big enough that rsync is provably still transferring when the job is killed, small enough that
+     * the throttled tests write only a few megabytes to disk (the transfers are capped with --bwlimit).
+     */
+    private static final long BIG_FILE_BYTES = 300_000_000L;
+    /** KB/s cap applied to the tests that kill a transfer mid-flight, to bound real writes. */
+    private static final long THROTTLE_KBPS = 2_000L;
 
     @TempDir
     Path source;
@@ -42,6 +47,17 @@ class FileSyncEngineLifecycleTest {
 
     private static void assumeRsync() {
         assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+    }
+
+    /**
+     * Many tiny work units rather than big files: a job made of them cannot finish before a deadline or a
+     * cancel lands, and empty files keep the fixture cheap on disk.
+     */
+    private void manyTinyFiles() throws IOException {
+        for (int i = 0; i < 2_000; i++) {
+            TestSupport.write(source.resolve("f" + i + ".bin"), "");
+            TestSupport.write(dest.resolve("f" + i + ".bin"), "");
+        }
     }
 
     private void smallFixture() throws Exception {
@@ -233,6 +249,7 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             holder[0] = engine;
+            engine.setBandwidthLimitKbps(THROTTLE_KBPS);
             assertTrue(engine.start(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
                     TestSupport.selectAllOf(source), TestSupport.none()), rec));
 
@@ -243,12 +260,15 @@ class FileSyncEngineLifecycleTest {
             assertTrue(result.message().contains("cancelled"), result.message());
             assertFalse(engine.isRunning(), "a cancelled job must release the engine");
             assertEquals(JobStatus.FAILED, engine.status());
-            assertTrue(result.filesCopied() >= 1, result.toString());
             assertTrue(result.filesCopied() < 3,
                     "cancellation must stop the job, not let it finish: " + result.filesCopied());
+            // rsync announces before it moves data, so a cut-short job reports completed transfers -
+            // capped by rsync's own count when it reported one.
+            assertTrue(result.message().contains("announced") && result.message().contains("at most"),
+                    result.message());
             assertEquals(0, result.filesChecked(), "verification must not run after cancellation");
-            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("temporary file")),
-                    result.warnings().toString());
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial rsync file")),
+                    "the engine must say whether rsync left partial files behind: " + result.warnings());
         }
 
         awaitNoRsyncProcesses();
@@ -263,6 +283,7 @@ class FileSyncEngineLifecycleTest {
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             engine.setJobTimeoutMillis(250);
+            engine.setBandwidthLimitKbps(THROTTLE_KBPS);
             assertEquals(250, engine.jobTimeoutMillis());
 
             JobResult result = engine.execute(TestSupport.request(source, dest, JobType.COPY_AND_VERIFY,
@@ -271,6 +292,8 @@ class FileSyncEngineLifecycleTest {
             assertEquals(JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("timeout"), result.message());
             assertTrue(result.message().contains("250 ms"), result.message());
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial rsync file")),
+                    result.warnings().toString());
             assertFalse(engine.isRunning());
             assertEquals(JobStatus.FAILED, engine.status());
         }
@@ -279,35 +302,35 @@ class FileSyncEngineLifecycleTest {
 
     @Test
     void jobTimeoutAlsoAbortsTheVerificationPhase() throws Exception {
-        // No rsync involved: hashing 1.5 GB at both ends is far slower than the deadline, so the
-        // per-file timeout check is what has to abort the job.
-        sparseFile(source.resolve("huge.bin"), BIG_FILE_BYTES);
-        sparseFile(dest.resolve("huge.bin"), BIG_FILE_BYTES);
-        TestSupport.write(source.resolve("small.txt"), "small\n");
-        TestSupport.write(dest.resolve("small.txt"), "small\n");
+        // VERIFY_ONLY has no copy phase, so a deadline here can only be enforced by the verification
+        // loop, and many tiny work units make sure the job cannot finish inside 1 ms. The mid-transfer
+        // trip is covered by jobTimeoutTerminatesASlowRsync.
+        manyTinyFiles();
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
-            engine.setJobTimeoutMillis(250);
+            engine.setJobTimeoutMillis(1);
             JobResult result = engine.execute(TestSupport.request(source, dest, JobType.VERIFY_ONLY,
-                    TestSupport.selection("huge.bin", "small.txt"),
-                    TestSupport.selection("huge.bin", "small.txt")), new TestSupport.Recorder());
+                    TestSupport.selectAllOf(source), TestSupport.selectAllOf(dest)), new TestSupport.Recorder());
 
             assertEquals(JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("timeout"), result.message());
-            assertTrue(result.message().contains("250 ms"), result.message());
-            // A failed job reports the partial counters it reached, and they stay consistent.
-            assertTrue(result.filesChecked() < 2, result.message());
+            assertTrue(result.message().contains("1 ms"), result.message());
+            assertTrue(result.filesChecked() < 2_000,
+                    "the deadline must stop the verification loop: checked=" + result.filesChecked());
             assertEquals(result.filesChecked(),
                     result.filesMatched() + result.filesMismatched() + result.filesMissing());
+            assertEquals(0, result.filesMissing(),
+                    "a job cut short must not report files it never hashed as missing");
+            assertFalse(engine.isRunning());
+            assertEquals(JobStatus.FAILED, engine.status());
         }
     }
 
     @Test
     void cancellationAlsoStopsTheVerificationPhase() throws Exception {
-        sparseFile(source.resolve("huge.bin"), BIG_FILE_BYTES);
-        sparseFile(dest.resolve("huge.bin"), BIG_FILE_BYTES);
-        TestSupport.write(source.resolve("small.txt"), "small\n");
-        TestSupport.write(dest.resolve("small.txt"), "small\n");
+        // Cancelling on the first verified file must stop the rest of the loop; only in-flight units can
+        // still finish.
+        manyTinyFiles();
 
         final FileSyncEngine[] holder = new FileSyncEngine[1];
         AtomicInteger verified = new AtomicInteger();
@@ -329,7 +352,7 @@ class FileSyncEngineLifecycleTest {
 
             assertEquals(JobStatus.FAILED, rec.result.status());
             assertTrue(rec.result.message().contains("cancelled"), rec.result.message());
-            assertTrue(rec.result.filesChecked() < 2,
+            assertTrue(rec.result.filesChecked() < 100,
                     "verification must stop after cancellation: " + rec.result.filesChecked());
         }
     }

@@ -34,8 +34,15 @@ final class TestSupport {
                                              FileSyncEngine.Selection sourceSelection,
                                              FileSyncEngine.Selection destSelection,
                                              ScanOptions options, boolean detectExtraFiles) {
+        return request(source, dest, type, sourceSelection, destSelection, options, detectExtraFiles, false);
+    }
+
+    static FileSyncEngine.JobRequest request(Path source, Path dest, FileSyncEngine.JobType type,
+                                             FileSyncEngine.Selection sourceSelection,
+                                             FileSyncEngine.Selection destSelection,
+                                             ScanOptions options, boolean detectExtraFiles, boolean dryRun) {
         return new FileSyncEngine.JobRequest(source, dest, type, sourceSelection, destSelection,
-                options, detectExtraFiles);
+                options, detectExtraFiles, dryRun);
     }
 
     /**
@@ -74,6 +81,32 @@ final class TestSupport {
                 exit 0
                 """.formatted(shellQuote(output));
         Files.writeString(script, body, StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
+    /**
+     * A stand-in rsync that prints {@code output}, leaves {@code partialFile} behind in the destination
+     * (the hidden file a killed transfer leaves), and then hangs so a timeout or a cancellation can cut
+     * it off. Pass null for {@code partialFile} to model a run that cleaned up after itself.
+     */
+    static Path hangingFakeRsync(Path dir, String output, String partialFile) throws IOException {
+        Path script = dir.resolve("fake-hanging-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("printf '%s\\n' ").append(shellQuote(output)).append('\n');
+        if (partialFile != null) {
+            // The engine passes source and destination as the last two arguments; the eval turns
+            // "\${N}" into positional argument N, which is the destination directory.
+            body.append("dst=$(eval echo \"\\${$#}\")\n");
+            body.append(": > \"$dst/").append(partialFile).append("\"\n");
+        }
+        body.append("sleep 20\n");
+        body.append("exit 137\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
         Files.setPosixFilePermissions(script, java.util.EnumSet.of(
                 java.nio.file.attribute.PosixFilePermission.OWNER_READ,
                 java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,

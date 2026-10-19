@@ -279,4 +279,41 @@ class CliTest {
         assertNotNull(dest.resolve("a.txt"));
         assertTrue(Files.isRegularFile(dest.resolve("a.txt")), o.out());
     }
+
+    @Test
+    void dryRunFlagReachesTheRequestAndReportsLimit() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+        Cli.Options options = Cli.parse(new String[]{"--cli", "--source", source.toString(),
+                "--dest", dest.toString(), "--all", "--dry-run", "--bwlimit", "1500"});
+        assertTrue(options.request().dryRun());
+        assertEquals(1500L, options.bandwidthLimitKbps());
+    }
+
+    @Test
+    void bwlimitMustBeANumber() {
+        Output o = new Output();
+        assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--bwlimit", "fast"));
+        assertTrue(o.err().contains("--bwlimit must be KB/s"), o.err());
+    }
+
+    @Test
+    void dryRunReportsWhatWouldHappenAndWritesNothing() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha\n");
+        TestSupport.write(source.resolve("sub/b.txt"), "beta\n");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(), "--all",
+                "--dry-run", "--quiet");
+
+        // The would-be missing files are exactly what a dry run is for, so they are reported the same
+        // way a real verify would report them.
+        assertEquals(Cli.EXIT_VERIFICATION_PROBLEMS, exit);
+        assertTrue(o.out().contains("Dry run - nothing was written"), o.out());
+        assertTrue(o.out().contains("2 would be copied"), o.out());
+        try (var walk = Files.walk(dest)) {
+            assertTrue(walk.noneMatch(Files::isRegularFile), o.out());
+        }
+    }
 }

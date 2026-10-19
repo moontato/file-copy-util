@@ -722,6 +722,159 @@ class FileSyncEngineTest {
         assertEquals(Set.of("abs/path.txt", "sub/file.txt", "double/leading.txt"), normalized);
     }
 
+    // ---------------------------------------------------------------- dry run (5.3)
+
+    private FileSyncEngine.JobResult runDry(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel,
+                                            FileSyncEngine.Selection dstSel) {
+        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel,
+                ScanOptions.DEFAULTS, false, true), rec);
+    }
+
+    @Test
+    void dryRunReportsWhatWouldCopyAndWritesNothing() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(source.resolve("sub/b.txt"), "b\n");
+
+        FileSyncEngine.JobResult result = runDry(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("a.txt", "sub/b.txt"), TestSupport.none());
+
+        assertTrue(result.isSuccess(), result.message());
+        assertTrue(result.message().startsWith("Dry run - nothing was written:"), result.message());
+        assertTrue(result.message().contains("2 would be copied"), result.message());
+        assertEquals(2, result.filesCopied(), "the count is what rsync says it would transfer");
+        assertEquals(2, result.filesMissing(), "nothing is at the destination yet");
+        try (var walk = Files.walk(dest)) {
+            assertTrue(walk.noneMatch(Files::isRegularFile), "a dry run must not write anything");
+        }
+        assertTrue(result.warnings().stream().anyMatch(w -> w.contains("--dry-run")),
+                String.valueOf(result.warnings()));
+    }
+
+    @Test
+    void dryRunOnIdenticalTreesSaysThereIsNothingToCopy() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "same\n");
+        TestSupport.write(source.resolve("b.txt"), "same2\n");
+        TestSupport.write(dest.resolve("a.txt"), "same\n");
+        TestSupport.write(dest.resolve("b.txt"), "same2\n");
+
+        FileSyncEngine.JobResult result = runDry(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("a.txt", "b.txt"), TestSupport.none());
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(0, result.filesCopied(), "unchanged files are not announced even in a dry run");
+        assertEquals(2, result.filesMatched());
+        assertEquals(0, result.filesMissing());
+    }
+
+    @Test
+    void dryRunStillFindsMismatchesAndDestinationOnlyFiles() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "source\n");
+        TestSupport.write(dest.resolve("a.txt"), "different\n");
+        TestSupport.write(dest.resolve("orphan.txt"), "only at destination\n");
+
+        FileSyncEngine.JobResult result = FileSyncEngine.runOnce(TestSupport.request(source, dest,
+                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("a.txt"), TestSupport.none(),
+                ScanOptions.DEFAULTS, true, true), rec);
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(1, result.filesMismatched(), result.message());
+        assertEquals(1, result.filesExtra(), result.message());
+        assertFalse(Files.exists(dest.resolve("a.txt.bak")), "nothing may be written by a dry run");
+    }
+
+    // ---------------------------------------------------------------- interrupted transfers (5.1, 5.2)
+
+    @Test
+    void aCutShortCopyReportsTransfersRsyncFinishedNotOnesItAnnounced() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        TestSupport.write(source.resolve("b.bin"), "b\n");
+        TestSupport.write(source.resolve("c.bin"), "c\n");
+
+        // Scripted rsync: announces three files, reports one completed transfer, creates the hidden
+        // partial file a killed transfer leaves, then hangs until the deadline cuts it off.
+        Path fake = TestSupport.hangingFakeRsync(tools, String.join("\n",
+                ">f+++++++++ a.txt",
+                "          2   33%    1.00kB/s    0:00:01 (xfr#1, to-chk=2/3)",
+                ">f+++++++++ b.bin",
+                ">f+++++++++ c.bin"), ".b.bin.ABCDEF");
+
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.setJobTimeoutMillis(1_500L);
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("a.txt", "b.bin", "c.bin"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
+            // Three announced, but rsync only ever reported one completed transfer - so the reported
+            // count is 1, not 3.
+            assertTrue(result.message().contains("announced 3"), result.message());
+            assertTrue(result.message().contains("at most 1"), result.message());
+            assertEquals(1, result.filesCopied(), result.message());
+
+            String leftover = result.warnings().stream()
+                    .filter(w -> w.contains("partial rsync file")).findFirst().orElse("");
+            assertTrue(leftover.contains(".b.bin.ABCDEF"), String.valueOf(result.warnings()));
+            assertTrue(leftover.contains("for b.bin"), leftover);
+            assertTrue(leftover.contains("delete them or re-run"), leftover);
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    @Test
+    void aCutShortCopyThatCleanedUpAfterItselfSaysSoInsteadOfWarning() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        Path fake = TestSupport.hangingFakeRsync(tools,
+                ">f+++++++++ a.txt\n          2   50%    1.00kB/s    0:00:01 (xfr#1, to-chk=0/1)", null);
+
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.setJobTimeoutMillis(1_500L);
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("a.txt"),
+                    TestSupport.none()), new TestSupport.Recorder());
+
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("No partial rsync file")),
+                    String.valueOf(result.warnings()));
+            assertEquals(1, result.filesCopied(), result.message());
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    @Test
+    void leftoverDetectionNamesRealLeftoversAndIgnoresEverythingElse() throws Exception {
+        TestSupport.write(dest.resolve("b.bin"), "a complete file\n");
+        TestSupport.write(dest.resolve(".b.bin.ABCDEF"), "partial");
+        TestSupport.write(dest.resolve(".b.bin.SHORT77"), "7-character suffix: not an rsync temp name");
+        TestSupport.write(dest.resolve(".someone.elses.XYZ123"), "a dotfile the user made");
+        TestSupport.write(dest.resolve("sub/.c.txt.A1B2C3"), "nested partial");
+        TestSupport.write(dest.resolve("sub/notes.md"), "# notes");
+
+        List<String> found = FileSyncEngine.interruptedTempFiles(
+                List.of(dest.resolve("b.bin"), dest.resolve("sub/c.txt")));
+
+        assertEquals(2, found.size(), found.toString());
+        assertTrue(found.stream().anyMatch(name -> name.contains(".b.bin.ABCDEF") && name.contains("for b.bin")),
+                found.toString());
+        assertTrue(found.stream().anyMatch(name -> name.contains(".c.txt.A1B2C3")), found.toString());
+    }
+
+    @Test
+    void byteSizesAreReportedInUnitsAUserCanRead() {
+        assertEquals("0 B", FileSyncEngine.humanBytes(0));
+        assertEquals("512 B", FileSyncEngine.humanBytes(512));
+        assertEquals("1.0 KB", FileSyncEngine.humanBytes(1024));
+        assertEquals("1.5 MB", FileSyncEngine.humanBytes(1_572_864));
+        assertEquals("2.0 GB", FileSyncEngine.humanBytes(2_147_483_648L));
+    }
+
     // ---------------------------------------------------------------- misc
 
     @Test
