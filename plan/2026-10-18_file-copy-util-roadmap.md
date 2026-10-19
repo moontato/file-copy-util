@@ -325,7 +325,7 @@ Owner constraint for this phase: **limit large and frequent writes** (the work r
 | Item | Status | Note |
 |---|---|---|
 | 5.4 measure 100k-file scale | open | Scan + Verify Only timing and memory with ~100k files, GUI included. `MAX_OUTCOMES` and the coalesced progress are unproven at that size |
-| 5.5 rsync version matrix | open | Itemize parsing and `xfr#` verified only against 3.2.7. Needs a container matrix (3.1.x, 3.3.x) before claiming portability |
+| 5.5 rsync version matrix | done | Verified against 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0 built from source; `RsyncVersionMatrixTest` + CI gate. It found and fixed a real overstatement in interrupted-job copy counts |
 | 5.6 per-side selection mode in the GUI | done | Rule in one place, stated on screen as a work-set line plus per-list selection counts, `--exclude-dest` on the CLI; GUI cost measured at 100k and 300k rows |
 | 5.7 polish | partially done | `--bwlimit` shipped; static analysis (error-prone/SpotBugs) and a longer `--help` with examples still open |
 
@@ -457,3 +457,47 @@ Shipped:
     be declared `public`, or javac rejects it as "attempting to assign stronger access privileges".
 
 **Open after Group B:** 5.5 (rsync version matrix), streaming export, a GUI knob for the results bound.
+
+### Group C: 5.5 rsync version matrix (2026-10-19)
+
+Container images were the obvious route and the wrong one: apt offers only 3.2.7, and pulling four distro
+images to get four rsyncs costs more time and more disk than it buys. The cheapest honest matrix was source:
+`download.samba.org/pub/rsync/src` tarballs, built with `--disable-openssl --disable-xxhash --disable-zstd
+--disable-lz4` (configure otherwise aborts on missing optional headers). **3.1.3, 3.2.7, 3.3.0 and 3.4.0**
+then run side by side, selected per job with the existing rsync-binary override. Fixture writes stayed tiny:
+one 4 MB file and a handful of text files, throttled with `--bwlimit`.
+
+`RsyncVersionMatrixTest` asserts, per binary: the same tree and selection give the **same counters**; a dry
+run writes nothing; progress reaches 100 and stays coalesced; an interrupted job claims only transfers that
+finished. Binaries come from `FCU_RSYNC_BINARIES`, and a binary that cannot run is skipped rather than
+failing the build, so the same class runs on CI's single distro rsync and on a local four-way matrix. CI now
+builds 3.1.3, 3.3.0 and 3.4.0 and runs the class, making portability a gate.
+
+34. **The matrix immediately found an overstatement.** Phase 5 assumed "no `xfr#` seen → no information →
+    keep the announcement count". Measured on all four versions, `xfr#N` appears **only in the progress
+    fragment printed when a transfer finishes**; the fragments of a transfer still in flight carry no `xfr#`
+    at all. So progress-without-`xfr#` is evidence of *nothing completed*, not of silence: a throttled 4 MB
+    copy cut off at 1.5 s was reporting **1 file copied while the destination held 0 complete files**, on
+    every version. Fixed: three distinct cases now, each worded to name its evidence - "announced 3 and
+    completed 1 of them", "announced 1 and completed none of them", "reported no progress, so how many
+    finished is unknown". The old phrase "at most N finished" was dropped because when rsync had reported a
+    count, it was a count and not a bound.
+35. **Dry runs have to be exempt from the cap.** A `--dry-run` transfers nothing, so its `xfr#` is 0 by
+    construction; capping it would have reported "0 file(s) copied" for the one job where the number is
+    pure intent. It now reports "N file(s) would have been copied".
+36. **`--info=progress2` is carriage-return output.** rsync rewrites one status line, so its "lines" are
+    separated by `\\r`. Line-by-line parsing works only because the reader treats CR as a line end; had the
+    output been read as newline-delimited text, real transfers would have produced one giant line and no
+    percentages at all. Recorded in DESIGN.md because it is the kind of fact a rewrite forgets.
+37. **`--files-from` sorts its list.** With `a1.txt … zbig.bin` requested in that order, the 4 MB file went
+    first. No counter changes, but it explains why a throttled job appears to ignore the small files it was
+    asked for first - worth knowing before debugging a "missing" file that was merely queued last. The first
+    version of the matrix test also tripped over its own fixture (reusing one temp directory across four
+    runs), which is what caught it.
+38. **Counting what rsync counts.** `keep.txt`, already identical at the destination, is selected, scanned,
+    verified - and never appears in the itemize output, so it is not "copied". The matrix's first assertion
+    expected 5 copies for 5 selected files and was wrong; 4 is right, and that is the whole distinction
+    between selection, work set and transfers in one number.
+
+**Open after Group C:** streaming export, a GUI knob for the results bound, and anything the owner wants
+from the backlog. Release prep (push `main` + `v1.1.0`) is still waiting on credentials.

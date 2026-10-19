@@ -263,8 +263,11 @@ class FileSyncEngineLifecycleTest {
             assertTrue(result.filesCopied() < 3,
                     "cancellation must stop the job, not let it finish: " + result.filesCopied());
             // rsync announces before it moves data, so a cut-short job reports completed transfers -
-            // capped by rsync's own count when it reported one.
-            assertTrue(result.message().contains("announced") && result.message().contains("at most"),
+            // capped by rsync's own count when it reported one, and admitting uncertainty when it had not
+            // reported a percentage yet at all.
+            assertTrue(result.message().contains("announced")
+                            && (result.message().contains("completed")
+                                || result.message().contains("no progress")),
                     result.message());
             assertEquals(0, result.filesChecked(), "verification must not run after cancellation");
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial rsync file")),

@@ -153,8 +153,12 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-115 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the CLI front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
-bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. `mvn verify` also runs the static-analysis gates: `javac -Xlint:all -Werror` and SpotBugs at Medium
+122 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the CLI front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
+bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
+checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
+`FCU_RSYNC_BINARIES=path,path` at other binaries to extend the matrix.
+
+`mvn verify` also runs the static-analysis gates: `javac -Xlint:all -Werror` and SpotBugs at Medium
 severity. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged
 jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the jar to a GitHub Release.
 

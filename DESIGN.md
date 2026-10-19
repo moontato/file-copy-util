@@ -83,10 +83,24 @@ rsync -a --checksum --itemize-changes --info=progress2 [--dry-run] [--bwlimit=N]
   the job with rsync's own error lines attached.
 - **Announcements are not transfers.** rsync prints the itemize line for a file before its data has
   moved. `--info=progress2` carries rsync's own counter of transfers it has *finished* — the `xfr#N`
-  field — so a job that is cut short reports `min(announced, rsync's completed count)` and says so,
-  while a completed job reports the itemize count (which includes locally created links and devices,
-  something `xfr#` never counts). Progress follows the percentage, never the announcements; a
-  `--dry-run` announces a meaningless 100% instantly, so its percentage is ignored.
+  field — so a job that is cut short reports what rsync proved had finished, while a completed job
+  reports the itemize count (which includes locally created links and devices, something `xfr#` never
+  counts). Progress follows the percentage, never the announcements; a `--dry-run` announces a
+  meaningless 100% instantly, so its percentage is ignored, and a dry run's count is exempt from the
+  cap because it is intent rather than completed transfers.
+- **What absence of `xfr#` means** was measured on rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0 rather than
+  assumed: the `xfr#N` field appears only in the progress fragment printed when a transfer finishes, and
+  the fragments of a transfer still in flight carry none. So progress fragments with no `xfr#` mean
+  nothing had finished yet — not that rsync stayed quiet. Three cases are reported differently: a count
+  rsync reported ("announced 3 and completed 1 of them"), progress but no completed transfer ("announced 1
+  and completed none of them"), and no progress at all ("how many finished is unknown", with the
+  announcement count kept because nothing rules it out).
+- **Progress fragments are separated by carriage returns, not newlines**, because rsync rewrites one
+  status line. Reading rsync's output line-by-line works only because the reader treats `\r` as a line
+  end; a byte-stream reader would see one enormous line and no percentages.
+- **The `--files-from` list is sorted, not preserved**: a 4 MB `zbig.bin` is transferred before `a1.txt`
+  if the file name says so. It changes no counter, but it is why a throttled job can appear to have
+  ignored the small files listed first.
 
 ## 5. Two lists, one rule, and the line that explains them
 
@@ -223,6 +237,9 @@ filtered view for the filter boxes.
   3 ms, filter 26 ms - but it is not a low-memory design.
 - The fast work-set preview is proportional to how many destination rows are unticked. If half of a
   300000 row destination is unticked, the preview costs a few hundred milliseconds per click.
-- Older rsync 3.1.x renders itemize paths differently; behaviour here is verified against 3.2.7.
+- rsync output is verified against 3.1.3, 3.2.7, 3.3.0 and 3.4.0 (`RsyncVersionMatrixTest`: identical
+  counters for the same tree, dry runs that write nothing, interrupted jobs that claim only finished
+  transfers). A version outside that range is unverified; the matrix takes extra binaries through
+  `FCU_RSYNC_BINARIES`, so a new release can be added without touching the tests.
 - The per-side selection rule is modelled (`Selection.selected`/`known`) but the GUI has no separate
   per-side selection mode yet.

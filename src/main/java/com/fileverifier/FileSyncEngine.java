@@ -608,11 +608,11 @@ public class FileSyncEngine implements AutoCloseable {
                 markActivity("rsync exit " + rsyncExitCode);
 
                 if (timeoutWasTriggered()) {
-                    return timeoutResult(progress, outcomes, errors, warnings, destinationTargets);
+                    return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
                 }
                 if (cancelRequested.get()) {
                     return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
-                            destinationTargets);
+                            destinationTargets, dryRun);
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
@@ -638,7 +638,7 @@ public class FileSyncEngine implements AutoCloseable {
         verifyEntries(workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
                 warnings, verifyOnly);
         if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets);
+            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
         }
         if (cancelRequested.get()) {
             return cancelledDuringVerify(progress, outcomes, errors, warnings);
@@ -650,7 +650,7 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets);
+            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
         }
         if (cancelRequested.get()) {
             return cancelledDuringVerify(progress, outcomes, errors, warnings);
@@ -689,14 +689,13 @@ public class FileSyncEngine implements AutoCloseable {
 
     private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
                                           int exitCode, List<String> errors, List<String> warnings,
-                                          List<Path> destinationTargets) {
+                                          List<Path> destinationTargets, boolean dryRun) {
         int announced = progress.copied();
-        int completed = completedTransfers(progress, announced);
-        String message = "Job cancelled by the user: rsync announced " + announced + " file(s) for copy, "
-                + "of which at most " + completed + " finished, and " + progress.processed()
-                + " file(s) were verified (matched: " + progress.matched() + ", mismatched: "
-                + progress.mismatched() + ", missing: " + progress.missing() + "). rsync exit code: "
-                + exitCode + ".";
+        int completed = completedTransfers(progress, announced, dryRun);
+        String message = "Job cancelled by the user: " + transfersPhrase(progress, announced, completed, dryRun)
+                + ", and " + progress.processed() + " file(s) were verified (matched: "
+                + progress.matched() + ", mismatched: " + progress.mismatched() + ", missing: "
+                + progress.missing() + "). rsync exit code: " + exitCode + ".";
         List<String> leftovers = interruptedTempFiles(destinationTargets);
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(leftovers));
@@ -706,14 +705,38 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /**
-     * rsync announces a file before its data has moved, so on a job that was cut short the announcement
-     * count is an upper bound. When rsync reported its own completed-transfer count (the {@code xfr#}
-     * field of {@code --info=progress2}), the reported number is capped by it; when it never reported
-     * one, the announcement count is kept and the wording says "announced".
+     * How many copies a job that was cut short may claim. Measured against rsync 3.1.3, 3.2.7, 3.3.0 and
+     * 3.4.0: {@code --info=progress2} prints a progress fragment each time a transfer finishes, carrying
+     * {@code (xfr#N, ...)}, and prints fragments carrying no xfr# while a transfer is still in flight.
+     * So progress fragments without an xfr# mean nothing had finished yet, not that rsync stayed silent.
+     * A dry run is exempt: nothing was written, so its count is intent rather than completed transfers.
      */
-    private static int completedTransfers(ProgressReporter progress, int announced) {
+    private static int completedTransfers(ProgressReporter progress, int announced, boolean dryRun) {
+        if (dryRun) {
+            return announced;
+        }
         int reported = progress.rsyncTransfers();
-        return reported >= 0 ? Math.min(announced, reported) : announced;
+        if (reported >= 0) {
+            return Math.min(announced, reported);
+        }
+        return progress.transferProgressSeen() ? 0 : announced;
+    }
+
+    /** The same distinction, in words a user can act on. */
+    private static String transfersPhrase(ProgressReporter progress, int announced, int completed,
+                                          boolean dryRun) {
+        if (dryRun) {
+            return announced + " file(s) would have been copied";
+        }
+        if (progress.rsyncTransfers() >= 0) {
+            return "rsync announced " + announced + " file(s) for copy and completed " + completed
+                    + " of them";
+        }
+        if (progress.transferProgressSeen()) {
+            return "rsync announced " + announced + " file(s) for copy and completed none of them";
+        }
+        return "rsync announced " + announced
+                + " file(s) for copy; it reported no progress, so how many finished is unknown";
     }
 
     private JobResult cancelledDuringVerify(ProgressReporter progress, List<FileOutcome> outcomes,
@@ -726,11 +749,12 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     private JobResult timeoutResult(ProgressReporter progress, List<FileOutcome> outcomes,
-                                    List<String> errors, List<String> warnings, List<Path> destinationTargets) {
+                                    List<String> errors, List<String> warnings, List<Path> destinationTargets,
+                                    boolean dryRun) {
         int announced = progress.copied();
-        int completed = completedTransfers(progress, announced);
-        String message = "Job aborted: it exceeded the " + jobTimeoutMillis + " ms timeout. rsync announced "
-                + announced + " file(s) for copy, of which at most " + completed + " finished, and "
+        int completed = completedTransfers(progress, announced, dryRun);
+        String message = "Job aborted: it exceeded the " + jobTimeoutMillis + " ms timeout. "
+                + transfersPhrase(progress, announced, completed, dryRun) + ", and "
                 + progress.processed() + " file(s) were verified.";
         List<String> extended = new ArrayList<>(warnings);
         extended.add("Increase or clear the job timeout if this job is expected to take longer.");
@@ -1508,6 +1532,11 @@ public class FileSyncEngine implements AutoCloseable {
 
         int copied() {
             return copied;
+        }
+
+        /** True once rsync had shown a transfer percentage, which is when its xfr# count is meaningful. */
+        boolean transferProgressSeen() {
+            return rsyncPercent >= 0;
         }
 
         int rsyncTransfers() {

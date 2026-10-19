@@ -31,6 +31,27 @@ jobs:
       - name: Build and run tests
         run: mvn -B -ntp verify
 
+      # 5.5: the engine reads rsync's itemize lines, its --info=progress2 percentage and its xfr#
+      # completed-transfer count. Those are output formats, so the behaviour is checked against several
+      # rsync releases built here, not only against the one this runner's package manager provides.
+      - name: rsync version matrix
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y build-essential
+          work="$RUNNER_TEMP/rsync-matrix"
+          mkdir -p "$work"
+          for version in 3.1.3 3.3.0 3.4.0; do
+            curl -fsSLo "$work/rsync-$version.tar.gz" \
+              "https://download.samba.org/pub/rsync/src/rsync-$version.tar.gz"
+            tar xzf "$work/rsync-$version.tar.gz" -C "$work"
+            (cd "$work/rsync-$version"
+              ./configure --disable-openssl --disable-xxhash --disable-zstd --disable-lz4 > /dev/null
+              make -j"$(nproc)" > /dev/null)
+            "$work/rsync-$version/rsync" --version | head -1
+          done
+          binaries=$(ls "$work"/rsync-*/rsync | paste -sd,)
+          FCU_RSYNC_BINARIES="$binaries" mvn -B -ntp test -Dtest=RsyncVersionMatrixTest
+
       # The tests are headless; this proves the packaged jar itself starts and can copy/verify.
       - name: CLI smoke test against the packaged jar
         run: |

@@ -63,6 +63,27 @@ there is now a test suite that says what it is supposed to do.
   `--dry-run` and still compares hashes, so you see what the job would copy and what already mismatches
   without writing anything. Its count means "would be copied" and its message says nothing was written.
 - **`--bwlimit KB/s`** caps the transfer rate.
+### rsync version matrix (Phase 5, Group C)
+
+- **Behaviour is now verified against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0**, not only against the one
+  version this machine ships. `RsyncVersionMatrixTest` builds the same tree on each binary and requires
+  the same counters, dry runs that write nothing, progress that reaches its end, and interrupted jobs that
+  claim only the transfers rsync finished. Extra binaries are supplied with `FCU_RSYNC_BINARIES=path,...`;
+  CI builds 3.1.3, 3.3.0 and 3.4.0 from source and runs the matrix, so portability is a gate rather than a
+  hope.
+- **Fixed: an interrupted copy claimed a transfer that never finished.** The engine treated "rsync never
+  reported an `xfr#`" as "no information, keep the announcement count". Measured on all four versions, a
+  transfer still in flight prints progress fragments that carry no `xfr#` at all, so progress without
+  `xfr#` means *nothing completed*: a throttled 4 MB copy cut at 1.5 s reported 1 file copied while the
+  destination held 0 complete files. It now reports 0.
+- **Interrupted jobs say which evidence existed**: "announced 3 file(s) for copy and completed 1 of them",
+  "announced 1 file(s) for copy and completed none of them", or "it reported no progress, so how many
+  finished is unknown". "at most N finished" was dropped: when rsync reported a count it was a count, not a
+  bound.
+- **A dry run cut short is exempt from the cap** and reports "N file(s) would have been copied"; capping a
+  run that was never meant to write anything would have reported 0.
+- 122 tests.
+
 ### Per-side selection made visible (Phase 5, Group B)
 
 - **The window states what its two checkbox lists mean.** Each list now reads `100000 files, 100000

@@ -989,7 +989,7 @@ class FileSyncEngineTest {
             // Three announced, but rsync only ever reported one completed transfer - so the reported
             // count is 1, not 3.
             assertTrue(result.message().contains("announced 3"), result.message());
-            assertTrue(result.message().contains("at most 1"), result.message());
+            assertTrue(result.message().contains("completed 1 of them"), result.message());
             assertEquals(1, result.filesCopied(), result.message());
 
             String leftover = result.warnings().stream()
@@ -997,6 +997,60 @@ class FileSyncEngineTest {
             assertTrue(leftover.contains(".b.bin.ABCDEF"), String.valueOf(result.warnings()));
             assertTrue(leftover.contains("for b.bin"), leftover);
             assertTrue(leftover.contains("delete them or re-run"), leftover);
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    @Test
+    void progressWithNoCompletedTransferMeansNothingWasCopied() throws Exception {
+        TestSupport.write(source.resolve("big.bin"), "payload\n");
+
+        // Measured against real rsync 3.1.3 through 3.4.0: while a transfer is in flight, its progress
+        // fragments carry no xfr# field at all. A job killed there has announced a copy and finished
+        // none of it, which is different from rsync saying nothing at all.
+        Path fake = TestSupport.hangingFakeRsync(tools, String.join("\n",
+                ">f+++++++++ big.bin",
+                "  1,000,000  25%  300.00kB/s    0:00:09",
+                "  2,000,000  50%  300.00kB/s    0:00:06"), ".big.bin.ABCDEF");
+
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.setJobTimeoutMillis(1_500L);
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("big.bin"), TestSupport.none()), new TestSupport.Recorder());
+
+            assertEquals(0, result.filesCopied(), result.message());
+            assertTrue(result.message().contains("completed none of them"), result.message());
+            assertFalse(Files.exists(dest.resolve("big.bin")), "the hidden partial file is not the finished one");
+        } finally {
+            FileSyncEngine.setRsyncBinary("rsync");
+        }
+    }
+
+    @Test
+    void aDryRunCutShortStillReportsWhatItWouldHaveCopied() throws Exception {
+        TestSupport.write(source.resolve("a.bin"), "a\n");
+        TestSupport.write(source.resolve("b.bin"), "b\n");
+
+        // A dry run's count is intent, not completed transfers: capping it by xfr# would report 0 files
+        // "copied" for a run that was never meant to copy anything.
+        Path fake = TestSupport.hangingFakeRsync(tools, String.join("\n",
+                ">f+++++++++ a.bin",
+                "     100%    0.00kB/s    0:00:00 (xfr#0, to-chk=0/2)",
+                ">f+++++++++ b.bin"), null);
+
+        FileSyncEngine.setRsyncBinary(fake.toString());
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.setJobTimeoutMillis(1_500L);
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("a.bin", "b.bin"), TestSupport.none(),
+                    ScanOptions.DEFAULTS, false, true), new TestSupport.Recorder());
+
+            assertEquals(2, result.filesCopied(), result.message());
+            assertTrue(result.message().contains("would have been copied"), result.message());
         } finally {
             FileSyncEngine.setRsyncBinary("rsync");
         }
