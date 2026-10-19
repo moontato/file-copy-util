@@ -7,6 +7,16 @@ on:
   push:
     tags:
       - "v*"
+  # A manual run for any existing tag. It exists because a tag push can fail to trigger this file
+  # (a tag trigger loads workflows from the default branch, and a tag created before this file landed
+  # on that branch has nothing to run), and because it is the only way to see the failure log of a
+  # release that never happened. It also lets a release be (re)created without re-tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v1.1.0"
+        required: true
+        default: "v1.1.0"
 
 permissions:
   contents: write
@@ -15,7 +25,25 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # The ref of a manual run is the branch it was dispatched from, not the tag being released, so
+      # the tag has to be resolved once and used for checkout, the version check and the release.
+      - name: Resolve the tag this run releases
+        id: tag
+        env:
+          DISPATCHED_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag="${DISPATCHED_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "not a version tag: $tag" >&2; exit 1 ;;
+          esac
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag"
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
 
       - uses: actions/setup-java@v4
         with:
@@ -30,9 +58,11 @@ jobs:
         run: mvn -B -ntp verify
 
       - name: Check the jar matches the tag and runs headless
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
         run: |
           set -eu
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           expected="${tag#v}"
 
           jar=$(ls target/file-copy-util-*.jar | head -1)
@@ -61,6 +91,7 @@ jobs:
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.name }}
           files: target/file-copy-util-*.jar
           fail_on_unmatched_files: true
           generate_release_notes: true
