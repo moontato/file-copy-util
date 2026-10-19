@@ -319,3 +319,12 @@ Owner constraint for this phase: **limit large and frequent writes** (the work r
 - CI smoke sequence run locally end to end, including "dry run exits non-zero and leaves the destination empty".
 
 25. **A latent lifecycle bug surfaced while building 5.1-5.3: a job could run past its deadline and be reported `COMPLETED`.** The deadline was enforced only by the watchdog (250 ms period), while the work loops merely *stopped* on `deadlineExceeded()`. So a phase that finished between two ticks fell through to the success path - and a verification whose hashing had been cut short reported the unhashed files as `missing`, i.e. a job that never happened reported as one that found problems. Fixed by making the check itself authoritative: `deadlineExceeded()` records the timeout the moment it sees the deadline passed, `abortRequested()` (used by every loop, on every thread) also kills a live `rsync`, and the watchdog is reduced to what only it can do - a blocked `process.waitFor()` or one huge file being hashed. Found because a test that looked flaky was rewritten to be deterministic: making it deterministic made the bug visible.
+
+### Phase 5 remaining (not yet done)
+
+| Item | Status | Note |
+|---|---|---|
+| 5.4 measure 100k-file scale | open | Scan + Verify Only timing and memory with ~100k files, GUI included. `MAX_OUTCOMES` and the coalesced progress are unproven at that size |
+| 5.5 rsync version matrix | open | Itemize parsing and `xfr#` verified only against 3.2.7. Needs a container matrix (3.1.x, 3.3.x) before claiming portability |
+| 5.6 per-side selection mode in the GUI | open | `Selection.selected`/`known` already model it; the GUI has one shared selection. Decide the UI before writing code |
+| 5.7 polish | partially done | `--bwlimit` shipped; static analysis (error-prone/SpotBugs) and a longer `--help` with examples still open |
