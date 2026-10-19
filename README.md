@@ -128,9 +128,10 @@ mvn test
 .
 ├── pom.xml
 ├── README.md
-├── DESIGN.md                          # the rules the engine guarantees
-├── CHANGELOG.md
-├── .github/workflows/ci.yml          # build + tests + packaged-jar CLI smoke test
+├── LICENSE                              # MIT (see the License section)
+├── DESIGN.md                            # the rules the engine guarantees
+├── CHANGELOG.md                         # what changed, behaviour first
+├── .github/workflows/ci.yml               # build + tests + packaged-jar CLI smoke test
 ├── plan/                             # roadmap / phase notes
 └── src/main/java/com/fileverifier/
     ├── FileVerifierApp.java          # Entry point: GUI, or --cli headless; Wayland/headless handling
@@ -175,5 +176,8 @@ sudo apt install openjdk-21-jre
 
 ## License
 
-Not specified yet. Choosing one is the owner's call (roadmap item 4.4); until a `LICENSE` file exists,
-all rights are reserved by the author.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 moontato.
+
+MIT was chosen because it keeps every later option open: this code can be re-released under a stricter
+license at any future version, while copies already distributed stay MIT. The choice itself is recorded
+in the roadmap (item 4.4).

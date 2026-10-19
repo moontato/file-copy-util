@@ -14,6 +14,16 @@
     <name>File Verifier &amp; Copier</name>
     <description>Copy and verify files between directories using rsync and SHA-256 hashes</description>
 
+    <!-- MIT: permissive, and it keeps every future option open (MIT code can be re-released under
+         GPL later; the reverse needs every contributor's consent). Text in LICENSE. -->
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/license/mit/</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
