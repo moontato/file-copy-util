@@ -56,7 +56,7 @@ there is now a test suite that says what it is supposed to do.
   timeout, job mode, extra-file detection).
 - Directory chooser picks the directory you actually selected (`getSelectedFile()`), starting in the
   directory already in that field.
-- **Headless CLI**: `java -jar file-verifier.jar --cli --source DIR --dest DIR --all` (or `--files`)
+- **Headless CLI**: `java -jar file-copy-util.jar --cli --source DIR --dest DIR --all` (or `--files`)
   with the same engine and semantics, plus CSV/JSON export and exit codes
   (0 nothing to report, 1 job failed, 2 bad command line, 3 files mismatched or missing).
 - **Dry run** (`--dry-run` in the CLI, *Dry run (write nothing)* in the GUI): runs rsync with
@@ -78,8 +78,10 @@ there is now a test suite that says what it is supposed to do.
 
 ### Packaging
 
-- Coordinates renamed to match the code and the window title: `com.fileverifier:file-verifier`
-  (was `com.filecopyutil:file-copy-util`), jar `target/file-verifier-1.1.0.jar`.
+- Coordinates: `com.fileverifier:file-copy-util` (was `com.filecopyutil:file-copy-util`), jar
+  `target/file-copy-util-1.1.0.jar`, matching the repository name. Package and groupId follow the code
+  (`com.fileverifier`); the GUI window carries the longer product title *File Verifier & Copier*, which is
+  a title rather than a coordinate.
 - `maven-shade-plugin` removed (the project has no runtime dependency), so there is one jar and no
   `original-*.jar`.
 - `maven-compiler-plugin` pinned with `<release>17</release>`, surefire pinned to 3.2.5 (Maven 3.8.x

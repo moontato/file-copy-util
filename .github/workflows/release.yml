@@ -1,0 +1,76 @@
+name: release
+
+# Triggered by a version tag (v1.1.0, v1.2.0, ...). Builds the jar, runs the test suite, and attaches
+# the runnable jar to a GitHub Release for that tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rsync
+
+      - name: Build, test and package
+        run: mvn -B -ntp verify
+
+      - name: Check the jar matches the tag and runs headless
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          expected="${tag#v}"
+
+          jar=$(ls target/file-copy-util-*.jar | head -1)
+          if [ -z "$jar" ]; then
+            echo "no jar produced by the build" >&2
+            exit 1
+          fi
+          found=$(basename "$jar" .jar)
+          found=${found#file-copy-util-}
+          echo "tag=$tag  jar=$jar  jar version=$found"
+
+          # The thing being published must be the version the tag claims - not the pom, the actual artifact.
+          if [ "$found" != "$expected" ]; then
+            echo "jar version ($found) does not match tag ($tag)" >&2
+            exit 1
+          fi
+
+          java -jar "$jar" --cli --help > /dev/null
+          mkdir -p /tmp/rel/src/sub /tmp/rel/dst
+          echo alpha > /tmp/rel/src/a.txt
+          echo beta > /tmp/rel/src/sub/b.txt
+          java -jar "$jar" --cli --quiet --source /tmp/rel/src --dest /tmp/rel/dst --all
+          test -f /tmp/rel/dst/sub/b.txt
+          java -jar "$jar" --cli --quiet --source /tmp/rel/src --dest /tmp/rel/dst --all --verify-only
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/file-copy-util-*.jar
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            A runnable jar for Java 17. `rsync` must be on PATH for copy jobs; Verify Only needs no rsync.
+
+            ```
+            java -jar file-copy-util-VERSION.jar                                  # GUI
+            java -jar file-copy-util-VERSION.jar --cli --source DIR --dest DIR --all   # headless
+            ```
+
+            Exit codes: 0 nothing to report, 1 job failed, 2 bad command line, 3 files mismatched or missing.
+            See CHANGELOG.md for what changed in this version and DESIGN.md for the guarantees.

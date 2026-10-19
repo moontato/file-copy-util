@@ -16,7 +16,7 @@ public class FileVerifierApp {
         }
         if (GraphicsEnvironment.isHeadless()) {
             System.err.println("Error: No display available. Ensure X11 is running and DISPLAY is set,");
-            System.err.println("or run without a display: java -jar file-verifier.jar --cli --source DIR --dest DIR --all");
+            System.err.println("or run without a display: java -jar file-copy-util.jar --cli --source DIR --dest DIR --all");
             System.exit(1);
         }
         try {

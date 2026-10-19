@@ -1,7 +1,10 @@
-# File Verifier & Copier
+# File Copy Util
 
-A Java tool for copying and verifying files between two directories using `rsync` and SHA-256 hashing.
-It has a Swing GUI and a headless CLI that share one engine.
+[![build](https://github.com/moontato/file-copy-util/actions/workflows/ci.yml/badge.svg)](https://github.com/moontato/file-copy-util/actions/workflows/ci.yml)
+
+Copy and verify files between two directories with `rsync` and SHA-256. One engine, two front ends: a
+Swing GUI and a headless CLI. The repository, the artifact and the CLI all use the short name
+`file-copy-util`; the GUI window carries the longer product title *File Verifier & Copier*.
 
 See [DESIGN.md](DESIGN.md) for the rules the program guarantees (path model, selection semantics,
 counters) and [CHANGELOG.md](CHANGELOG.md) for what changed in 1.1.0.
@@ -49,20 +52,20 @@ sudo apt install openjdk-21-jre rsync
 mvn clean package
 ```
 
-Output: `target/file-verifier-1.1.0.jar` (one jar - the project has no runtime dependencies).
+Output: `target/file-copy-util-1.1.0.jar` (one jar - the project has no runtime dependencies).
 
 ## Usage
 
 ```bash
 # GUI
-java -jar target/file-verifier-1.1.0.jar
+java -jar target/file-copy-util-1.1.0.jar
 
 # Headless
-java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
-java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
-java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
-java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
-java -jar target/file-verifier-1.1.0.jar --cli --help
+java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
+java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
+java -jar target/file-copy-util-1.1.0.jar --cli --help
 ```
 
 The CLI runs the same engine with the same selection rules: either `--files` or `--all` is required, and
@@ -168,7 +171,7 @@ mvn test
 Only the GUI needs a display. On a machine without one, use `--cli`:
 
 ```bash
-java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
 ```
 
 On Wayland sessions, the app automatically falls back to X11. If you still see this error, ensure:

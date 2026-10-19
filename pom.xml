@@ -4,15 +4,23 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <!-- One name everywhere: package com.fileverifier, groupId com.fileverifier, product
-         "File Verifier & Copier" (the window title), artifact file-verifier. -->
+    <!-- Naming, deliberately two-tier: the repository, artifact and CLI name are the short
+         file-copy-util; the GUI window shows the longer product title "File Verifier & Copier"
+         (see FileVerifierFrame.setTitle). Package and groupId stay com.fileverifier to match the code. -->
     <groupId>com.fileverifier</groupId>
-    <artifactId>file-verifier</artifactId>
+    <artifactId>file-copy-util</artifactId>
     <version>1.1.0</version>
     <packaging>jar</packaging>
 
-    <name>File Verifier &amp; Copier</name>
+    <name>File Copy Util</name>
     <description>Copy and verify files between directories using rsync and SHA-256 hashes</description>
+    <url>https://github.com/moontato/file-copy-util</url>
+
+    <scm>
+        <url>https://github.com/moontato/file-copy-util</url>
+        <connection>scm:git:https://github.com/moontato/file-copy-util.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/moontato/file-copy-util.git</developerConnection>
+    </scm>
 
     <!-- MIT: permissive, and it keeps every future option open (MIT code can be re-released under
          GPL later; the reverse needs every contributor's consent). Text in LICENSE. -->

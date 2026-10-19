@@ -32,10 +32,10 @@ public final class Cli {
     public static final int EXIT_VERIFICATION_PROBLEMS = 3;
 
     private static final String USAGE = """
-        File Verifier & Copier
+        File Copy Util - copy and verify files between directories (window title: File Verifier & Copier)
 
-        GUI:      java -jar file-verifier.jar
-        Headless: java -jar file-verifier.jar --cli --source DIR --dest DIR [options]
+        GUI:      java -jar file-copy-util.jar
+        Headless: java -jar file-copy-util.jar --cli --source DIR --dest DIR [options]
 
           --cli                     run without a display instead of opening the GUI
           --source DIR              source directory (required)

@@ -328,3 +328,42 @@ Owner constraint for this phase: **limit large and frequent writes** (the work r
 | 5.5 rsync version matrix | open | Itemize parsing and `xfr#` verified only against 3.2.7. Needs a container matrix (3.1.x, 3.3.x) before claiming portability |
 | 5.6 per-side selection mode in the GUI | open | `Selection.selected`/`known` already model it; the GUI has one shared selection. Decide the UI before writing code |
 | 5.7 polish | partially done | `--bwlimit` shipped; static analysis (error-prone/SpotBugs) and a longer `--help` with examples still open |
+
+---
+
+## Naming revision and pre-release housekeeping (2026-10-19)
+
+**4.5 naming was revised by the owner.** The earlier decision ("one name everywhere") pushed the product
+name into the coordinates: `com.fileverifier:file-verifier`. The owner prefers the short name for the
+repository and artifact, and is happy for the long title to live only in the window. Naming is now
+deliberately two-tier:
+
+| Layer | Name |
+|---|---|
+| Repository, Maven artifact, jar, CLI usage | `file-copy-util` (`target/file-copy-util-1.1.0.jar`) |
+| GUI window title | *File Verifier & Copier* (`FileVerifierFrame.setTitle`) |
+| Package and groupId | `com.fileverifier`, matching the source tree |
+
+Recorded so nobody "fixes" the mismatch later: the mismatch is intentional, a title is not a coordinate.
+
+**Housekeeping done:**
+- `pom.xml`: `<artifactId>file-copy-util</artifactId>`, `<name>File Copy Util</name>`, plus `<url>` and
+  `<scm>` pointing at `github.com/moontato/file-copy-util`.
+- `README.md`: title back to `File Copy Util`, a note explaining the two-tier naming, CI status badge, all
+  jar paths updated.
+- `ci.yml`: tag pushes excluded (`tags-ignore: ["v*"]`) so a release does not build the same commit twice.
+- `release.yml` added: on any `v*` tag it installs rsync, runs `mvn verify`, checks the **jar name**
+  against the tag (the artifact being published, not the pom's claim), runs a headless copy+verify smoke
+  test, and attaches the jar to a GitHub Release.
+- Annotated tag `v1.1.0` created locally.
+
+**Commit identity: no change, and a correction to my own earlier plan.** `origin` is
+`github.com/moontato/file-copy-util` and its existing tip (`aeef29c`) is already public under
+`moontato <christianhk0701@gmail.com>`. Rewriting authorship would mean force-pushing over commits that
+are already public, breaking any other clone, for no benefit. The plan item "decide whether to rewrite the
+commit author identity before the first push" is closed: there is no first push, and the identity is
+consistent with where the repo lives. `LICENSE` holder stays `moontato` for the same reason.
+
+**Owner action, blocked here:** the container has no git credentials (`could not read Username for
+'https://github.com'`, no `gh`, no token in the environment), so the push must be run by the owner:
+`git push origin main --follow-tags`.
