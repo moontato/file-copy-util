@@ -245,3 +245,33 @@ Ignore globs honoured (`.git, node_modules, *.bin`) and reported; filter box nar
 - `MAX_OUTCOMES = 50_000` bounds memory; a job larger than that keeps its counters but truncates the reportable outcomes (logged as a warning).
 - GUI hangs on truly enormous lists are mitigated (view model, log cap) but not measured at 100k files here.
 - `serialVersionUID` still missing on `FileVerifierFrame` and its cell renderer (Phase 4 hygiene).
+
+---
+
+## Phase 4 completion record (2026-10-19)
+
+**Done except 4.4 (license - an owner decision, not an engineering one).** `mvn -B clean verify` is green: 94 tests, 0 failures, one jar (`target/file-verifier-1.1.0.jar`, no `original-*.jar`). The packaged jar was run for real: the GUI under Xvfb and `--cli` against a live tree (copy, verify, mismatch exit code).
+
+| Phase 4 item | Result |
+|---|---|
+| 4.1 compiler release | `maven-compiler-plugin` 3.13.0 with `<release>17</release>`; `maven.compiler.source/target` removed. `<release>` compiles against the JDK 17 API, which source/target alone does not |
+| 4.2 no shading | `maven-shade-plugin` deleted - the project has one test-scope dependency and no runtime dependency, so the shaded jar was a copy of the plain jar plus a second `mainClass` declaration. `maven-jar-plugin` alone now produces the runnable jar (verified: `java -jar` starts the GUI and runs `--cli`) |
+| 4.3 CI | `.github/workflows/ci.yml`: temurin JDK 17 + maven cache, installs `rsync` explicitly (without it the rsync-dependent tests would silently skip and the build would become a partial check), `mvn -B -ntp verify`, then a CLI smoke test against the packaged jar: `--help`, a real copy+verify, checks the files landed and the CSV is non-empty, a clean verify exits 0, and a deliberately corrupted copy exits non-zero |
+| 4.4 license | **not done on purpose.** A license is the author's decision; the roadmap suggested GPL-3.0-or-later, but nothing here links against GPL code (rsync runs as a separate process), so MIT/Apache/GPL are all defensible. README now states plainly that no license has been granted yet rather than leaving it ambiguous |
+| 4.5 naming | one name everywhere: groupId `com.fileverifier` (was `com.filecopyutil`), matching the package; product name "File Verifier & Copier" matching the window title; artifactId `file-verifier` (was `file-copy-util`); version 1.0.0 → 1.1.0 because 1.0.0's selection semantics were unsafe and changed |
+| 4.6 CLI | `Cli` front end: `--cli --source DIR --dest DIR` with `--files`/`--all`/`--exclude`/`--ignore`/`--no-default-ignore`/`--no-hidden`/`--symlinks`/`--no-report-extra`/`--timeout`/`--csv`/`--json`/`--quiet`/`--help`. No GUI flags → no GUI. Exit codes 0/1/2/3 (completed / job failed / bad command line / mismatched-or-missing). 16 tests |
+| 4.7 docs + hygiene | `DESIGN.md` (path identity, selection and work-set rules, hashing, the rsync command and itemize grammar, counters and progress, lifecycle, two front ends one engine, scanning, bounded UI, known limits), `CHANGELOG.md` (1.1.0 behaviour changes first, because they change what a job does to your files), `.gitignore` rewritten so markdown is tracked by default - the old `*.md` with per-file exceptions silently untracked any new document |
+
+### Findings that changed the design
+
+16. **A ticked path with no file behind it used to vanish from the job.** Designing `--files` made this visible: a typo (`--files typo.txt`) selected nothing real, and the job would have reported success on an empty work set. `doExecute` now compares the selection against the scan and either fails naming the missing paths, or continues with a warning naming them. A test pins both.
+17. **A file missing at the destination was reported twice** - once as `MISSING` and once as a per-file "Could not read ... NoSuchFileException" warning. Absence is the counter's job; `NoSuchFileException` no longer produces a warning, while real read failures (permissions) still do. Without this, verifying 100k absent files buries the log.
+18. **Path identity had to absorb what people type.** `--files ./a.txt` normalized to `./a.txt`, which never matched the scanned `a.txt`. `normalize` now strips leading `./` as well as leading `/` and converts separators.
+19. **`--ignore` is additive in the CLI, replacing in the GUI.** In the GUI the ignore field shows the full effective list, so editing it *is* the decision. In a CLI, `--ignore "*.log"` silently dropping the built-in VCS/OS ignores would quietly copy `.git` objects, so it adds instead, and `--no-default-ignore` is the explicit way to start from an empty list.
+20. **The CLI gets no weaker selection rule than the GUI.** `--all` is not a flag that makes the engine scan-everything: the CLI scans first, expands `--all` (minus `--exclude`) into an explicit `Selection`, and hands that to the engine - so there is one work-set implementation.
+
+### Deferred / open
+
+- 4.4 license: needs your decision (MIT, Apache-2.0 or GPL-3.0-or-later are all compatible with what this project links).
+- The per-side selection *mode* (3.4's original ambition) is still modelled only as `Selection.selected`/`known`.
+- GUI behaviour at 100k+ files is mitigated (view model, log cap, coalesced progress, `MAX_OUTCOMES`) but never measured at that size.

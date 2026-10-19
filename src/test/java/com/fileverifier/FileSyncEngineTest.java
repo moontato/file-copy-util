@@ -60,6 +60,46 @@ class FileSyncEngineTest {
     // ---------------------------------------------------------------- B1
 
     @Test
+    void aSelectedFileThatNoLongerExistsIsReportedInsteadOfSilentlySkipped() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+
+        JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("a.txt", "gone.txt"), TestSupport.none());
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(1, result.filesChecked(), "the ghost file is not counted - it does not exist");
+        assertEquals(1, result.filesCopied());
+        assertTrue(result.warnings().stream().anyMatch(w -> w.contains("not found in the source")
+                        && w.contains("gone.txt")),
+                String.valueOf(result.warnings()));
+    }
+
+    @Test
+    void aSelectionOfOnlyGoneFilesFailsAndNamesThem() throws Exception {
+        JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("gone.txt"), TestSupport.none());
+
+        assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
+        assertTrue(result.message().contains("Selected but not found in the source"), result.message());
+        assertTrue(result.message().contains("gone.txt"), result.message());
+        assertEquals(0, result.filesChecked());
+    }
+
+    @Test
+    void aFileMissingAtTheDestinationIsReportedOnceNotAlsoAsAReadError() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+
+        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selection("a.txt", "b.txt"), TestSupport.none());
+
+        assertTrue(result.isSuccess(), result.message());
+        assertEquals(2, result.filesMissing());
+        assertTrue(result.warnings().stream().noneMatch(w -> w.contains("Could not read")),
+                "absence is the MISSING counter's job, not a warning per file: " + result.warnings());
+    }
+
+    @Test
     void emptySelectionCopiesNothingInsteadOfEverything() throws Exception {
         TestSupport.write(source.resolve("a.txt"), "a");
         TestSupport.write(source.resolve("nested/b.txt"), "b");

@@ -1,6 +1,13 @@
-apache-maven-*/
+# build output
 target/
-*.md
-!README.md
-!plan/*.md
+apache-maven-*/
+
+# scratch / throwaway artefacts (markdown here is not documentation)
+scratch/
 *.png
+
+# editors and OS noise
+.idea/
+*.iml
+.vscode/
+.DS_Store

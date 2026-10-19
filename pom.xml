@@ -4,22 +4,24 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.filecopyutil</groupId>
-    <artifactId>file-copy-util</artifactId>
-    <version>1.0.0</version>
+    <!-- One name everywhere: package com.fileverifier, groupId com.fileverifier, product
+         "File Verifier & Copier" (the window title), artifact file-verifier. -->
+    <groupId>com.fileverifier</groupId>
+    <artifactId>file-verifier</artifactId>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
-    <name>File Copy Util</name>
-    <description>Copy and verify files between directories using rsync and SHA256 hashes</description>
+    <name>File Verifier &amp; Copier</name>
+    <description>Copy and verify files between directories using rsync and SHA-256 hashes</description>
 
     <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
         <junit.version>5.10.2</junit.version>
     </properties>
 
     <dependencies>
+        <!-- Test-only. There is no runtime dependency, so no shading is needed and the jar is the jar. -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -30,6 +32,16 @@
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <!-- <release> compiles against the JDK 17 API and rejects newer API usage;
+                         source/target alone would not. -->
+                    <release>17</release>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -46,27 +58,6 @@
                         </manifest>
                     </archive>
                 </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.1</version>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                        <configuration>
-                            <transformers>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.fileverifier.FileVerifierApp</mainClass>
-                                </transformer>
-                            </transformers>
-                            <createDependencyReducedPom>false</createDependencyReducedPom>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
     </build>

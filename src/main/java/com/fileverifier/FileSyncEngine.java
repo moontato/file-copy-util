@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -483,9 +484,19 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         int workTotal = workSet.size() + extras.size();
+        // A ticked path with no scanned file behind it is not the same as an unticked one: the user
+        // asked for it and it is gone (deleted, or filtered out by an ignore pattern). Silently doing
+        // without it is how a typo in a CLI list or a file deleted after the scan turns into a job
+        // that reports success.
+        List<String> notFound = new ArrayList<>(src.selected());
+        notFound.removeAll(sourceRels);
+        notFound.sort(Comparator.naturalOrder());
+        String notFoundText = describeNames(notFound);
+
         if (workTotal == 0) {
+            String suffix = notFound.isEmpty() ? "" : " Selected but not found in the source: " + notFoundText + ".";
             return failure("Empty work set: 0 selected source files and 0 destination-only files survived "
-                            + "the selection, so there is nothing to do.",
+                            + "the selection, so there is nothing to do." + suffix,
                     List.of(), List.of(), 0);
         }
 
@@ -497,6 +508,10 @@ public class FileSyncEngine implements AutoCloseable {
         if (scan.skippedLinks() > 0) {
             warnings.add(scan.skippedLinks() + " symbolic link(s) in the source were ignored; change the "
                     + "symlink policy to copy or verify them.");
+        }
+        if (!notFound.isEmpty()) {
+            warnings.add(notFound.size() + " selected file(s) were not found in the source and were not "
+                    + "touched: " + notFoundText + ".");
         }
 
         int rsyncExitCode = 0;
@@ -734,6 +749,10 @@ public class FileSyncEngine implements AutoCloseable {
             } catch (ExecutionException e) {
                 if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
                     pending = algorithmException;
+                } else if (e.getCause() instanceof java.nio.file.NoSuchFileException) {
+                    // Absence is not a read error. The caller classifies a file with no hash and no
+                    // file as MISSING; warning about it too would bury the log in "could not read"
+                    // lines for files that are simply not there.
                 } else {
                     warnings.add("Could not read " + side + " file: " + future.getKey()
                             + " (" + e.getCause() + ")");
@@ -936,6 +955,13 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
+    /** Names for a message: the first few sorted ones, then how many more there are. */
+    static String describeNames(List<String> names) {
+        int shown = Math.min(names.size(), 10);
+        String head = String.join(", ", names.subList(0, shown));
+        return names.size() > shown ? head + " (+" + (names.size() - shown) + " more)" : head;
+    }
+
     /** rsync exit codes 0 and 24 are success for our purposes; 24 is reported as a warning. */
     static boolean isSuccessfulExit(int exitCode) {
         return exitCode == 0 || exitCode == 24;
@@ -951,6 +977,11 @@ public class FileSyncEngine implements AutoCloseable {
             String trimmed = rel.replace(java.io.File.separatorChar, '/').trim();
             while (trimmed.startsWith("/")) {
                 trimmed = trimmed.substring(1);
+            }
+            // "sub/./b.txt" and "./b.txt" are the same relative path as "b.txt"; a CLI user writes
+            // them, and a path identity that keeps the prefix would never match the scanned file.
+            while (trimmed.startsWith("./")) {
+                trimmed = trimmed.substring(2);
             }
             if (!trimmed.isEmpty()) {
                 normalized.add(trimmed);

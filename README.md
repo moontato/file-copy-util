@@ -1,6 +1,10 @@
-# File Copy Util
+# File Verifier & Copier
 
-A Java GUI application for copying and verifying files between two directories using `rsync` and SHA-256 hashing.
+A Java tool for copying and verifying files between two directories using `rsync` and SHA-256 hashing.
+It has a Swing GUI and a headless CLI that share one engine.
+
+See [DESIGN.md](DESIGN.md) for the rules the program guarantees (path model, selection semantics,
+counters) and [CHANGELOG.md](CHANGELOG.md) for what changed in 1.1.0.
 
 ## Features
 
@@ -20,6 +24,7 @@ A Java GUI application for copying and verifying files between two directories u
 - **Bounded Log** — The on-screen log keeps its newest 5000 lines; the export is the archive
 - **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode and extra-file detection are restored in the next window
 - **Smart Directory Selection** — The chooser starts in the directory already in that field (falling back to the other field, then home) and takes the directory you actually clicked
+- **Headless CLI** — `--cli` runs the same engine without a display, with CSV/JSON export and exit codes for scripting
 - **Wayland Support** — Automatically detects Wayland sessions and falls back to X11 toolkit
 
 ## Requirements
@@ -27,7 +32,7 @@ A Java GUI application for copying and verifying files between two directories u
 - **Java 17+** (OpenJDK recommended)
 - **Linux/Unix** (Windows not supported)
 - **`rsync`** installed on the system
-- **Full JRE** (not headless) — GUI libraries are required
+- **Full JRE** (not headless) — required for the GUI; `--cli` works on a headless JRE
 
 ### Ubuntu/Debian
 
@@ -41,13 +46,34 @@ sudo apt install openjdk-21-jre rsync
 mvn clean package
 ```
 
-Output: `target/file-copy-util-1.0.0.jar`
+Output: `target/file-verifier-1.1.0.jar` (one jar - the project has no runtime dependencies).
 
 ## Usage
 
 ```bash
-java -jar target/file-copy-util-1.0.0.jar
+# GUI
+java -jar target/file-verifier-1.1.0.jar
+
+# Headless
+java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
+java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-verifier-1.1.0.jar --cli --help
 ```
+
+The CLI runs the same engine with the same selection rules: either `--files` or `--all` is required, and
+`--all` is expanded into an explicit list by scanning first.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | job completed, nothing mismatched or missing |
+| 1 | the job failed: preflight problem, rsync error, cancellation |
+| 2 | bad command line |
+| 3 | job completed, but files mismatched or were missing at the destination |
+
+Other CLI options: `--verify-only`, `--exclude a.txt,...` (with `--all`), `--ignore "GLOB,GLOB"` (adds to
+the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
+`--no-report-extra`, `--timeout SECONDS`, `--quiet`.
 
 ### Workflow
 
@@ -94,7 +120,7 @@ A **failed** job (cancelled, timed out, or an rsync error) reports the partial c
 mvn test
 ```
 
-75 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (including symlink policies and the itemize-line grammar), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout), the bounded log buffer, and the CSV/JSON report exporter. The rsync-dependent tests are skipped automatically if `rsync` is not installed. The lifecycle tests create 1.5 GB sparse files, so that suite takes a few seconds.
+93 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout), the CLI front end, the bounded log buffer, and the CSV/JSON report exporter. The rsync-dependent tests are skipped automatically if `rsync` is not installed. The lifecycle tests create 1.5 GB sparse files, so that suite takes a few seconds. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged jar.
 
 ## Project Structure
 
@@ -102,17 +128,21 @@ mvn test
 .
 ├── pom.xml
 ├── README.md
-├── plan/                            # roadmap / phase notes
+├── DESIGN.md                          # the rules the engine guarantees
+├── CHANGELOG.md
+├── .github/workflows/ci.yml          # build + tests + packaged-jar CLI smoke test
+├── plan/                             # roadmap / phase notes
 └── src/main/java/com/fileverifier/
-    ├── FileVerifierApp.java         # Main entry point, headless/Wayland handling
-    ├── FileVerifierFrame.java       # GUI frame (selectors, lists, filters, results, export, log)
-    ├── DirectoryScanner.java        # Recursive scanner -> FileEntry (relative paths)
-    ├── ScanOptions.java             # Ignore patterns, hidden files, symlink policy
-    ├── FileEntry.java               # (relPath, absolutePath) - the app's single file identity
-    ├── FileSyncEngine.java          # Copy/verify logic using rsync + SHA-256 (no UI dependency)
-    ├── FileHasher.java              # SHA-256 hash computation
-    ├── ReportExporter.java          # CSV / JSON job reports with full digests
-    └── TailLog.java                 # Bounded log tail buffer
+    ├── FileVerifierApp.java          # Entry point: GUI, or --cli headless; Wayland/headless handling
+    ├── Cli.java                      # Headless front end (--cli): same engine, exit codes
+    ├── FileVerifierFrame.java        # GUI frame (selectors, lists, filters, results, export, log)
+    ├── DirectoryScanner.java         # Recursive scanner -> FileEntry (relative paths)
+    ├── ScanOptions.java              # Ignore patterns, hidden files, symlink policy
+    ├── FileEntry.java                # (relPath, absolutePath) - the app's single file identity
+    ├── FileSyncEngine.java           # Copy/verify logic using rsync + SHA-256 (no UI dependency)
+    ├── FileHasher.java               # SHA-256 hash computation
+    ├── ReportExporter.java           # CSV / JSON job reports with full digests
+    └── TailLog.java                  # Bounded log tail buffer
 ```
 
 `FileSyncEngine` has no Swing dependency, so the copy/verify logic can be run and tested headlessly.
@@ -120,6 +150,12 @@ mvn test
 ## Troubleshooting
 
 ### "No display available" error
+
+Only the GUI needs a display. On a machine without one, use `--cli`:
+
+```bash
+java -jar target/file-verifier-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
+```
 
 On Wayland sessions, the app automatically falls back to X11. If you still see this error, ensure:
 - `DISPLAY` is set (`echo $DISPLAY` should output `:0` or similar)
@@ -139,4 +175,5 @@ sudo apt install openjdk-21-jre
 
 ## License
 
-Not specified.
+Not specified yet. Choosing one is the owner's call (roadmap item 4.4); until a `LICENSE` file exists,
+all rights are reserved by the author.
