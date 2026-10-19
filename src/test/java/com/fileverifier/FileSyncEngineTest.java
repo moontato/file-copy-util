@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
@@ -721,6 +722,75 @@ class FileSyncEngineTest {
         Set<String> normalized = FileSyncEngine.normalize(input);
         assertEquals(Set.of("abs/path.txt", "sub/file.txt", "double/leading.txt"), normalized);
     }
+
+    // ---------------------------------------------------------------- scale limits (5.4)
+
+    @Test
+    void theResultsListIsBoundedButTheCountersAreNot() throws Exception {
+        for (int i = 0; i < 8; i++) {
+            TestSupport.write(source.resolve("f" + i + ".txt"), "c" + i + "\n");
+            TestSupport.write(dest.resolve("f" + i + ".txt"), "c" + i + "\n");
+        }
+
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.setResultLimit(5);
+            assertEquals(5, engine.resultLimit());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selectAllOf(source),
+                    TestSupport.selectAllOf(dest)), new TestSupport.Recorder());
+
+            assertTrue(result.isSuccess(), result.message());
+            assertEquals(8, result.filesChecked(), "counters must stay exact when the list is truncated");
+            assertEquals(8, result.filesMatched());
+            assertEquals(5, result.outcomes().size());
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("truncated at 5")),
+                    String.valueOf(result.warnings()));
+        }
+    }
+
+    @Test
+    void resultsKeepWorkSetOrderSoALargeExportIsDiffable() throws Exception {
+        // The hashing runs on a pool; the reported results must still arrive in work-set order, or a
+        // 100k-row export would be a different order on every run.
+        for (int i = 0; i < 2_000; i++) {
+            TestSupport.write(source.resolve(String.format("f%04d.txt", i)), "c" + i + "\n");
+            TestSupport.write(dest.resolve(String.format("f%04d.txt", i)), "c" + i + "\n");
+        }
+
+        FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.selectAllOf(source), TestSupport.selectAllOf(dest));
+
+        assertEquals(2_000, result.filesChecked());
+        assertEquals(2_000, result.outcomes().size());
+        List<String> reported = result.outcomes().stream().map(FileSyncEngine.FileOutcome::relPath).toList();
+        assertEquals(List.of("f0000.txt", "f1999.txt"), List.of(reported.get(0), reported.get(1999)));
+        String[] copy = reported.toArray(new String[0]);
+        Arrays.sort(copy);
+        assertTrue(Arrays.equals(reported.toArray(new String[0]), copy), "results must be in work-set order");
+    }
+
+    @Test
+    void aFileThatExistsButCannotBeReadIsAMismatchNotAMissingFile() throws Exception {
+        TestSupport.write(source.resolve("locked.bin"), "secret\n");
+        TestSupport.write(dest.resolve("locked.bin"), "secret\n");
+        Path unreadable = source.resolve("locked.bin");
+        Set<PosixFilePermission> none = EnumSet.noneOf(PosixFilePermission.class);
+        Set<PosixFilePermission> readable = EnumSet.of(
+                PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+        Files.setPosixFilePermissions(unreadable, none);
+        try {
+            FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.VERIFY_ONLY,
+                    TestSupport.selection("locked.bin"), TestSupport.selection("locked.bin"));
+
+            assertEquals(1, result.filesMismatched(), "unreadable is not the same as absent: " + result.message());
+            assertEquals(0, result.filesMissing(), result.message());
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("Could not read file")),
+                    String.valueOf(result.warnings()));
+        } finally {
+            Files.setPosixFilePermissions(unreadable, readable);
+        }
+    }
+
 
     // ---------------------------------------------------------------- dry run (5.3)
 

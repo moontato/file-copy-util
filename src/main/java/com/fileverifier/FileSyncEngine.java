@@ -213,11 +213,12 @@ public class FileSyncEngine implements AutoCloseable {
     private volatile JobResult lastResult;
     private volatile long jobTimeoutMillis = NO_TIMEOUT;
     private volatile long bandwidthLimitKbps;
+    private volatile int resultLimit = MAX_OUTCOMES;
     /** Set by the job thread; read by the watchdog to tell a live transfer from a hung engine. */
     private volatile String jobPhase = "idle";
 
     public FileSyncEngine() {
-        watchdog.scheduleAtFixedRate(this::watchdogTick,
+        watchdog.scheduleAtFixedRate(this::watchdogLoop,
                 WATCHDOG_PERIOD_MS, WATCHDOG_PERIOD_MS, TimeUnit.MILLISECONDS);
     }
 
@@ -253,6 +254,19 @@ public class FileSyncEngine implements AutoCloseable {
         return bandwidthLimitKbps;
     }
 
+    /**
+     * How many individual results a job keeps in memory - which is also how many rows the results table,
+     * and an export taken from it, can contain. Counters stay exact whatever this is. Set it while the
+     * engine is idle.
+     */
+    public void setResultLimit(int limit) {
+        this.resultLimit = Math.max(1, limit);
+    }
+
+    public int resultLimit() {
+        return resultLimit;
+    }
+
     /** ms since the engine last saw activity; Long.MAX_VALUE when no job has run. */
     public long millisSinceLastActivity() {
         long at = lastActivityAt.get();
@@ -273,7 +287,18 @@ public class FileSyncEngine implements AutoCloseable {
         }
         beginJob(request, listener);
         try {
-            jobWorker.submit(() -> finishJob(runGuarded(request, listener), listener));
+            jobWorker.submit(() -> {
+                JobResult result;
+                try {
+                    result = runGuarded(request, listener);
+                } catch (Throwable t) {
+                    // An Error that escaped the guard (usually an OutOfMemoryError while building its own
+                    // message) must still release the engine: a job thread that dies quietly would leave
+                    // it reporting RUNNING forever with no way to start another job.
+                    result = failure("Job aborted: " + t, List.of(String.valueOf(t)), List.of(), 0);
+                }
+                finishJob(result, listener);
+            });
             return true;
         } catch (RuntimeException e) {
             jobRunning.set(false);
@@ -352,6 +377,14 @@ public class FileSyncEngine implements AutoCloseable {
     private JobResult runGuarded(JobRequest request, ProgressListener listener) {
         try {
             return doExecute(request, listener);
+        } catch (OutOfMemoryError e) {
+            // A selection too large for this JVM is a job failure with a fixable cause, not a crash. By
+            // the time it gets here doExecute's own lists are unreachable, so there is heap left to
+            // build this message with.
+            return failure("Job aborted: the JVM ran out of memory while working on this selection. Try a "
+                            + "narrower selection, turn off destination-only detection, or start the program "
+                            + "with a larger heap (java -Xmx1g -jar ...).",
+                    List.of("OutOfMemoryError"), List.of(), 0);
         } catch (Exception e) {
             return failure("Job aborted: " + e.getMessage(), List.of(String.valueOf(e)), List.of(), 0);
         } finally {
@@ -474,7 +507,6 @@ public class FileSyncEngine implements AutoCloseable {
 
         markActivity("scanning " + sourceDir);
         DirectoryScanner.ScanResult scan = DirectoryScanner.scanFiles(sourceDir, options);
-        DirectoryScanner.ScanResult destScan = verifyOnly ? DirectoryScanner.scanFiles(destDir, options) : null;
         Set<String> sourceRels = new HashSet<>();
         for (FileEntry entry : scan.files()) {
             sourceRels.add(entry.relPath());
@@ -493,21 +525,17 @@ public class FileSyncEngine implements AutoCloseable {
             workSet.add(entry);
         }
 
-        List<FileEntry> extras = new ArrayList<>();
-        if (destScan != null && request.detectExtraFiles()) {
-            for (FileEntry entry : destScan.files()) {
-                String rel = entry.relPath();
-                if (sourceRels.contains(rel)) {
-                    continue;
-                }
-                if (dst.known().contains(rel) && !dst.selected().contains(rel)) {
-                    continue;
-                }
-                extras.add(entry);
-            }
-        }
+        // Destination-only detection is the only reason to scan the destination. Doing it here instead of
+        // at the top of the job keeps that scan inside a frame that ends immediately: on a 300k-file tree
+        // its entry list was tens of megabytes held for the whole job for information one checkbox asks
+        // for. With the checkbox off the scan does not happen at all.
+        DestinationSides destination = verifyOnly && request.detectExtraFiles()
+                ? scanDestinationSides(destDir, options, sourceRels, dst)
+                : new DestinationSides(List.of(), List.of());
+        List<FileEntry> extras = destination.extras();
 
         int workTotal = workSet.size() + extras.size();
+
         // A ticked path with no scanned file behind it is not the same as an unticked one: the user
         // asked for it and it is gone (deleted, or filtered out by an ignore pattern). Silently doing
         // without it is how a typo in a CLI list or a file deleted after the scan turns into a job
@@ -515,6 +543,9 @@ public class FileSyncEngine implements AutoCloseable {
         List<String> notFound = new ArrayList<>(src.selected());
         notFound.removeAll(sourceRels);
         notFound.sort(Comparator.naturalOrder());
+        // Nothing after this point needs the set of every source path, and on a large tree that set is a
+        // lot of memory to carry through a transfer for a lookup that is already finished.
+        sourceRels = null;
         String notFoundText = describeNames(notFound);
 
         if (workTotal == 0) {
@@ -526,9 +557,7 @@ public class FileSyncEngine implements AutoCloseable {
 
         List<String> errors = new ArrayList<>();
         List<String> warnings = new ArrayList<>(scan.warnings());
-        if (destScan != null) {
-            warnings.addAll(destScan.warnings());
-        }
+        warnings.addAll(destination.warnings());
         if (scan.skippedLinks() > 0) {
             warnings.add(scan.skippedLinks() + " symbolic link(s) in the source were ignored; change the "
                     + "symlink policy to copy or verify them.");
@@ -599,18 +628,11 @@ public class FileSyncEngine implements AutoCloseable {
         jobPhase = "verify";
         progress.verifyStart(!verifyOnly);
 
-        List<FileEntry> destTargets = new ArrayList<>();
-        for (FileEntry entry : concat(workSet, extras)) {
-            destTargets.add(new FileEntry(entry.relPath(), destDir.resolve(entry.relPath())));
-        }
-
-        Map<String, String> destHashes;
         if (verifyOnly) {
-            sourceHashes = hashFiles(workSet, "source", warnings);
-            destHashes = hashFiles(destTargets, "destination", warnings);
-        } else {
-            destHashes = hashFiles(destTargets, "destination", warnings);
+            sourceHashes = Map.of();
         }
+        verifyEntries(workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
+                warnings, verifyOnly);
         if (timeoutWasTriggered()) {
             return timeoutResult(progress, outcomes, errors, warnings, destinationTargets);
         }
@@ -618,43 +640,9 @@ public class FileSyncEngine implements AutoCloseable {
             return cancelledDuringVerify(progress, outcomes, errors, warnings);
         }
 
-        for (FileEntry entry : workSet) {
-            if (abortRequested()) {
-                break;
-            }
-            String rel = entry.relPath();
-            String sourceHash = sourceHashes.get(rel);
-            String destHash = destHashes.get(rel);
-            markActivity("verified " + rel);
-            if (destHash != null && sourceHash != null && sourceHash.equals(destHash)) {
-                progress.countMatched();
-                recordOutcome(outcomes, listener, rel, "OK", sourceHash, destHash);
-            } else if (sourceHash == null && !Files.isRegularFile(entry.absolutePath())) {
-                progress.countMissing();
-                recordOutcome(outcomes, listener, rel, "MISSING", null, destHash);
-            } else if (destHash == null) {
-                progress.countMissing();
-                recordOutcome(outcomes, listener, rel, "MISSING", sourceHash, null);
-            } else {
-                progress.countMismatched();
-                recordOutcome(outcomes, listener, rel, "MISMATCH", sourceHash, destHash);
-            }
-            progress.verifiedFile(!verifyOnly);
-        }
-
-        for (FileEntry entry : extras) {
-            if (abortRequested()) {
-                break;
-            }
-            progress.countExtra();
-            markActivity("verified " + entry.relPath());
-            recordOutcome(outcomes, listener, entry.relPath(), "EXTRA", null,
-                    destHashes.get(entry.relPath()));
-            progress.verifiedFile(!verifyOnly);
-        }
-
-        if (outcomes.size() >= MAX_OUTCOMES) {
-            warnings.add("Results list truncated at " + MAX_OUTCOMES + " entries; counters are still exact.");
+        if (outcomes.size() >= resultLimit) {
+            warnings.add("Results list truncated at " + resultLimit + " entries; counters are still exact. "
+                    + (dryRun ? "" : "Raise it (CLI: --max-results N) if the export must list every file."));
         }
 
         if (timeoutWasTriggered()) {
@@ -685,9 +673,9 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /** Records one verification outcome and the matching streaming-log callback (short hashes). */
-    private static void recordOutcome(List<FileOutcome> outcomes, ProgressListener listener, String rel,
-                                      String kind, String sourceHash, String destHash) {
-        if (outcomes.size() < MAX_OUTCOMES) {
+    private void recordOutcome(List<FileOutcome> outcomes, ProgressListener listener, String rel,
+                               String kind, String sourceHash, String destHash) {
+        if (outcomes.size() < resultLimit) {
             outcomes.add(new FileOutcome(rel, kind, sourceHash, destHash));
         }
         listener.onFileProcessed(rel, kind,
@@ -762,9 +750,10 @@ public class FileSyncEngine implements AutoCloseable {
         Map<Path, List<String>> namesByParent = new LinkedHashMap<>();
         for (Path target : destinationTargets) {
             Path parent = target.getParent();
-            if (parent != null) {
+            Path name = target.getFileName();
+            if (parent != null && name != null) {
                 namesByParent.computeIfAbsent(parent, key -> new ArrayList<>())
-                        .add(target.getFileName().toString());
+                        .add(name.toString());
             }
         }
         List<String> found = new ArrayList<>();
@@ -776,7 +765,11 @@ public class FileSyncEngine implements AutoCloseable {
             }
             try (var entries = Files.newDirectoryStream(parent)) {
                 for (Path sibling : entries) {
-                    String name = sibling.getFileName().toString();
+                    Path entryName = sibling.getFileName();
+                    if (entryName == null) {
+                        continue;
+                    }
+                    String name = entryName.toString();
                     Matcher temp = RSYNC_TEMP_NAME.matcher(name);
                     if (!temp.matches() || !realNames.contains(temp.group(1)) || !Files.isRegularFile(sibling)) {
                         continue;
@@ -813,17 +806,167 @@ public class FileSyncEngine implements AutoCloseable {
         return String.format("%.1f %s", value, units[unit]);
     }
 
-    private static List<FileEntry> concat(List<FileEntry> a, List<FileEntry> b) {
-        List<FileEntry> all = new ArrayList<>(a.size() + b.size());
-        all.addAll(a);
-        all.addAll(b);
-        return all;
+    /** What scanning the destination contributes to a job: destination-only files and warnings. */
+    private record DestinationSides(List<FileEntry> extras, List<String> warnings) {
+    }
+
+    private DestinationSides scanDestinationSides(Path destDir, ScanOptions options,
+                                                 Set<String> sourceRels, Selection dst) {
+        markActivity("scanning " + destDir + " for destination-only files");
+        DirectoryScanner.ScanResult destScan = DirectoryScanner.scanFiles(destDir, options);
+        List<FileEntry> extras = new ArrayList<>();
+        for (FileEntry entry : destScan.files()) {
+            String rel = entry.relPath();
+            if (sourceRels.contains(rel)) {
+                continue;
+            }
+            // An unticked destination row the user actually saw is an exclusion; a file that was never
+            // in the list is not.
+            if (dst.known().contains(rel) && !dst.selected().contains(rel)) {
+                continue;
+            }
+            extras.add(entry);
+        }
+        return new DestinationSides(extras, destScan.warnings());
     }
 
     /**
-     * Hashes a batch of files on a bounded pool. Files that are unreadable are omitted from the
-     * result and recorded in {@code warnings}; "missing" is then inferred by the caller from the
-     * absence of both a hash and a file.
+     * One verdict per file: hash whatever still needs hashing, compare, report, and let the digests go.
+     *
+     * <p>This is deliberately not "hash every source file into a map, hash every destination file into a
+     * second map, then walk the maps". Two full digest maps plus a resolved-path entry list per side is
+     * what a 300k-file Verify Only was doing before, and it is memory the comparison never asks for
+     * again: only a mismatch needs its digests kept, and those live in the bounded results list. Verdicts
+     * are consumed in work-set order, so the results list and any export stay deterministic even though
+     * the hashing runs in parallel.
+     */
+    private void verifyEntries(List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
+                               Map<String, String> knownSourceHashes, ProgressReporter progress,
+                               List<FileOutcome> outcomes, ProgressListener listener,
+                               List<String> warnings, boolean verifyOnly)
+            throws NoSuchAlgorithmException, InterruptedException {
+        int total = workSet.size() + extras.size();
+        if (total == 0) {
+            return;
+        }
+        int threads = Math.min(MAX_HASH_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
+        ExecutorService pool = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "verify");
+            thread.setDaemon(true);
+            return thread;
+        });
+        List<Future<Verdict>> futures = new ArrayList<>(Math.min(total, 1024));
+        Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        try {
+            for (int index = 0; index < total; index++) {
+                if (abortRequested()) {
+                    break;
+                }
+                final int i = index;
+                futures.add(pool.submit(() -> verdict(i, workSet, extras, destDir, knownSourceHashes,
+                        readProblems)));
+            }
+        } finally {
+            pool.shutdown();
+        }
+
+        for (Future<Verdict> future : futures) {
+            if (abortRequested()) {
+                break;
+            }
+            Verdict verdict;
+            try {
+                verdict = future.get();
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                    throw algorithmException;
+                }
+                // A task that could not decide is not a verdict; the read problem it recorded (if any)
+                // is reported below.
+                continue;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (verdict == null) {
+                continue;
+            }
+            markActivity("verified " + verdict.relPath());
+            switch (verdict.kind()) {
+                case "OK" -> progress.countMatched();
+                case "MISSING" -> progress.countMissing();
+                case "MISMATCH" -> progress.countMismatched();
+                default -> progress.countExtra();
+            }
+            recordOutcome(outcomes, listener, verdict.relPath(), verdict.kind(),
+                    verdict.sourceHash(), verdict.destHash());
+            progress.verifiedFile(!verifyOnly);
+        }
+
+        for (String problem : readProblems) {
+            warnings.add("Could not read file: " + problem);
+        }
+    }
+
+    /** A file's verdict. {@code kind} is OK, MISMATCH, MISSING or EXTRA; hashes are null where absent. */
+    private record Verdict(String kind, String relPath, String sourceHash, String destHash) {
+    }
+
+    private Verdict verdict(int index, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
+                            Map<String, String> knownSourceHashes, Set<String> readProblems)
+            throws NoSuchAlgorithmException {
+        if (abortRequested()) {
+            return null;
+        }
+        boolean destinationOnly = index >= workSet.size();
+        FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
+        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+
+        String destHash = hashFile(destDir.resolve(rel), rel, readProblems);
+        if (destinationOnly) {
+            return new Verdict("EXTRA", rel, null, destHash);
+        }
+
+        String sourceHash = knownSourceHashes.get(rel);
+        if (sourceHash == null) {
+            sourceHash = hashFile(sourceEntry.absolutePath(), rel, readProblems);
+        }
+        if (destHash != null && sourceHash != null && sourceHash.equals(destHash)) {
+            return new Verdict("OK", rel, sourceHash, destHash);
+        }
+        if (sourceHash == null && !Files.isRegularFile(sourceEntry.absolutePath())) {
+            return new Verdict("MISSING", rel, null, destHash);
+        }
+        if (destHash == null) {
+            return new Verdict("MISSING", rel, sourceHash, null);
+        }
+        // A source file that exists but could not be hashed is not "missing": reporting it as such
+        // would hide an unreadable file behind a word that means "not there".
+        return new Verdict("MISMATCH", rel, sourceHash, destHash);
+    }
+
+    /**
+     * Hash one file, or null when it is absent. Absence is not an error to report: the verdict turns it
+     * into MISSING, and a warning per absent file would bury the log.
+     */
+    private String hashFile(Path path, String rel, Set<String> readProblems) throws NoSuchAlgorithmException {
+        try {
+            return FileHasher.computeHash(path);
+        } catch (java.nio.file.NoSuchFileException e) {
+            return null;
+        } catch (IOException e) {
+            readProblems.add(rel + " (" + e + ")");
+            return null;
+        } catch (RuntimeException e) {
+            readProblems.add(rel + " (" + e + ")");
+            return null;
+        }
+    }
+
+    /**
+     * Hashes a batch of files on a bounded pool. Unreadable files are omitted from the result and
+     * recorded in {@code warnings}; absence is inferred by the caller from a missing hash and a missing
+     * file. Used for the source digests Copy & Verify needs before rsync runs.
      */
     private Map<String, String> hashFiles(List<FileEntry> entries, String side, List<String> warnings)
             throws NoSuchAlgorithmException {
@@ -1137,12 +1280,20 @@ public class FileSyncEngine implements AutoCloseable {
         if (!isRunning()) {
             return;
         }
-        long deadlineNanos = deadline.get();
-        if (deadlineNanos != 0L && System.nanoTime() > deadlineNanos) {
-            timeoutTriggered.set(true);
-            cancelRequested.set(true);
-            markActivity("timeout after " + jobTimeoutMillis + " ms in phase " + jobPhase);
+        if (deadlineExceeded()) {
             terminateRsync();
+        }
+    }
+
+    /**
+     * A scheduled task that throws is never rescheduled, which would silently disable the deadline for
+     * the rest of the engine's life - so the tick has to survive anything it can throw.
+     */
+    private void watchdogLoop() {
+        try {
+            watchdogTick();
+        } catch (Throwable t) {
+            markActivity("watchdog skipped: " + t.getClass().getSimpleName());
         }
     }
 

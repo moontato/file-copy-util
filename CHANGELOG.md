@@ -63,7 +63,25 @@ there is now a test suite that says what it is supposed to do.
   `--dry-run` and still compares hashes, so you see what the job would copy and what already mismatches
   without writing anything. Its count means "would be copied" and its message says nothing was written.
 - **`--bwlimit KB/s`** caps the transfer rate.
-- 104 tests, headless, driven against real `rsync` when it is installed. Tests that kill a transfer
+### Scale and static analysis (Phase 5, Group A)
+
+- **Measured on 100k and 300k file trees** (scan ~1 s / ~3.6 s, Verify Only ~2.4 s / ~7 s). Time is linear;
+  memory was the problem, so verification now decides one file at a time instead of building a digest map
+  per side, and the destination is not scanned at all unless destination-only reporting is on. A 300k-file
+  Verify Only used to run out of memory at 256 MB and now completes inside it.
+- **Running out of memory is a failed job, not a crash**: it reports what to do (narrow the selection, turn
+  off destination-only detection, or raise `-Xmx`) and exits 1.
+- **The watchdog no longer dies silently.** A scheduled task that throws is never rescheduled, which would
+  have disabled the job deadline for the rest of the engine's life; the tick now survives anything it throws.
+- **`--max-results N`** raises the bound on how many individual results a job keeps. Counters were always
+  exact; the export could only ever list what was kept, and now that bound is the user's to set.
+- **`javac -Xlint:all -Werror` and SpotBugs at Medium run on every `mvn verify`.** Findings it raised and
+  what was done: `Path.getFileName()` is null for a root path, so scanning a filesystem root could throw
+  (`DirectoryScanner`, `FileSyncEngine`); `JFileChooser.getSelectedFile()` can return null in the export
+  path; a format string with literal newlines in the CLI usage; `EI_EXPOSE_REP` on `TailLog.component()`
+  is intentional and annotated as such. The dead `concat` helper was removed.
+- **`--help` is longer**: examples, what the counters mean, and the measured cost of large trees.
+- 109 tests, headless, driven against real `rsync` when it is installed. Tests that kill a transfer
   throttle rsync with `--bwlimit`, so they write a few megabytes instead of gigabytes.
 
 ### Fixed

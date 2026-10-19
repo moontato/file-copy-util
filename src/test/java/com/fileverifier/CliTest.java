@@ -316,4 +316,36 @@ class CliTest {
             assertTrue(walk.noneMatch(Files::isRegularFile), o.out());
         }
     }
+
+    @Test
+    void maxResultsBoundsTheExportedRowsButNotTheCounters() throws Exception {
+        for (int i = 0; i < 5; i++) {
+            TestSupport.write(source.resolve("f" + i + ".txt"), "c" + i + "\n");
+            TestSupport.write(dest.resolve("f" + i + ".txt"), "c" + i + "\n");
+        }
+        Path csv = source.resolve("report.csv");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--quiet", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--max-results", "3", "--csv", csv.toString());
+
+        assertEquals(Cli.EXIT_OK, exit, o.out());
+        assertTrue(o.out().contains("checked=5"), o.out());
+        List<String> lines = Files.readAllLines(csv);
+        assertEquals(4, lines.size(), "header plus the 3 kept results: " + o.out());
+        assertTrue(o.out().contains("truncated at 3"), o.out());
+    }
+
+    @Test
+    void maxResultsMustBeAPositiveWholeNumber() {
+        Output o = new Output();
+        assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--max-results", "0"));
+        assertTrue(o.err().contains("--max-results must be at least 1"), o.err());
+
+        Output o2 = new Output();
+        assertEquals(Cli.EXIT_USAGE, run(o2, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+                "--all", "--max-results", "many"));
+        assertTrue(o2.err().contains("--max-results must be a whole number"), o2.err());
+    }
 }

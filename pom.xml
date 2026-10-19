@@ -39,6 +39,15 @@
     </properties>
 
     <dependencies>
+        <!-- Compile-time only: tells the static analysis when a finding is deliberate rather than a
+             bug. Provided scope keeps it out of the jar, which still has no runtime dependency. -->
+        <dependency>
+            <groupId>com.github.spotbugs</groupId>
+            <artifactId>spotbugs-annotations</artifactId>
+            <version>4.8.3</version>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- Test-only. There is no runtime dependency, so no shading is needed and the jar is the jar. -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -58,12 +67,41 @@
                     <!-- <release> compiles against the JDK 17 API and rejects newer API usage;
                          source/target alone would not. -->
                     <release>17</release>
+                    <compilerArgs>
+                        <!-- 5.7: the compiler is the free static analysis. -Werror means a warning cannot
+                             be parked for later; it has to be fixed or explicitly silenced where it is
+                             wrong. -->
+                        <arg>-Xlint:all</arg>
+                        <arg>-Werror</arg>
+                    </compilerArgs>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <!-- 5.7: bytecode-level analysis on every build, at the level where style complaints
+                     also show up, because the codebase is clean at it and there is no reason to accept
+                     the next finding that arrives. Findings it raised and what was done about them are
+                     recorded in CHANGELOG 1.1.0. -->
+                <groupId>com.github.spotbugs</groupId>
+                <artifactId>spotbugs-maven-plugin</artifactId>
+                <version>4.8.3.0</version>
+                <executions>
+                    <execution>
+                        <id>spotbugs</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <threshold>Medium</threshold>
+                    <failOnError>true</failOnError>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

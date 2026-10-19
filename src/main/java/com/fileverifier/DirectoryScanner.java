@@ -77,6 +77,15 @@ public final class DirectoryScanner {
         return rel.toString().replace(java.io.File.separatorChar, '/');
     }
 
+    /**
+     * A printable single-element name for a path. {@link Path#getFileName()} is null for a root path,
+     * and a root is a perfectly ordinary thing to be asked to scan, so the name has to survive that.
+     */
+    private static String nameOf(Path path) {
+        Path name = path.getFileName();
+        return name == null ? path.toString() : name.toString();
+    }
+
     /** Convenience for callers that only need the file list. */
     public static List<FileEntry> listFiles(Path root) {
         return scanFiles(root).files();
@@ -118,7 +127,7 @@ public final class DirectoryScanner {
                 ignoredDirs++;
                 return FileVisitResult.SKIP_SUBTREE;
             }
-            if (!options.includeHidden() && ScanOptions.isHiddenName(dir.getFileName().toString())) {
+            if (!options.includeHidden() && ScanOptions.isHiddenName(nameOf(dir))) {
                 ignoredDirs++;
                 return FileVisitResult.SKIP_SUBTREE;
             }
@@ -152,7 +161,7 @@ public final class DirectoryScanner {
             if (options.ignores(rel, rules)) {
                 return FileVisitResult.CONTINUE;
             }
-            if (!options.includeHidden() && ScanOptions.isHiddenName(file.getFileName().toString())) {
+            if (!options.includeHidden() && ScanOptions.isHiddenName(nameOf(file))) {
                 return FileVisitResult.CONTINUE;
             }
             if (!link && !attrs.isRegularFile()) {

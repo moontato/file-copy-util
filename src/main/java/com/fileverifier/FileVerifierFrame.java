@@ -23,7 +23,7 @@ import java.util.prefs.Preferences;
  * selection, the scan options, the progress display, and the results table, and never touches
  * rsync or hashing directly.
  */
-public class FileVerifierFrame extends JFrame {
+public final class FileVerifierFrame extends JFrame {
 
     private static final long serialVersionUID = 1L;
 
@@ -867,9 +867,19 @@ public class FileVerifierFrame extends JFrame {
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
         }
-        Path target = chooser.getSelectedFile().toPath();
-        if (!target.getFileName().toString().contains(".")) {
-            target = target.resolveSibling(target.getFileName() + "." + format);
+        File chosen = chooser.getSelectedFile();
+        if (chosen == null) {
+            log("No file was chosen - nothing was exported.");
+            return;
+        }
+        Path target = chosen.toPath();
+        Path name = target.getFileName();
+        if (name == null) {
+            log("The chosen path has no file name - nothing was exported.");
+            return;
+        }
+        if (!name.toString().contains(".")) {
+            target = target.resolveSibling(name + "." + format);
         }
         try {
             String content = "json".equals(format)

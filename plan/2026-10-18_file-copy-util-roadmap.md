@@ -367,3 +367,51 @@ consistent with where the repo lives. `LICENSE` holder stays `moontato` for the 
 **Owner action, blocked here:** the container has no git credentials (`could not read Username for
 'https://github.com'`, no `gh`, no token in the environment), so the push must be run by the owner:
 `git push origin main --follow-tags`.
+
+### Group A: 5.4 scale measurement + 5.7 static analysis (2026-10-19)
+
+**Fixture, chosen to respect the owner's SSD constraint:** 100 dirs x 1000 files, every entry a **hard
+link** to one of 100 small pool files. A 100k tree and a 300k tree each occupy **400 KB on disk** and take
+3-10 s to build, while still being a real 100k/300k-file tree for scan, hash and rsync measurements.
+(An attempt to build it in `/dev/shm` failed: tmpfs there is 64 MB and gives ~7 KB per file to inodes.)
+
+| Tree | Scan | Verify Only | Copy & Verify (dry) | Heap that survives it |
+|---|---|---|---|---|
+| 100k files | 0.6-1.3 s | 2.4 s | 5.9 s | fits at `-Xmx128m` |
+| 300k files | 3.7 s | 6.8-8.3 s | 17.1 s | `-Xmx256m` verify, `-Xmx320m` copy |
+
+Counters were exact at every size (100k: 95900 matched + 2100 mismatched + 2000 missing = 100000, and the
+dry run independently reported exactly 4100 would-copy = the same 2000 missing + 2100 mismatched - two
+different code paths agreeing). Progress stayed at 101 callbacks for 100000 files, so the coalescing works.
+
+26. **Memory, not time, is what breaks a large tree.** Time is linear and unremarkable; the failure mode was
+    OutOfMemoryError escaping a worker thread - a stack trace and an engine left looking busy. Two shapes
+    caused it: the verify phase held a digest map per side plus a resolved-path entry list per side, and the
+    destination was scanned for `EXTRA` rows even when the checkbox was off. Verification now decides one
+    file at a time (digests kept only in the bounded results list) and skips the destination scan entirely
+    when nothing asked for it; 300k Verify Only went from OOM at 256 MB to completing inside it.
+27. **A scheduled task that throws is never rescheduled.** The watchdog enforced the deadline; if a tick had
+    ever thrown, the deadline would have silently stopped working for the rest of the engine's life with no
+    symptom. The tick is now wrapped and survives anything it throws. OutOfMemoryError in a job is now a
+    FAILED job with the actionable advice, and an Error that escapes even that guard still releases the
+    engine instead of leaving it reporting RUNNING forever.
+28. **`Path.getFileName()` returns null for a root path.** Two places dereferenced it, so being asked to
+    scan a filesystem root would have thrown. Found by static analysis, not by a test - which is the point
+    of adding the gates: `javac -Xlint:all -Werror` plus SpotBugs at Medium severity, both wired into
+    `mvn verify`. SpotBugs' first run produced 8 findings: 4 real null-dereference possibilities
+    (`getFileName()`, `JFileChooser.getSelectedFile()`), 1 format-string issue, 1 constructor-escape,
+    1 dead private method, and 1 intentional (`EI_EXPOSE_REP` on `TailLog.component()`, annotated as
+    deliberate because the caller must receive the very component the log writes into). All 8 are addressed
+    and the build is clean at Medium.
+29. **The results bound is a real tradeoff, not a bug to hide.** A 300k-file job keeps 50000 rows, so an
+    export lists 50000 of them with a warning naming the number. Chosen fix: make the bound the user's
+    (`setResultLimit`, CLI `--max-results N`) rather than grow memory by default or drop digests from
+    matched rows to save heap. Streaming the export straight out of the engine would remove the tradeoff
+    entirely and stays an open candidate.
+
+**Also in this group:** `--help` now carries examples, what each counter means, and the measured cost of
+large trees. Suite is 109 tests; GUI harness under Xvfb still 32/32; jar unchanged in shape (the SpotBugs
+annotations dependency is `provided`, so it is not in the jar).
+
+**Open after Group A:** 5.5 (rsync version matrix, needs container pulls), 5.6 (per-side GUI selection,
+needs an owner decision on the UI), streaming export, and a GUI knob for the results bound.

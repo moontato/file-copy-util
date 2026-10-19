@@ -88,7 +88,19 @@ rsync -a --checksum --itemize-changes --info=progress2 [--dry-run] [--bwlimit=N]
   something `xfr#` never counts). Progress follows the percentage, never the announcements; a
   `--dry-run` announces a meaningless 100% instantly, so its percentage is ignored.
 
-## 5. Counters and progress
+## 5. Counters, progress and memory
+
+Verification decides one file at a time: hash whatever still needs hashing, compare, report, and let the
+digests go. It is deliberately not "hash every source file into a map, hash every destination file into a
+second map, then walk the maps" — that shape holds memory the comparison never asks for again, because
+only a mismatch needs its digests kept afterwards. Verdicts are consumed in work-set order, so the results
+list and any export stay deterministic even though hashing runs on a bounded pool.
+
+The destination is scanned only when destination-only reporting is asked for; a Verify Only job that does
+not want `EXTRA` rows does not walk the destination at all. The results list is bounded (`setResultLimit`,
+CLI `--max-results`); counters stay exact whatever it is, and a truncated list says so in the warnings.
+
+
 
 ```
 checked = matched + mismatched + missing        (destination-only files counted separately)
@@ -174,6 +186,11 @@ filtered view for the filter boxes.
 
 ## 10. Known limits
 
+- A selection large enough to exhaust the heap fails the job with that advice; the tool does not spill to
+  disk or stream the report. Measured ceiling on this build: 300k files needs ~256 MB for Verify Only and
+  ~320 MB for a copy.
+- A results list beyond the limit is truncated, so an export taken from it lists only what was kept. The
+  warning names the number; raising `--max-results` is the user's call.
 - On a cut-short job, `copied` is capped by rsync's completed-transfer count; if rsync never reported
   one, the announcement count is kept and the wording says "announced". A cap can understate locally
   created links (`xfr#` does not count them).

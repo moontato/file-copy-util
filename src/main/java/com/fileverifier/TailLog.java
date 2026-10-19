@@ -1,5 +1,6 @@
 package com.fileverifier;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import javax.swing.JTextArea;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -36,7 +37,13 @@ public final class TailLog {
         this.dropBatch = Math.max(1, dropBatch);
     }
 
-    /** The component to put in a scroll pane. */
+    /**
+     * The component to put in a scroll pane. Handing back the area itself is the point: a copy would be
+     * a different text area from the one {@link #append} writes into, and the line accounting would no
+     * longer describe what is on screen.
+     */
+    @SuppressFBWarnings(value = "EI_EXPOSE_REP",
+            justification = "Deliberate: the caller must get the same component the log writes into.")
     public JTextArea component() {
         return area;
     }
