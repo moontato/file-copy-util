@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.2.0
+
+The interface phase. What the program does with files is unchanged; what the window looks like, and how
+much of it can be tested without a screen, is not.
+
+### Interface
+
+- **FlatLaf theme** (light and dark), with a *Dark mode* checkbox that takes effect immediately and is
+  remembered. Colours, fonts and gaps live in one class (`UiTheme`); the layout code contains no colour
+  literals at all, and a test enforces that.
+- **Layout rebuilt for legibility**: labels above their fields, scan options on one line, cards instead of
+  titled group boxes, a hairline edge on the lists and log, one vertical rhythm for padding.
+- **Mode choice is one control**: *Copy & Verify* and *Verify only* are now the two halves of a single
+  segmented control, with the work-set line that follows from the choice next to them.
+- **One primary action**: *Run job* is the only filled button in the window. Cancel is red, everything
+  else is quiet.
+- **Results table fixed**: `JScrollPane(JTable)` does not attach a table header, so the column titles -
+  and the click-to-sort affordance the toolbar advertised - were missing since 1.1.0. The header is
+  attached now, columns have deliberate widths, and the status column shows a colour dot *and* the word
+  (a dot alone would fail for a colour-blind reader and for a printed export).
+- **Progress line gained a phase**: the status row now says which phase the job is in.
+- **Keyboard shortcuts**: `Ctrl+S` scan, `Ctrl+R` run, `Escape` cancel. `Enter` is deliberately left
+  alone so it keeps activating whichever control has focus.
+- **Window title unchanged** (*File Verifier & Copier*): the long name is a title, not a coordinate.
+
+### Structure
+
+- The Swing front end is now a panel (`FileVerifierView`) hosted by a thin window (`FileVerifierFrame`).
+  A `JFrame` cannot be constructed at all when the JVM is headless, which had made the entire UI
+  untestable in CI. The panel can be built, driven, and painted offscreen with no display server.
+- New tests: 8 for the theme (every text/badge pairing clears 4.5:1 in both palettes, a palette switch
+  actually repaints widgets built under the old one) and 7 for the interface structure (every control
+  still exists, mode halves are mutually exclusive, the results table has a header, no colour literals
+  outside `UiTheme`). Suite: 137 tests, SpotBugs clean.
+
+### Packaging
+
+- Version 1.2.0. The runnable jar now bundles FlatLaf 3.7.2 (Apache-2.0), so it is ~1.1 MB instead of
+  ~110 KB; `NOTICE` records the bundling. If FlatLaf cannot load, the window falls back to the platform
+  look and feel, and if the machine has no display libraries at all the program says so and points at
+  `--cli` instead of printing a stack trace.
+
 ## 1.1.0
 
 A remediation release. The GUI looks much the same; what it does with your files is different, and

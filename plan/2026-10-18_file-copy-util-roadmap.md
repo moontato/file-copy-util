@@ -501,3 +501,78 @@ builds 3.1.3, 3.3.0 and 3.4.0 and runs the class, making portability a gate.
 
 **Open after Group C:** streaming export, a GUI knob for the results bound, and anything the owner wants
 from the backlog. Release prep (push `main` + `v1.1.0`) is still waiting on credentials.
+
+## Phase 6 completion record (2026-10-20): the interface, and what it made testable
+
+Packaging decision (item 0): **FlatLaf 3.7.2** (Apache-2.0), owner approved. The runnable jar is now
+~1.1 MB instead of ~110 KB because the theme is bundled; `NOTICE` records it, and the thin jar
+(`original-*.jar`) still runs the same program in the platform look and feel. Version moved to **1.2.0**.
+
+### What shipped
+
+- **6.1 theme infrastructure** - `UiTheme` holds two complete palettes (same tokens), three typography
+  weights plus a monospaced face, the FlatLaf style keys, and `install(boolean dark)`. It is the only
+  file in the program containing a `new Color(...)`; `UiThemeTest` and `FileVerifierViewTest` both enforce
+  that by scanning the other sources.
+- **Contrast is a gate, not an opinion.** Measured minimums: light palette **5.17:1** (button label on the
+  accent), dark palette **6.03:1** (MISMATCH badge on the window), everything else between 6.5:1 and
+  17.7:1 - all above the WCAG 2.1 4.5:1 bar, asserted for both palettes in `UiThemeTest`.
+- **6.2 restyle through tokens** - cards with a hairline edge replace titled group boxes, labels sit above
+  fields, scan options fit on one line, one padding rhythm (`UiTheme.SPACING`), lists get alternating row
+  stripes, the log and list viewports get a `UiTheme.edge()`.
+- **6.3 mode and action** - the two mode buttons are one FlatLaf segmented control (`left`/`right`), the
+  work-set line sits beside it, *Run job* is the only filled button, *Cancel* is the only other coloured
+  one, and the status row gained a phase ("Phase: copying/verifying/done").
+- **6.4 results table, log, filters** - status column shows a colour dot **and** the word (never colour
+  alone), hashes stay monospaced while the status column uses the UI face, columns have deliberate widths,
+  each list got a *Clear* button for its filter, and the quiet instructions under each list stopped being
+  clipped by the buttons.
+- **6.5 keyboard + docs** - `Ctrl+S` scan, `Ctrl+R` run, `Escape` cancel (`Enter` left alone so it still
+  activates the focused control), shortcuts in the tooltips, DESIGN.md §12 written, CHANGELOG 1.2.0.
+
+### The structural change that paid for the rest
+
+`FileVerifierView` (a panel) now owns the interface; `FileVerifierFrame` is a thin window that hosts it.
+A `JFrame` cannot be constructed at all in a headless JVM, which had made the entire UI unreviewable in
+CI. As a panel it can be built, driven, and painted with no display server, so the interface now has
+committed tests: control inventory (nothing was removed to make the window look modern), mode exclusivity,
+theme switching, contrast, no colour literals outside the theme.
+
+### A defect the render review found
+
+`JScrollPane(JTable)` does not attach the table header. The results table has had **no column titles
+since 1.1.0** - which also meant the "click a column header to sort" the toolbar advertised was not
+reachable. Fixed by setting `setRowHeaderView(resultsTable.getTableHeader())` explicitly, and asserted in
+`FileVerifierViewTest.resultsTableHasAHeaderSoColumnsCanBeSorted`.
+
+### Dark mode that actually repaints
+
+`UiTheme` tags every widget it styles with a client property; `applyTheme` installs the look-and-feel,
+calls `FlatLaf.updateUI()`, then `UiTheme.restyle(root)` walks the tree and re-applies the palette.
+Without the walk, cards, the log and the buttons keep the colours they were built with - the usual way
+"dark mode" ends up half working. The preference persists (`darkMode`).
+
+### Verification, and its limits
+
+- `mvn -B clean verify`: **137 tests, 0 failures**, `BugInstance size is 0`, `BUILD SUCCESS`
+  (15 new: 8 theme, 7 interface structure).
+- A scratch headless harness (`UiHarness`) drives the real panel through 46 checks: scan, click-to-toggle
+  a row, work-set wording, select/deselect, filter+clear, a real throttled copy & verify job with control
+  locking and exact totals, only-problems filtering, dry run writing nothing, `EXTRA` detection, dark/light
+  switch, engine release on shutdown. All 46 pass.
+- PNG renders of the panel in light and dark, plus a close-up of the results table, were produced offscreen
+  and reviewed by eye - that is how the missing table header and the clipped hint text were caught.
+- **What this container could not do**: it had no JDK, Maven, fonts, or X server at the start of the
+  session. Toolchain was reinstalled to `/home/pi/tools`, and `libfontconfig` plus DejaVu fonts were
+  unpacked from Debian packages into the scratch directory - without them every Swing text measurement
+  throws `Fontconfig head is null`, and the suite cannot run. `Xvfb` could not be started (it insists on
+  `/usr/bin/xkbcomp` and a writable `/var/lib/xkb`, neither available without root), so the interface was
+  verified headlessly and offscreen rather than on a desktop. **The visual judgement is still the owner's.**
+
+### Still open in Phase 6
+
+- Tab-order/focus-traversal audit (shortcuts exist; traversal order was not deliberately chosen).
+- The directory chooser is the platform's own; FlatLaf's system-chooser integration was not enabled.
+- The 300k-row list is still ~710 MB resident (unchanged by this phase; it is a known limit, not a
+  regression).
+- A GUI knob for `--max-results`, and lazy rendering for very large lists, remain backlog items.

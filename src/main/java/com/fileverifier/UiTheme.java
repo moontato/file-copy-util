@@ -1,0 +1,442 @@
+package com.fileverifier;
+
+import com.formdev.flatlaf.FlatDarkLaf;
+import com.formdev.flatlaf.FlatLaf;
+import com.formdev.flatlaf.FlatLightLaf;
+
+import javax.swing.BorderFactory;
+import javax.swing.JButton;
+import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
+import javax.swing.JLabel;
+import javax.swing.JList;
+import javax.swing.JPanel;
+import javax.swing.JProgressBar;
+import javax.swing.JTable;
+import javax.swing.JTextField;
+import javax.swing.ListSelectionModel;
+import javax.swing.UIManager;
+import javax.swing.border.Border;
+import javax.swing.border.CompoundBorder;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.LineBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Container;
+import java.awt.Font;
+
+/**
+ * Every colour, font, and gap the window is allowed to use, in one place.
+ *
+ * <p>The point is not decoration: when the palette is a value instead of a literal sprinkled through
+ * the layout, dark mode is a palette swap instead of a rewrite, contrast is checkable (see
+ * {@link #contrastRatio}), and a redesign does not mean hunting {@code new Color(...)} calls across a
+ * thousand-line file. The only colour literals in the codebase live here.</p>
+ *
+ * <p>{@link #install(boolean)} sets up FlatLaf and applies the widget polish; every token below is
+ * plain Swing so the theme works even if FlatLaf is ever removed.</p>
+ */
+public final class UiTheme {
+
+    /** A complete palette: no token is left to fall back to a look-and-feel default. */
+    public record Palette(
+        Color window,
+        Color surface,
+        Color alternateRow,
+        Color text,
+        Color muted,
+        Color line,
+        Color accent,
+        Color onAccent,
+        Color selection,
+        Color danger,
+        Color onDanger,
+        Color logBackground,
+        Color logText,
+        Color ok,
+        Color warn,
+        Color bad,
+        Color info) {
+
+        public Palette {
+            java.util.Objects.requireNonNull(window, "window");
+            java.util.Objects.requireNonNull(text, "text");
+            java.util.Objects.requireNonNull(accent, "accent");
+        }
+    }
+
+    /**
+     * Light palette. Text and badge colours are chosen to clear 4.5:1 against {@code window}
+     * (UiThemeTest asserts this), which is why the greens and ambers are darker than they look
+     * fashionable.
+     */
+    public static final Palette LIGHT = new Palette(
+        new Color(0xFF, 0xFF, 0xFF),
+        new Color(0xF8, 0xF9, 0xFA),
+        new Color(0xF3, 0xF4, 0xF6),
+        new Color(0x11, 0x18, 0x27),
+        new Color(0x4B, 0x55, 0x63),
+        new Color(0xD7, 0xDC, 0xE2),
+        new Color(0x25, 0x63, 0xEB),
+        new Color(0xFF, 0xFF, 0xFF),
+        new Color(0xDB, 0xE4, 0xFF),
+        new Color(0xB9, 0x1C, 0x1C),
+        new Color(0xFF, 0xFF, 0xFF),
+        new Color(0xF3, 0xF4, 0xF6),
+        new Color(0x1F, 0x29, 0x37),
+        new Color(0x16, 0x65, 0x34),
+        new Color(0x92, 0x40, 0x0E),
+        new Color(0xB9, 0x1C, 0x1C),
+        new Color(0x1D, 0x4E, 0xD8));
+
+    /** Dark palette, same tokens, same contrast margins. */
+    public static final Palette DARK = new Palette(
+        new Color(0x1E, 0x1E, 0x1E),
+        new Color(0x24, 0x24, 0x26),
+        new Color(0x26, 0x27, 0x2A),
+        new Color(0xE5, 0xE7, 0xEB),
+        new Color(0x9C, 0xA3, 0xAF),
+        new Color(0x3F, 0x41, 0x45),
+        new Color(0x60, 0xA5, 0xFA),
+        new Color(0x0B, 0x12, 0x20),
+        new Color(0x1E, 0x3A, 0x6E),
+        new Color(0xF8, 0x71, 0x71),
+        new Color(0x18, 0x0B, 0x0B),
+        new Color(0x14, 0x15, 0x17),
+        new Color(0xD1, 0xD5, 0xDB),
+        new Color(0x4A, 0xDE, 0x80),
+        new Color(0xFB, 0xBF, 0x24),
+        new Color(0xF8, 0x71, 0x71),
+        new Color(0x60, 0xA5, 0xFA));
+
+    private static Palette active = LIGHT;
+
+    private UiTheme() {
+    }
+
+    /**
+     * Installs FlatLaf in the requested mode, applies the widget polish, and makes the matching
+     * palette current. Safe to call again on a theme change.
+     */
+    public static void install(boolean dark) {
+        if (dark) {
+            FlatDarkLaf.setup();
+        } else {
+            FlatLightLaf.setup();
+        }
+        active = dark ? DARK : LIGHT;
+        applyStyleKeys();
+    }
+
+    public static Palette palette() {
+        return active;
+    }
+
+    /**
+     * FlatLaf knobs. Set after {@code setup()} because installing a look-and-feel replaces the
+     * defaults {@code UIManager} held before. Unknown keys are inert, so this list is limited to the
+     * ones that visibly matter: corner radius, focus ring, grid removal, alternating rows, tab height.
+     */
+    private static void applyStyleKeys() {
+        UIManager.put("Button.arc", 8);
+        UIManager.put("Component.arc", 8);
+        UIManager.put("TextComponent.arc", 8);
+        UIManager.put("Component.focusWidth", 2);
+        UIManager.put("Component.innerFocusWidth", 0);
+        UIManager.put("Component.borderWidth", 1);
+        UIManager.put("Button.minimumWidth", 76);
+        UIManager.put("CheckBox.iconSize", 16);
+        UIManager.put("ToggleButton.selectedBackground", active.accent());
+        UIManager.put("List.selectionBackground", active.selection());
+        UIManager.put("List.selectionForeground", active.text());
+        UIManager.put("Table.showGrid", false);
+        UIManager.put("Table.alternateRowColor", active.alternateRow());
+        UIManager.put("Table.headerBackground", active.surface());
+        UIManager.put("Table.headerSeparatorColor", active.line());
+        UIManager.put("ScrollBar.width", 12);
+        UIManager.put("TabbedPane.tabHeight", 32);
+        UIManager.put("TabbedPane.selectedBackground", active.window());
+        UIManager.put("TabbedPane.contentAreaColor", active.line());
+        UIManager.put("SplitPane.background", active.line());
+        UIManager.put("ProgressBar.background", active.alternateRow());
+        UIManager.put("ProgressBar.foreground", active.accent());
+        UIManager.put("ProgressBar.selectionBackground", active.text());
+        UIManager.put("ProgressBar.selectionForeground", active.text());
+    }
+
+    /** Relative luminance of a colour, per WCAG 2.1. */
+    public static double luminance(Color color) {
+        return 0.2126 * channel(color.getRed())
+            + 0.7152 * channel(color.getGreen())
+            + 0.0722 * channel(color.getBlue());
+    }
+
+    private static double channel(int value) {
+        double srgb = value / 255.0;
+        return srgb <= 0.03928 ? srgb / 12.92 : Math.pow((srgb + 0.055) / 1.055, 2.4);
+    }
+
+    /** Contrast ratio between two colours: 1.0 (identical) to 21.0 (black on white). */
+    public static double contrastRatio(Color a, Color b) {
+        double light = Math.max(luminance(a), luminance(b));
+        double dark = Math.min(luminance(a), luminance(b));
+        return (light + 0.05) / (dark + 0.05);
+    }
+
+    // ------------------------------------------------------------- typography
+
+    public static Font baseFont() {
+        Font ui = UIManager.getFont("Label.font");
+        Font foundation = ui != null ? ui : Font.getFont("Dialog");
+        return foundation.deriveFont(Font.PLAIN, 13.0f);
+    }
+
+    public static Font headingFont() {
+        return baseFont().deriveFont(Font.BOLD, 15.0f);
+    }
+
+    public static Font captionFont() {
+        return baseFont().deriveFont(Font.PLAIN, 12.0f);
+    }
+
+    public static Font monoFont() {
+        return new Font(Font.MONOSPACED, Font.PLAIN, 12);
+    }
+
+    // ------------------------------------------------------------- components
+
+    public static JLabel heading(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(headingFont());
+        label.setForeground(active.text());
+        label.putClientProperty(LABEL, "heading");
+        return label;
+    }
+
+    /** A quiet label: instructions, units, "what these ticks mean" notes. */
+    public static JLabel caption(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(captionFont());
+        label.setForeground(active.muted());
+        label.putClientProperty(LABEL, "caption");
+        return label;
+    }
+
+    /** Body text: the status line, anything that should read at the same weight as a control. */
+    public static JLabel bodyLabel(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(baseFont());
+        label.setForeground(active.text());
+        label.putClientProperty(LABEL, "body");
+        return label;
+    }
+
+    /** Field labels sit above their field, left aligned, so scanning the form is vertical. */
+    public static JLabel fieldLabel(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(captionFont());
+        label.setForeground(active.muted());
+        label.putClientProperty(LABEL, "field");
+        return label;
+    }
+
+    public static JTextField field(int columns) {
+        JTextField field = new JTextField(columns);
+        field.setFont(baseFont());
+        return field;
+    }
+
+    public static JButton button(String text) {
+        JButton button = new JButton(text);
+        button.setFont(baseFont());
+        return button;
+    }
+
+    /** The one button that starts the job: the only filled control in the window. */
+    public static JButton primaryButton(String text) {
+        JButton button = button(text);
+        button.setBackground(active.accent());
+        button.setForeground(active.onAccent());
+        button.putClientProperty(FILL, "primary");
+        return button;
+    }
+
+    public static JButton dangerButton(String text) {
+        JButton button = button(text);
+        button.setBackground(active.danger());
+        button.setForeground(active.onDanger());
+        button.putClientProperty(FILL, "danger");
+        return button;
+    }
+
+    /**
+     * One half of a segmented control. FlatLaf draws the pair as a single pill with the halves joined
+     * at the shared edge, which is how a mode choice reads today: two labels, one control.
+     */
+    public static javax.swing.JToggleButton segmentButton(String text, String position) {
+        javax.swing.JToggleButton button = new javax.swing.JToggleButton(text);
+        button.setFont(baseFont());
+        button.putClientProperty("JButton.buttonType", "segmented");
+        button.putClientProperty("segmentLocation", position);
+        button.putClientProperty(FILL, "segment");
+        button.setFocusPainted(false);
+        return button;
+    }
+
+    /** Style a mode segment for whether it is the active mode. */
+    public static void paintSegment(javax.swing.AbstractButton button, boolean selected) {
+        button.setBackground(selected ? active.accent() : active.surface());
+        button.setForeground(selected ? active.onAccent() : active.text());
+    }
+
+    public static JCheckBox check(String text) {
+        JCheckBox check = new JCheckBox(text);
+        check.setFont(baseFont());
+        check.setForeground(active.text());
+        check.setOpaque(false);
+        return check;
+    }
+
+    public static <E> JComboBox<E> comboBox(E[] items) {
+        JComboBox<E> box = new JComboBox<>(items);
+        box.setFont(baseFont());
+        return box;
+    }
+
+    public static <E> JList<E> list(javax.swing.ListModel<E> model) {
+        JList<E> list = new JList<>(model);
+        list.setFont(baseFont());
+        list.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        list.setFixedCellHeight(20);
+        return list;
+    }
+
+    public static JTable table(javax.swing.table.TableModel model) {
+        JTable table = new JTable(model);
+        table.setFont(monoFont());
+        table.setRowHeight(20);
+        table.setShowGrid(false);
+        table.setIntercellSpacing(new java.awt.Dimension(0, 0));
+        table.setFillsViewportHeight(true);
+        table.getTableHeader().setReorderingAllowed(false);
+        table.getTableHeader().setFont(captionFont());
+        return table;
+    }
+
+    public static JProgressBar progressBar() {
+        JProgressBar bar = new JProgressBar(0, 100);
+        bar.setStringPainted(true);
+        bar.setFont(captionFont());
+        bar.setPreferredSize(new java.awt.Dimension(240, 22));
+        return bar;
+    }
+
+    /** A panel with a hairline edge and inner padding: the card, replacing the group boxes. */
+    public static JPanel card() {
+        JPanel panel = new JPanel();
+        panel.setBackground(active.surface());
+        panel.setBorder(cardBorder());
+        panel.putClientProperty(CARD, Boolean.TRUE);
+        return panel;
+    }
+
+    private static Border cardBorder() {
+        return new CompoundBorder(
+            BorderFactory.createLineBorder(active.line(), 1),
+            new EmptyBorder(10, 12, 10, 12));
+    }
+
+    /** Client properties naming everything this class styled, so a palette swap can find them again. */
+    private static final String CARD = "fcu.card";
+    private static final String LABEL = "fcu.label";
+    private static final String FILL = "fcu.fill";
+    private static final String LOG = "fcu.log";
+
+    /** The log area: monospaced, recessed against the rest of the window, word wrapped. */
+    public static void asLog(javax.swing.JTextArea area) {
+        area.setFont(monoFont());
+        area.setBackground(active.logBackground());
+        area.setForeground(active.logText());
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.putClientProperty(LOG, Boolean.TRUE);
+    }
+
+    /** A hairline panel edge (list viewports), tagged so it follows the palette too. */
+    public static void edge(javax.swing.JScrollPane scroll) {
+        scroll.setBorder(BorderFactory.createLineBorder(active.line(), 1));
+        scroll.setBackground(active.window());
+        scroll.putClientProperty(CARD, Boolean.TRUE);
+    }
+
+    /**
+     * Re-apply the current palette to components already on screen. Colours chosen at construction
+     * time would otherwise survive a theme switch, which is the usual way "dark mode support" ends up
+     * half working. Everything {@code UiTheme} created is tagged, so this walks and re-paints.
+     */
+    public static void restyle(Container root) {
+        if (root == null) {
+            return;
+        }
+        if (root instanceof JPanel panel && Boolean.TRUE.equals(panel.getClientProperty(CARD))) {
+            panel.setBackground(active.surface());
+            Border border = panel.getBorder();
+            if (border instanceof CompoundBorder compound && compound.getOutsideBorder() instanceof LineBorder) {
+                panel.setBorder(cardBorder());
+            }
+        }
+        if (root instanceof javax.swing.JTextArea area && Boolean.TRUE.equals(area.getClientProperty(LOG))) {
+            area.setBackground(active.logBackground());
+            area.setForeground(active.logText());
+        }
+        if (root instanceof JLabel label) {
+            Object kind = label.getClientProperty(LABEL);
+            if ("heading".equals(kind)) {
+                label.setFont(headingFont());
+                label.setForeground(active.text());
+            } else if ("body".equals(kind)) {
+                label.setFont(baseFont());
+                label.setForeground(active.text());
+            } else if ("caption".equals(kind) || "field".equals(kind)) {
+                label.setFont(captionFont());
+                label.setForeground(active.muted());
+            }
+        }
+        if (root instanceof javax.swing.AbstractButton button) {
+            Object fill = button.getClientProperty(FILL);
+            if ("primary".equals(fill)) {
+                button.setBackground(active.accent());
+                button.setForeground(active.onAccent());
+            } else if ("danger".equals(fill)) {
+                button.setBackground(active.danger());
+                button.setForeground(active.onDanger());
+            } else if ("segment".equals(fill)) {
+                paintSegment(button, button.getModel().isSelected());
+            }
+        }
+        for (Component child : root.getComponents()) {
+            if (child instanceof Container nested) {
+                restyle(nested);
+            }
+        }
+    }
+
+    public static Border gutter() {
+        return new EmptyBorder(SPACING);
+    }
+
+    /** Outer margin of each region: one value, so the window has a single rhythm. */
+    public static final java.awt.Insets SPACING = new java.awt.Insets(12, 16, 12, 16);
+
+    /** Colour a status word or badge by outcome kind. */
+    public static Color outcomeColor(String kind) {
+        return switch (kind) {
+            case "OK", "MATCHED", "COPIED" -> active.ok();
+            case "MISMATCH" -> active.bad();
+            case "MISSING" -> active.warn();
+            case "EXTRA" -> active.info();
+            case "TRUNCATED", "INFO", "WARNING" -> active.muted();
+            default -> active.text();
+        };
+    }
+}

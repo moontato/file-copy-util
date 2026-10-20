@@ -7,7 +7,7 @@ Swing GUI and a headless CLI. The repository, the artifact and the CLI all use t
 `file-copy-util`; the GUI window carries the longer product title *File Verifier & Copier*.
 
 See [DESIGN.md](DESIGN.md) for the rules the program guarantees (path model, selection semantics,
-counters) and [CHANGELOG.md](CHANGELOG.md) for what changed in 1.1.0.
+counters) and [CHANGELOG.md](CHANGELOG.md) for what changed between 1.1.0 and 1.2.0.
 
 ## Features
 
@@ -31,6 +31,8 @@ counters) and [CHANGELOG.md](CHANGELOG.md) for what changed in 1.1.0.
 - **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode and extra-file detection are restored in the next window
 - **Smart Directory Selection** — The chooser starts in the directory already in that field (falling back to the other field, then home) and takes the directory you actually clicked
 - **Headless CLI** — `--cli` runs the same engine without a display, with CSV/JSON export and exit codes for scripting
+- **Modern interface** — FlatLaf theme with light or dark mode (remembered between runs), cards instead of group boxes, labels above fields, a segmented *Copy & Verify / Verify only* control, one filled action button, and a results table whose status column carries a colour dot beside the word
+- **Keyboard shortcuts** — `Ctrl+S` scan, `Ctrl+R` run, `Escape` cancel; `Enter` still activates whatever control has focus
 - **Wayland Support** — Automatically detects Wayland sessions and falls back to X11 toolkit
 
 ## Requirements
@@ -52,20 +54,22 @@ sudo apt install openjdk-21-jre rsync
 mvn clean package
 ```
 
-Output: `target/file-copy-util-1.1.0.jar` (one jar - the project has no runtime dependencies).
+Output: `target/file-copy-util-1.2.0.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
+`target/original-file-copy-util-1.2.0.jar` is the same program without the theme: it still runs, in the
+platform look and feel.
 
 ## Usage
 
 ```bash
 # GUI
-java -jar target/file-copy-util-1.1.0.jar
+java -jar target/file-copy-util-1.2.0.jar
 
 # Headless
-java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
-java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
-java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
-java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
-java -jar target/file-copy-util-1.1.0.jar --cli --help
+java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
+java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
+java -jar target/file-copy-util-1.2.0.jar --cli --help
 ```
 
 The CLI runs the same engine with the same selection rules: either `--files` or `--all` is required, and
@@ -195,7 +199,7 @@ jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the
 Only the GUI needs a display. On a machine without one, use `--cli`:
 
 ```bash
-java -jar target/file-copy-util-1.1.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all
 ```
 
 On Wayland sessions, the app automatically falls back to X11. If you still see this error, ensure:
@@ -216,7 +220,9 @@ sudo apt install openjdk-21-jre
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 moontato.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 moontato. The runnable jar bundles FlatLaf
+(Apache-2.0); see [NOTICE](NOTICE) and [DESIGN.md](DESIGN.md) for what that dependency does and does
+not touch.
 
 MIT was chosen because it keeps every later option open: this code can be re-released under a stricter
 license at any future version, while copies already distributed stay MIT. The choice itself is recorded

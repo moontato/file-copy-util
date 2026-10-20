@@ -241,5 +241,52 @@ filtered view for the filter boxes.
   counters for the same tree, dry runs that write nothing, interrupted jobs that claim only finished
   transfers). A version outside that range is unverified; the matrix takes extra binaries through
   `FCU_RSYNC_BINARIES`, so a new release can be added without touching the tests.
-- The per-side selection rule is modelled (`Selection.selected`/`known`) but the GUI has no separate
-  per-side selection mode yet.
+- The per-side selection rule is modelled (`Selection.selected`/`known`) and stated in the window (each
+  list reports how many of its rows are ticked, and the work-set line names the rule that produced the
+  count). There is deliberately no third "effective files" list: a third thing to keep in sync was the
+  failure mode being avoided (roadmap 5.6).
+- The interface is verified structurally and offscreen. CI has no display server, so the UI checks assert
+  structure (controls exist, modes are exclusive, the table has a header, no colour literals escape the
+  theme) and paint the panel to an image. Whether the result *looks* right on a real desktop is still a
+  human judgement.
+
+## 12. The interface layer
+
+### 12.1 A panel, not a window
+
+`FileVerifierView` (a `JPanel`) holds every control, the models, the log buffer and the engine reference.
+`FileVerifierFrame` is a `JFrame` that sizes a window, titles it, hosts the view, and tells it when the
+window is closing.
+
+The split exists for one reason: **a `JFrame` cannot be constructed when the JVM is headless**, so a UI
+built inside one can only be reviewed by hand. As a panel the whole interface can be constructed, driven
+(buttons clicked, rows clicked, jobs run against real `rsync`), and painted to a `BufferedImage` with no
+display server - which is what `FileVerifierViewTest` and the CI job do.
+
+### 12.2 One place for colour
+
+`UiTheme` is the only file in the program that contains a `new Color(...)`; a test walks every other
+source file and fails if one appears. It holds two complete palettes (light and dark) with the same
+tokens, so dark mode is a palette swap rather than a second design, and the tokens are values a test can
+check:
+
+- every text/badge pairing must clear **4.5:1** against the surface it sits on (WCAG 2.1 body-text bar),
+  asserted for both palettes - which is why the greens and ambers are darker than the fashionable ones;
+- `outcomeColor(kind)` maps an outcome to a colour once, so the log, the table and any future view agree;
+- typography is three weights (caption 12, body 13, heading 15) plus a monospaced face for digests and
+  the log.
+
+### 12.3 FlatLaf, and what it may not do
+
+FlatLaf 3.7.2 (Apache-2.0, bundled in the runnable jar; see `NOTICE`) supplies the widget shapes: rounded
+corners, focus rings, alternating table rows, tab styling, segmented buttons. `UiTheme.install()` sets a
+short list of FlatLaf style keys after `setup()`, because installing a look-and-feel replaces the
+defaults `UIManager` held before.
+
+Theme changes are applied live with `FlatLaf.updateUI()` plus `UiTheme.restyle(root)`: colours chosen at
+construction time would otherwise survive the switch, which is how "dark mode support" usually ends up
+half working. Every widget `UiTheme` creates is tagged with a client property, and `restyle` walks for
+those tags.
+
+The theme is presentation only. The engine has no dependency on it, `--cli` never loads it, and the thin
+jar (`original-*.jar`) runs the same program in the platform look and feel.

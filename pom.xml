@@ -9,7 +9,7 @@
          (see FileVerifierFrame.setTitle). Package and groupId stay com.fileverifier to match the code. -->
     <groupId>com.fileverifier</groupId>
     <artifactId>file-copy-util</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <name>File Copy Util</name>
@@ -36,9 +36,19 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
         <junit.version>5.10.2</junit.version>
+        <flatlaf.version>3.7.2</flatlaf.version>
     </properties>
 
     <dependencies>
+        <!-- The GUI's look and feel. Swing's default look and feel cannot be modernised by recolouring:
+             colours and spacing are adjustable, widget shapes are not. The engine has no dependency; only
+             the GUI front end needs this one, and the runnable jar shades it so `java -jar` still works. -->
+        <dependency>
+            <groupId>com.formdev</groupId>
+            <artifactId>flatlaf</artifactId>
+            <version>${flatlaf.version}</version>
+        </dependency>
+
         <!-- Compile-time only: tells the static analysis when a finding is deliberate rather than a
              bug. Provided scope keeps it out of the jar, which still has no runtime dependency. -->
         <dependency>
@@ -102,6 +112,42 @@
                     <threshold>Medium</threshold>
                     <failOnError>true</failOnError>
                 </configuration>
+            </plugin>
+            <plugin>
+                <!-- The jar must stay runnable with a bare `java -jar`, so the look and feel is packed
+                     into it. Shade replaces the plain jar rather than producing a second artifact, so
+                     CI, the release workflow and the README all keep naming one file. -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.fileverifier.FileVerifierApp</mainClass>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
