@@ -107,6 +107,10 @@ public final class FileVerifierView extends JPanel {
         restorePreferences();
         livenessTimer = new Timer(1000, e -> updateLiveness());
         installShortcuts();
+        // A look-and-feel overwrites component colours with its own defaults whenever it installs a UI,
+        // so the palette is applied last rather than hoped for. It also makes a widget built before a
+        // theme switch legible after it.
+        UiTheme.restyle(this);
     }
 
     /**
@@ -156,7 +160,10 @@ public final class FileVerifierView extends JPanel {
 
     private void initComponents() {
         setLayout(new BorderLayout(0, 12));
-        setBackground(UiTheme.palette().window());
+        // The root and the three regions must be part of the palette. AWT resolves a control with no
+        // background of its own by walking up the parents, so an untracked region is how dark mode ends
+        // up with light buttons carrying light text.
+        UiTheme.surface(this);
         setBorder(new EmptyBorder(UiTheme.SPACING));
         add(createTopPanel(), BorderLayout.NORTH);
         add(createCenterPanel(), BorderLayout.CENTER);
@@ -169,7 +176,7 @@ public final class FileVerifierView extends JPanel {
      */
     private JPanel createTopPanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 10));
-        panel.setOpaque(false);
+        UiTheme.surface(panel);
 
         JPanel paths = UiTheme.card();
         paths.setLayout(new GridBagLayout());
@@ -185,8 +192,7 @@ public final class FileVerifierView extends JPanel {
         gbc.gridy = 0;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        sourcePathField = UiTheme.field(28);
-        sourcePathField.setEditable(false);
+        sourcePathField = UiTheme.readOnlyField(28);
         paths.add(sourcePathField, gbc);
 
         gbc.gridx = 2;
@@ -206,8 +212,7 @@ public final class FileVerifierView extends JPanel {
         gbc.gridy = 1;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        destPathField = UiTheme.field(28);
-        destPathField.setEditable(false);
+        destPathField = UiTheme.readOnlyField(28);
         paths.add(destPathField, gbc);
 
         gbc.gridx = 2;
@@ -299,7 +304,7 @@ public final class FileVerifierView extends JPanel {
 
     private JPanel createCenterPanel() {
         JPanel panel = new JPanel(new BorderLayout());
-        panel.setOpaque(false);
+        UiTheme.surface(panel);
 
         JPanel sourcePanel = createListPanel("Source files", sourceList = UiTheme.list(sourceModel.view()),
             sourceModel, sourceFilterField = UiTheme.field(12), true);
@@ -401,7 +406,7 @@ public final class FileVerifierView extends JPanel {
      */
     private JPanel createBottomPanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 10));
-        panel.setOpaque(false);
+        UiTheme.surface(panel);
 
         JPanel statusRow = new JPanel(new BorderLayout(12, 0));
         statusRow.setOpaque(false);

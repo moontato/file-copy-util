@@ -142,6 +142,54 @@ class FileVerifierViewTest {
         }), "a closed engine must refuse new work");
     }
 
+    /**
+     * Dark mode used to leave ordinary buttons painted light while their labels were switched to the
+     * dark palette's light text - invisible text. A control with no background of its own inherits one
+     * from its parent, so the regions have to follow the palette too. This is the regression test for
+     * that.
+     */
+    @Test
+    void aThemeSwitchLeavesEveryControlReadable() throws Exception {
+        FileVerifierView view = build();
+        assertReadable(view);   // as-built, before any theme switch
+        JCheckBox dark = (JCheckBox) field(view, "darkModeCheck");
+        boolean wasDark = dark.isSelected();
+        try {
+            dark.setSelected(false);
+            UiTheme.install(false);
+            UiTheme.restyle(view);
+            assertReadable(view);
+
+            dark.setSelected(true);
+            UiTheme.install(true);
+            com.formdev.flatlaf.FlatLaf.updateUI();
+            UiTheme.restyle(view);
+            assertReadable(view);
+        } finally {
+            UiTheme.install(false);
+            UiTheme.restyle(view);
+            dark.setSelected(wasDark);
+        }
+    }
+
+    /** Every visible control's own label must clear 4.5:1 against whatever it sits on. */
+    private static void assertReadable(FileVerifierView view) throws Exception {
+        java.util.List<String> controls = java.util.List.of(
+            "sourceBrowseButton", "scanButton", "runButton", "cancelButton", "exportCsvButton",
+            "hiddenCheck", "extraCheck", "dryRunCheck", "darkModeCheck", "statusLabel", "workSetLabel",
+            "sourcePathField");
+        for (String name : controls) {
+            javax.swing.JComponent component = (javax.swing.JComponent) field(view, name);
+            java.awt.Color foreground = component.getForeground();
+            java.awt.Color background = UiTheme.backgroundBehind(component);
+            double ratio = UiTheme.contrastRatio(foreground, background);
+            assertTrue(ratio >= 4.5,
+                name + " (" + component.getClass().getSimpleName() + ") label " + foreground + " on "
+                    + background + " is " + String.format("%.2f", ratio) + ":1 in "
+                    + (UiTheme.palette() == UiTheme.DARK ? "dark" : "light") + " mode");
+        }
+    }
+
     /** The colour rule of the redesign: only UiTheme is allowed to name a colour. */
     @Test
     void noColourLiteralsOutsideTheTheme() throws IOException {
