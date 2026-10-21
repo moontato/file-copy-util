@@ -603,3 +603,31 @@ What this audit does **not** cover: concurrent jobs from two windows onto one de
 filesystems that lie about `isRegularFile`, Windows paths (out of scope), and a destination on a filesystem
 that runs out of space mid-transfer (rsync reports it, leftover detection has not been exercised against a real
 full disk).
+
+---
+
+# 1.2.2 — the "still open" items that needed no disk
+
+Chosen from the open list on the criterion of what could be verified here rather than reasoned about.
+
+| Item | Shipped | Evidence |
+| --- | --- | --- |
+| Case / Unicode-normalisation collisions in the work set | detector plus a named warning before any write; not a refusal, because on a case-sensitive destination both names are valid | `CollisionAndRaceTest`: a real job with `A.txt` + `a.txt`; a filesystem-free unit test of the detector covering case, accent composition, `sub/` separation, and no false alarm on an ordinary tree |
+| A source file edited mid-copy | source re-hashed once on mismatch; the file is named as one that moved during the job; the verdict itself is unchanged | `CollisionAndRaceTest` with a stand-in rsync that rewrites a source file while "running", plus a Verify-Only test asserting the tool does **not** make the claim where no pre-transfer digest exists |
+| Partial-file reporting on the failure path | leftover scan runs on an rsync error too, not only on cancel/timeout | `CollisionAndRaceTest` with a stand-in rsync leaving `.data.AAAAAA` and exiting 23, rsync's own reason included in the report |
+| `setRsyncBinary` was process-wide static | per-engine `useRsync()`, preflight checks the binary that engine would run, availability cached per binary; static default kept | `EngineIsolationTest` |
+| No protection against two jobs on one destination | in-process reservation per canonical destination; second job fails with the reason; released when the job ends | `EngineIsolationTest`: busy destination rejected, an unrelated destination unaffected, destination free again after cancel |
+
+Deliberately not done, and why:
+
+- **Cross-process locking.** Would mean writing a lock file into the owner's destination tree. That is the
+  owner's call, not a default. Documented instead.
+- **Lazy rendering for very large lists.** Real work, measurable benefit only on trees the owner does not carry
+  daily.
+- **Full-disk behaviour.** Leftover detection is proven against a stand-in that reports ENOSPC, not against a
+  genuinely full filesystem.
+- **Focus-order audit, native file chooser, streaming export, GUI knob for `--max-results`.** Unchanged backlog.
+
+Also worth stating plainly: the case-insensitive *consequence* is reasoning, not measurement. The detector is
+tested; what a case-insensitive mount does to a transfer was not observed, because no such mount was available
+here.

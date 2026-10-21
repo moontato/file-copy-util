@@ -317,3 +317,20 @@ what to set (`LC_ALL=C.UTF-8`), rather than dying with `InvalidPathException` or
 **Names that look like syntax are ordinary names.** `-dash`, `$name`, `back\slash`, `semi;colon`, `quote'`,
 `[bracket]`, `a,b`, tabs and trailing spaces all survive a copy and a verify, because the file list is a file,
 not a shell command line.
+
+Two more rules from the same audit.
+
+**A name collision is named before anything is written.** `A.txt` and `a.txt`, or `café` composed and decomposed,
+are two files on a case-sensitive filesystem and one file on a case-insensitive or normalising destination. The
+work set is checked (Unicode NFC, then case-folded, over the whole relative path — the directory part is part of
+the name) and the colliding pairs are reported with their consequence. Refusing would be wrong: on a normal
+destination both are legitimate files. Silently overwriting one and then reporting a mismatch would be worse.
+
+**A verdict and an explanation are different things.** A mismatch stays a mismatch: the destination really does
+not match the digest taken before the copy. But the source is re-hashed once, and if it moved during the job the
+warning says so. Same verdict, different story — and only where a before-and-after actually exists.
+
+**Engine state belongs to the engine.** Which rsync a job runs was a process-wide static; now it is per engine,
+with the static kept as a default. Which destination is busy was not tracked at all; it is now, per program, so a
+second job on the same directory fails fast instead of interleaving. Cross-process concurrency remains unlocked
+on purpose: a lock file in someone's destination tree is a decision for the owner of that tree.

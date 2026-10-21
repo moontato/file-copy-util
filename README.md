@@ -54,22 +54,22 @@ sudo apt install openjdk-21-jre rsync
 mvn clean package
 ```
 
-Output: `target/file-copy-util-1.2.0.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
-`target/original-file-copy-util-1.2.0.jar` is the same program without the theme: it still runs, in the
+Output: `target/file-copy-util-1.2.2.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
+`target/original-file-copy-util-1.2.2.jar` is the same program without the theme: it still runs, in the
 platform look and feel.
 
 ## Usage
 
 ```bash
 # GUI
-java -jar target/file-copy-util-1.2.0.jar
+java -jar target/file-copy-util-1.2.2.jar
 
 # Headless
-java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all
-java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
-java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
-java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
-java -jar target/file-copy-util-1.2.0.jar --cli --help
+java -jar target/file-copy-util-1.2.2.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.2.2.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
+java -jar target/file-copy-util-1.2.2.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-copy-util-1.2.2.jar --cli --source /data/src --dest /backup/dst --all --dry-run
+java -jar target/file-copy-util-1.2.2.jar --cli --help
 ```
 
 The CLI runs the same engine with the same selection rules: either `--files` or `--all` is required, and
@@ -202,8 +202,28 @@ accents, Cyrillic, CJK and similar names cannot be listed, copied or verified. T
 says so rather than guessing a name or crashing. To handle them, run with a UTF-8 locale:
 
 ```bash
-LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.2.1.jar --cli --source DIR --dest DIR --all
+LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.2.2.jar --cli --source DIR --dest DIR --all
 ```
+
+### "N name collision(s) in the work set"
+
+The selected files include names that differ only by case (`A.txt` and `a.txt`) or only by how an accent is
+composed. Both exist on Linux; on a case-insensitive or normalising destination — a Windows share, an exFAT
+card, some macOS volumes — they are the same file, and the later transfer overwrites the earlier one. The job
+runs and says so up front. If the destination is case-insensitive, rename one of them.
+
+### "changed in the source while the job ran"
+
+A copy verifies against the digest taken *before* the transfer started. If a source file was edited during the
+job, the mismatch is that moving file rather than damage done by the copy, and the job names it. This cannot
+happen in Verify Only, which has no before-and-after to compare.
+
+### "Another job in this program is already using the destination"
+
+Two jobs writing the same directory interleave: each reports the other's files as its own, and a partial-transfer
+warning can name a file the other job is still writing. The second job stops instead. This guard covers jobs in
+one program — two windows, or a window and a CLI run in the same JVM. Two *separate* processes are not guarded;
+don't run two copies into the same destination at once.
 
 ### A file name containing a carriage return is not copied
 
@@ -216,7 +236,7 @@ transferred. Rename them if you need them copied.
 Only the GUI needs a display. On a machine without one, use `--cli`:
 
 ```bash
-java -jar target/file-copy-util-1.2.0.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.2.2.jar --cli --source /data/src --dest /backup/dst --all
 ```
 
 On Wayland sessions, the app automatically falls back to X11. If you still see this error, ensure:

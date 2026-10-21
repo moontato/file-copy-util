@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.2 — collisions, races, and engine bookkeeping
+
+Things the copy cannot see from inside, plus two pieces of state the engine should have owned all along.
+
+- **Name collisions are named.** A work set containing `A.txt` and `a.txt` (or an accent written two ways) is
+  two files on your filesystem and one file on a case-insensitive or normalising destination — a Windows share,
+  exFAT, some macOS volumes. The pairs are reported before anything is written, with the consequence stated:
+  the later transfer would overwrite the earlier one. A warning, not a refusal, because on a case-sensitive
+  destination both names genuinely are separate files. Without this the tool overwrites one file with the other
+  and then reports a mismatch as if the copy had been honest.
+- **A source file that moves mid-copy is described as that.** A copy verifies against the digest taken before
+  the transfer; when a mismatch appears the source is re-hashed once, and if it changed the job names the file
+  as "changed in the source while the job ran" instead of leaving an unexplained MISMATCH that reads like
+  damage. Verify Only has no pre-transfer digest, so it makes no such claim.
+- **Half-written files are reported on a failed copy**, not only on a cancel or a timeout — the gap left by the
+  1.2.1 fix to failure counters. Tested with a stand-in rsync that leaves `.data.AAAAAA` behind and exits 23.
+- **Each engine chooses its own rsync.** The binary was a process-wide static; now an engine can override it
+  (`useRsync`) and preflight checks the binary that engine would actually run. The process default remains a
+  default.
+- **One live job per destination per program.** A second job pointed at the same destination fails immediately:
+  two jobs writing one directory interleave, each reporting the other's files as its own results, and a
+  partial-transfer warning can name a file the other job is still writing. This is an in-process guard, not a
+  lock — a second *process* would need a lock file written into your destination tree, which is left as the
+  owner's decision rather than a default.
+
+Tests: 160, plus the rsync matrix on 3.1.3 / 3.2.7 / 3.4.0.
 ## 1.2.1 — robustness audit
 
 Five defects found by attacking the program instead of writing the tests it seemed to need. Each now has a
