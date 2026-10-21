@@ -65,6 +65,11 @@ public final class DirectoryScanner {
         Collector collector = new Collector(base, options);
         try {
             Files.walkFileTree(base, collector.walkOptions(), Integer.MAX_VALUE, collector);
+        } catch (java.nio.file.InvalidPathException e) {
+            // The character encoding used for file names comes from the locale. Under LANG=C every
+            // non-ASCII byte in a name is unrepresentable, and the walk gives up rather than listing
+            // what it could not decode: report the entries that were reached and say why.
+            collector.noteUnreadable();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to scan directory: " + base, e);
         }
@@ -100,6 +105,7 @@ public final class DirectoryScanner {
         private final ScanOptions.SymlinkPolicy policy;
         private int skippedLinks;
         private int ignoredDirs;
+        private int unreadableNames;
 
         Collector(Path base, ScanOptions options) {
             this.base = base;
@@ -117,8 +123,21 @@ public final class DirectoryScanner {
                     : EnumSet.noneOf(FileVisitOption.class);
         }
 
+        void noteUnreadable() {
+            unreadableNames++;
+        }
+
         @Override
         public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+            try {
+                return lookAtDirectory(dir);
+            } catch (java.nio.file.InvalidPathException e) {
+                noteUnreadable();
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+        }
+
+        private FileVisitResult lookAtDirectory(Path dir) {
             if (dir.equals(base)) {
                 return FileVisitResult.CONTINUE;
             }
@@ -142,6 +161,17 @@ public final class DirectoryScanner {
 
         @Override
         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+            try {
+                lookAtFile(file, attrs);
+            } catch (java.nio.file.InvalidPathException e) {
+                // A name this JVM cannot represent cannot be listed, copied or hashed. It is one
+                // warning for the run, not a crash and not a silently missing file.
+                noteUnreadable();
+            }
+            return FileVisitResult.CONTINUE;
+        }
+
+        private void lookAtFile(Path file, BasicFileAttributes attrs) {
             boolean link = Files.isSymbolicLink(file);
             if (link) {
                 // Without FOLLOW_LINKS a symlinked directory arrives here rather than in
@@ -149,27 +179,26 @@ public final class DirectoryScanner {
                 // to list under it and nothing meaningful to hash, so it is reported as skipped.
                 if (policy == ScanOptions.SymlinkPolicy.SKIP || Files.isDirectory(file)) {
                     skippedLinks++;
-                    return FileVisitResult.CONTINUE;
+                    return;
                 }
                 if (!Files.exists(file)) {
                     warnings.add("Dangling symlink: " + relativize(base, file));
                     skippedLinks++;
-                    return FileVisitResult.CONTINUE;
+                    return;
                 }
             }
             String rel = relativize(base, file);
             if (options.ignores(rel, rules)) {
-                return FileVisitResult.CONTINUE;
+                return;
             }
             if (!options.includeHidden() && ScanOptions.isHiddenName(nameOf(file))) {
-                return FileVisitResult.CONTINUE;
+                return;
             }
             if (!link && !attrs.isRegularFile()) {
                 // Fifo, socket, device node: nothing meaningful to copy or hash.
-                return FileVisitResult.CONTINUE;
+                return;
             }
             files.add(new FileEntry(rel, file));
-            return FileVisitResult.CONTINUE;
         }
 
         @Override
@@ -184,6 +213,12 @@ public final class DirectoryScanner {
         }
 
         ScanResult result() {
+            if (unreadableNames > 0) {
+                warnings.add(unreadableNames + " entry(ies) could not be read because their names contain "
+                    + "characters this JVM cannot represent (file-name encoding "
+                    + System.getProperty("sun.jnu.encoding") + "). Run under a UTF-8 locale - for example "
+                    + "LC_ALL=C.UTF-8 - to list, copy and verify such files.");
+            }
             files.sort(Comparator.comparing(FileEntry::relPath));
             return new ScanResult(files, skippedLinks, ignoredDirs, warnings);
         }

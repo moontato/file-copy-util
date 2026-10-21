@@ -194,6 +194,23 @@ jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the
 
 ## Troubleshooting
 
+### "1 entry(ies) could not be read because their names contain characters this JVM cannot represent"
+
+File names are decoded using the JVM's locale. Under `LANG=C` / `LC_ALL=C` (common in cron jobs, systemd
+services, minimal containers and `sudo`) every non-ASCII byte in a name is unrepresentable, so files with
+accents, Cyrillic, CJK and similar names cannot be listed, copied or verified. The program skips them and
+says so rather than guessing a name or crashing. To handle them, run with a UTF-8 locale:
+
+```bash
+LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.2.1.jar --cli --source DIR --dest DIR --all
+```
+
+### A file name containing a carriage return is not copied
+
+rsync's file list is a line list, so a name containing a newline, a carriage return or a NUL byte cannot be
+passed safely. Such names are refused before anything is written, listed in the warnings, and reported as not
+transferred. Rename them if you need them copied.
+
 ### "No display available" error
 
 Only the GUI needs a display. On a machine without one, use `--cli`:

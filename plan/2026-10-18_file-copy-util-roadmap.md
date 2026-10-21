@@ -576,3 +576,30 @@ Without the walk, cards, the log and the buttons keep the colours they were buil
 - The 300k-row list is still ~710 MB resident (unchanged by this phase; it is a known limit, not a
   regression).
 - A GUI knob for `--max-results`, and lazy rendering for very large lists, remain backlog items.
+
+---
+
+# Post-release robustness audit (shipped as 1.2.1)
+
+Asked whether the program was bulletproof, the honest answer was: measured on the things I had measured, but
+unmeasured on several things that a hostile file system will do. Ran an adversarial pass instead of reasoning
+about it. Five defects found, all fixed, all covered by `RobustnessTest`.
+
+| Case | What it did | What it does now |
+| --- | --- | --- |
+| Non-ASCII names under a `C`/POSIX locale (cron, systemd, minimal containers, `sudo`) | `InvalidPathException` escaped `DirectoryScanner` and the job; crash, no advice | entry skipped, one warning naming the encoding and the fix (`LC_ALL=C.UTF-8`), no guessed name written |
+| rsync fails partway through a copy | failure returned **zeroed counters**: "0 copied" while files sat in the destination | same accounting as a cancelled job: announced, completed (`xfr#`), leftovers scanned |
+| Symbolic link at the destination | followed and hashed: read a file outside the destination, reported its digest as the destination's | MISMATCH + "not compared, this tool does not follow links"; nothing outside read |
+| Carriage return in a file name | accepted, handed to line-based `--files-from`, came back as "rsync failed (exit 23)" with no cause | refused up front like a newline/NUL, named in warnings, counted as not transferred |
+| `null` `ProgressListener` | job FAILED with an internal null dereference as its message | means silence |
+
+Checked and found correct, so no change: names containing `-`, `$`, `\`, `;`, `'`, `[`, `,`, tabs and trailing
+spaces; a selected file deleted between scan and run (named in warnings, not dropped); a symlinked directory
+inside the destination (rsync replaced the link, nothing was written outside); a source file edited mid-verify
+(counters still added up); a real file whose name happens to look like an rsync partial (not accused — the
+leftover scan only looks at directories the job wrote to).
+
+What this audit does **not** cover: concurrent jobs from two windows onto one destination (no advisory lock),
+filesystems that lie about `isRegularFile`, Windows paths (out of scope), and a destination on a filesystem
+that runs out of space mid-transfer (rsync reports it, leftover detection has not been exercised against a real
+full disk).

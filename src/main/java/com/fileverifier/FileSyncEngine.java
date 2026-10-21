@@ -286,22 +286,23 @@ public class FileSyncEngine implements AutoCloseable {
      * job, by design.
      */
     public boolean start(JobRequest request, ProgressListener listener) {
+        final ProgressListener progressListener = withoutListener(listener);
         if (closed || !jobRunning.compareAndSet(false, true)) {
             return false;
         }
-        beginJob(request, listener);
+        beginJob(request, progressListener);
         try {
             jobWorker.submit(() -> {
                 JobResult result;
                 try {
-                    result = runGuarded(request, listener);
+                    result = runGuarded(request, progressListener);
                 } catch (Throwable t) {
                     // An Error that escaped the guard (usually an OutOfMemoryError while building its own
                     // message) must still release the engine: a job thread that dies quietly would leave
                     // it reporting RUNNING forever with no way to start another job.
                     result = failure("Job aborted: " + t, List.of(String.valueOf(t)), List.of(), 0);
                 }
-                finishJob(result, listener);
+                finishJob(result, progressListener);
             });
             return true;
         } catch (RuntimeException e) {
@@ -313,6 +314,7 @@ public class FileSyncEngine implements AutoCloseable {
 
     /** Synchronous variant, for tests and headless callers. Blocks until the job finishes. */
     public JobResult execute(JobRequest request, ProgressListener listener) {
+        listener = withoutListener(listener);
         if (closed) {
             throw new IllegalStateException("Engine is closed");
         }
@@ -322,6 +324,17 @@ public class FileSyncEngine implements AutoCloseable {
         beginJob(request, listener);
         return finishJob(runGuarded(request, listener), listener);
     }
+
+    /** A caller that does not want progress callbacks gets silence, not a job that fails on a null. */
+    private static ProgressListener withoutListener(ProgressListener listener) {
+        return listener == null ? NO_PROGRESS : listener;
+    }
+
+    private static final ProgressListener NO_PROGRESS = new ProgressListener() {
+        @Override
+        public void onCompletion(JobResult result) {
+        }
+    };
 
     /** One-shot convenience: private engine, single job, no reuse. */
     public static JobResult runOnce(JobRequest request, ProgressListener listener) {
@@ -593,8 +606,8 @@ public class FileSyncEngine implements AutoCloseable {
 
             Path filesFrom = writeFilesFrom(workSet, warnings);
             if (filesFrom == null) {
-                return failure("No selected file name could be handed to rsync (each contains a newline or "
-                        + "NUL byte); deselect them and retry.", errors, warnings, 0);
+                return failure("No selected file name could be handed to rsync (each contains a newline, "
+                        + "carriage return or NUL byte); deselect them and retry.", errors, warnings, 0);
             }
             try {
                 Process process = new ProcessBuilder(
@@ -616,8 +629,8 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
-                    return failure("rsync failed (exit code " + rsyncExitCode + ")", errors, warnings,
-                            rsyncExitCode);
+                    return rsyncFailedDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
+                            destinationTargets, dryRun);
                 }
                 if (rsyncExitCode == 24) {
                     warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
@@ -685,6 +698,26 @@ public class FileSyncEngine implements AutoCloseable {
         listener.onFileProcessed(rel, kind,
                 sourceHash == null ? null : FileHasher.shortHash(sourceHash),
                 destHash == null ? null : FileHasher.shortHash(destHash));
+    }
+
+    /**
+     * An rsync error partway through a copy means a partial copy, not nothing at all. Until this, every
+     * failure returned zeroed counters, so a job that had already written files reported "0 copied" while
+     * those files sat in the destination. A cut-short job gets the same accounting as a cancelled one.
+     */
+    private JobResult rsyncFailedDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
+                                            int exitCode, List<String> errors, List<String> warnings,
+                                            List<Path> destinationTargets, boolean dryRun) {
+        int announced = progress.copied();
+        int completed = completedTransfers(progress, announced, dryRun);
+        String message = "rsync failed (exit code " + exitCode + "): "
+                + transfersPhrase(progress, announced, completed, dryRun)
+                + ". Nothing was verified; files already in the destination were left as they are.";
+        List<String> extended = new ArrayList<>(warnings);
+        extended.add(leftoverWarning(interruptedTempFiles(destinationTargets)));
+        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
+                progress.mismatched(), progress.missing(), progress.extra(), completed, exitCode,
+                outcomes, errors, extended);
     }
 
     private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
@@ -885,6 +918,7 @@ public class FileSyncEngine implements AutoCloseable {
         });
         List<Future<Verdict>> futures = new ArrayList<>(Math.min(total, 1024));
         Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> unfollowedLinks = java.util.concurrent.ConcurrentHashMap.newKeySet();
         try {
             for (int index = 0; index < total; index++) {
                 if (abortRequested()) {
@@ -892,7 +926,7 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 final int i = index;
                 futures.add(pool.submit(() -> verdict(i, workSet, extras, destDir, knownSourceHashes,
-                        readProblems)));
+                        readProblems, unfollowedLinks)));
             }
         } finally {
             pool.shutdown();
@@ -934,6 +968,11 @@ public class FileSyncEngine implements AutoCloseable {
         for (String problem : readProblems) {
             warnings.add("Could not read file: " + problem);
         }
+        for (String rel : unfollowedLinks) {
+            warnings.add("Not compared: the destination holds a symbolic link at " + rel
+                    + " where a file was expected, and this tool does not follow links, so the contents "
+                    + "behind it were not read.");
+        }
     }
 
     /** A file's verdict. {@code kind} is OK, MISMATCH, MISSING or EXTRA; hashes are null where absent. */
@@ -941,7 +980,8 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     private Verdict verdict(int index, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
-                            Map<String, String> knownSourceHashes, Set<String> readProblems)
+                            Map<String, String> knownSourceHashes, Set<String> readProblems,
+                            Set<String> unfollowedLinks)
             throws NoSuchAlgorithmException {
         if (abortRequested()) {
             return null;
@@ -949,6 +989,27 @@ public class FileSyncEngine implements AutoCloseable {
         boolean destinationOnly = index >= workSet.size();
         FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
         String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+
+        // The scanner refuses to list symbolic links; the destination side is reached by resolving a
+        // relative path, so a link can appear here even though it never appears in a list. Two cases are
+        // not the same thing: a link the job created under the LINK policy, and a link that was already
+        // sitting where a file was expected. The first is comparable by its target. The second would
+        // mean reading a file outside the destination and calling the digest a comparison.
+        Path destPath = destDir.resolve(rel);
+        if (Files.isSymbolicLink(destPath)) {
+            Path sourcePath = destinationOnly ? null : sourceEntry.absolutePath();
+            if (sourcePath != null && Files.isSymbolicLink(sourcePath)) {
+                String sourceLink = readLink(sourcePath);
+                String destLink = readLink(destPath);
+                return new Verdict(sourceLink != null && sourceLink.equals(destLink) ? "OK" : "MISMATCH",
+                    rel, null, null);
+            }
+            unfollowedLinks.add(rel);
+            String linkedSource = knownSourceHashes.get(rel);
+            return destinationOnly
+                ? new Verdict("EXTRA", rel, null, null)
+                : new Verdict("MISMATCH", rel, linkedSource, null);
+        }
 
         String destHash = hashFile(destDir.resolve(rel), rel, readProblems);
         if (destinationOnly) {
@@ -971,6 +1032,15 @@ public class FileSyncEngine implements AutoCloseable {
         // A source file that exists but could not be hashed is not "missing": reporting it as such
         // would hide an unreadable file behind a word that means "not there".
         return new Verdict("MISMATCH", rel, sourceHash, destHash);
+    }
+
+    /** Where a link points, or null when it cannot be read. The target is never opened. */
+    private static String readLink(Path link) {
+        try {
+            return String.valueOf(Files.readSymbolicLink(link));
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     /**
@@ -1063,8 +1133,11 @@ public class FileSyncEngine implements AutoCloseable {
         List<String> relPaths = new ArrayList<>();
         for (FileEntry entry : workSet) {
             String rel = entry.relPath();
-            if (rel.indexOf('\n') >= 0 || rel.indexOf('\0') >= 0) {
-                warnings.add("Skipped from copy: file name contains a newline or NUL byte: " + rel);
+            if (rel.indexOf('\n') >= 0 || rel.indexOf('\r') >= 0 || rel.indexOf('\0') >= 0) {
+                // --files-from is a line list: a newline, a carriage return or a NUL in a name cannot go
+                // into it without changing which file rsync is being asked for.
+                warnings.add("Skipped from copy: file name contains a newline, carriage return or NUL byte: "
+                        + rel);
                 continue;
             }
             relPaths.add(rel);

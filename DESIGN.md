@@ -290,3 +290,30 @@ those tags.
 
 The theme is presentation only. The engine has no dependency on it, `--cli` never loads it, and the thin
 jar (`original-*.jar`) runs the same program in the platform look and feel.
+
+## 13. Failure honesty
+
+A tool that copies files is trusted only if what it reports survives its bad days. These rules came out of
+attacking the program rather than writing the tests it seemed to need, and each has a regression test.
+
+**A cut-short copy is a partial copy, not nothing.** Every way a job can stop early — cancel, timeout, an
+rsync error, an out-of-memory guard — reports what rsync announced, how many transfers rsync actually
+completed (`xfr#`), and whether hidden half-written files were left behind. Until 1.2.1 the plain rsync-error
+path returned zeroed counters, so a job that had already written files reported none.
+
+**Names that cannot be handed to rsync are refused, not mangled.** `--files-from` is a line list. A newline,
+carriage return or NUL in a name is refused before the transfer, named in the warnings, and counted as a file
+that was not transferred. An error message that says only "rsync exit 23" is not a diagnosis.
+
+**Nothing outside the destination is read.** The scanner refuses to list symbolic links; the destination side
+is reached by resolving a relative path, so a link can still appear during verification. It is reported as
+MISMATCH with "not compared, this tool does not follow links" instead of hashing the file behind it and
+passing its digest off as the destination's.
+
+**An unreadable locale is a warning with a fix.** File-name encoding comes from the locale, so under `LANG=C`
+non-ASCII names are unrepresentable. The scan skips those entries and says which encoding was in force and
+what to set (`LC_ALL=C.UTF-8`), rather than dying with `InvalidPathException` or writing a guessed name.
+
+**Names that look like syntax are ordinary names.** `-dash`, `$name`, `back\slash`, `semi;colon`, `quote'`,
+`[bracket]`, `a,b`, tabs and trailing spaces all survive a copy and a verify, because the file list is a file,
+not a shell command line.

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.1 — robustness audit
+
+Five defects found by attacking the program instead of writing the tests it seemed to need. Each now has a
+regression test (`RobustnessTest`).
+
+- **A machine whose locale cannot spell a file name crashed the scan.** File-name encoding comes from the
+  locale, and under `LANG=C` — cron jobs, systemd services, minimal containers, `sudo` — every non-ASCII byte
+  in a name is unrepresentable: `DirectoryScanner` died with `InvalidPathException`, and a job threw out of
+  the engine. Such entries are now skipped with one clear warning naming the encoding and the fix
+  (`LC_ALL=C.UTF-8`), and no guessed name is ever written to the destination.
+- **An rsync failure partway through a copy reported "0 copied"** while the files it had already written sat
+  in the destination. Every failure path returned zeroed counters. A failed copy now gets the same
+  accounting as a cancelled one: what rsync announced, how many it completed, and whether it left
+  half-written files behind.
+- **A symbolic link at the destination was followed and hashed.** The scanner refuses to list links, but the
+  destination side is reached by resolving a relative path, so a link can appear during verification. It used
+  to read a file outside the destination and report its digest as the destination's. Now the file is reported
+  as MISMATCH with an explicit "not compared, this tool does not follow links" warning, and nothing outside
+  the destination is read.
+- **A carriage return in a file name was accepted**, handed to rsync's line-based `--files-from`, and came
+  back as "rsync failed (exit code 23)" with nothing explaining why. It is refused up front like a newline or
+  a NUL byte, named in the warnings, and reported as a file that was not transferred.
+- **A `null` `ProgressListener` turned the job into a failure** whose message was an internal null
+  dereference. Silence is now what it means.
+
+Also checked, and correct: names containing `-`, `$`, `\`, `;`, `'`, `[`, `,`, tabs and trailing spaces survive
+a copy and a verify; a selected file deleted between scan and run is named rather than silently dropped; a
+symlinked directory inside the destination is not written through.
 ## 1.2.0
 
 The interface phase. What the program does with files is unchanged; what the window looks like, and how
