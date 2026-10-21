@@ -5,6 +5,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import javax.swing.JCheckBox;
+import javax.swing.JList;
+import javax.swing.JTextArea;
+import javax.swing.JTextField;
 import javax.swing.JLabel;
 import javax.swing.JScrollPane;
 import javax.swing.JTable;
@@ -23,6 +26,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -77,7 +81,7 @@ class FileVerifierViewTest {
             "sourceFilterField", "destFilterField", "progressBar", "statusLabel", "phaseLabel",
             "logArea", "outputTabs", "resultsTable", "onlyProblemsCheck", "exportCsvButton",
             "exportJsonButton", "dryRunCheck", "jobTimeoutField", "darkModeCheck", "runButton",
-            "cancelButton")) {
+            "cancelButton", "versionLabel")) {
             assertNotNull(field(view, name), "missing control: " + name);
         }
     }
@@ -215,6 +219,76 @@ class FileVerifierViewTest {
     }
 
     /** Swing wants its widgets built on the event dispatch thread; the tests honour that. */
+    @Test
+    void directoriesAreTypedInNotOnlyChosenWithABrowseButton(@org.junit.jupiter.api.io.TempDir Path tmp)
+        throws Exception {
+        Path source = Files.createDirectories(tmp.resolve("src"));
+        Path destination = Files.createDirectory(tmp.resolve("dst"));
+        Files.writeString(source.resolve("a.txt"), "a");
+        Files.writeString(destination.resolve("b.txt"), "b");
+
+        FileVerifierView view = build();
+        JTextField sourceField = (JTextField) field(view, "sourcePathField");
+        JTextField destField = (JTextField) field(view, "destPathField");
+        JList<?> sourceList = (JList<?>) field(view, "sourceList");
+        JTextArea logArea = (JTextArea) field(view, "logArea");
+
+        assertTrue(sourceField.isEditable() && destField.isEditable(),
+            "a directory whose path you already know should not need a chooser opened first");
+
+        SwingUtilities.invokeAndWait(() -> {
+            sourceField.setText(source.toString());
+            destField.setText(destination.toString());
+        });
+        // What Enter does.
+        SwingUtilities.invokeAndWait(() -> {
+            for (java.awt.event.ActionListener listener : sourceField.getActionListeners()) {
+                listener.actionPerformed(new java.awt.event.ActionEvent(sourceField,
+                    java.awt.event.ActionEvent.ACTION_PERFORMED, null));
+            }
+        });
+        waitUntil(() -> sourceList.getModel().getSize() == 1, "Enter did not load the typed directory");
+
+        // The rows on screen are ticks against paths in the directory the field used to name. Changing the
+        // field has to drop them, or a job would run with a selection from somewhere else.
+        SwingUtilities.invokeAndWait(() -> destField.setText(destination.resolve("elsewhere").toString()));
+        assertEquals(0, sourceList.getModel().getSize(),
+            "a changed path must not leave the previous directory's rows behind");
+        assertTrue(logArea.getText().contains("Path changed"), logArea.getText());
+    }
+
+    @Test
+    void aTypedPathIsReadTheWayAShellWould() {
+        Path home = Path.of(System.getProperty("user.home", "")).toAbsolutePath().normalize();
+        assertEquals(home, FileVerifierView.userPath("~"));
+        assertTrue(FileVerifierView.userPath("~/notes/2026").startsWith(home),
+            "a leading ~ means the home directory, not a directory called ~");
+        assertTrue(FileVerifierView.userPath("notes").isAbsolute(),
+            "a relative path is taken from where the program was started");
+        assertEquals(Path.of("/data/src"), FileVerifierView.userPath("  /data/src  "));
+        assertNull(FileVerifierView.userPath("   "));
+        assertNull(FileVerifierView.userPath(null));
+    }
+
+    @Test
+    void theWindowShowsTheVersionItWasBuiltFrom() throws Exception {
+        FileVerifierView view = build();
+        JLabel label = (JLabel) field(view, "versionLabel");
+        String version = AppVersion.version();
+        assertNotNull(version, "a build that stamps no version leaves the window with nothing truthful to show");
+        assertTrue(version.matches("\\d+\\.\\d+\\.\\d+.*"), "not a version: " + version);
+        assertEquals("v" + version, label.getText());
+        assertTrue(label.getFont().getSize() <= UiTheme.baseFont().getSize(),
+            "a version stamp is furniture, not a headline");
+    }
+
+    private static void waitUntil(java.util.function.BooleanSupplier condition, String message) throws Exception {
+        for (int i = 0; i < 200 && !condition.getAsBoolean(); i++) {
+            Thread.sleep(50);
+        }
+        assertTrue(condition.getAsBoolean(), message);
+    }
+
     private static FileVerifierView build() throws Exception {
         FileVerifierView[] holder = new FileVerifierView[1];
         SwingUtilities.invokeAndWait(() -> holder[0] = new FileVerifierView());

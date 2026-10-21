@@ -9,7 +9,7 @@
          (see FileVerifierFrame.setTitle). Package and groupId stay com.fileverifier to match the code. -->
     <groupId>com.fileverifier</groupId>
     <artifactId>file-copy-util</artifactId>
-    <version>1.2.2</version>
+    <version>1.3.0</version>
     <packaging>jar</packaging>
 
     <name>File Copy Util</name>
@@ -68,6 +68,14 @@
     </dependencies>
 
     <build>
+        <resources>
+            <!-- ${project.version} is stamped into this file by the build, so the window reports the version
+                 it was actually built from rather than a string someone remembered to update. -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

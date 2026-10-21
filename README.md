@@ -89,6 +89,11 @@ Other CLI options: `--verify-only`, `--dry-run`, `--exclude a.txt,...` (with `--
 
 ### Workflow
 
+The two directory fields are typed, not chooser-only: type a path (or paste one) and press Enter to load both
+file lists. Browse is still there and starts in the directory already named. `~` means your home directory and a
+relative path is read from where the program was started. Changing a directory clears the lists that belonged to
+the old one. The version of the program is printed in muted text at the bottom right of the window.
+
 1. **Select Source Directory** — Click "Browse..." next to the source field. The chooser opens in the directory already in that field (or the other field, or home)
 2. **Select Destination Directory** — Click "Browse..." next to the destination field
 3. **Set Scan Options** — Ignore patterns, hidden files, and how symbolic links are handled

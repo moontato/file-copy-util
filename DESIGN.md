@@ -334,3 +334,15 @@ warning says so. Same verdict, different story — and only where a before-and-a
 with the static kept as a default. Which destination is busy was not tracked at all; it is now, per program, so a
 second job on the same directory fails fast instead of interleaving. Cross-process concurrency remains unlocked
 on purpose: a lock file in someone's destination tree is a decision for the owner of that tree.
+
+**A typed path is the program's own path parsing, and it is allowed to be wrong out loud.** The directory fields
+are editable: `~` is home, a relative path is resolved from the working directory, surrounding spaces are
+stripped. What is not allowed is keeping the file lists that were read from the directory the field used to name —
+those rows are ticks against paths in a place that is no longer in play — so a changed field clears them and says
+so in the log. A path the system's file-name encoding cannot spell gets a dialog naming the encoding, not an
+exception.
+
+**A version the interface shows must come from the build.** The corner label reads a resource the build stamps
+with the project version. A hardcoded version string in the UI is a number that drifts out of sync with the jar
+name, the tag, and the changelog, and then it is worse than nothing because it is trusted. A build that stamps
+nothing says `version unknown`.

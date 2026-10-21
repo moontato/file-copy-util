@@ -307,19 +307,6 @@ public final class UiTheme {
         return field;
     }
 
-    /**
-     * A field that only displays a value the user got from a chooser. FlatLaf paints a non-editable
-     * field with a "disabled" wash, which in dark mode means a bright box in the middle of a dark
-     * window, so its colours are stated rather than inherited.
-     */
-    public static JTextField readOnlyField(int columns) {
-        JTextField field = field(columns);
-        field.setEditable(false);
-        field.setBackground(asThemeColor(active.alternateRow()));
-        field.setForeground(asThemeColor(active.text()));
-        return field;
-    }
-
     public static JButton button(String text) {
         JButton button = new JButton(text);
         button.setFont(baseFont());

@@ -51,6 +51,9 @@ public final class FileVerifierView extends JPanel {
 
     private final Preferences prefs = Preferences.userRoot().node("com/fileverifier");
 
+    private JLabel versionLabel;
+    private boolean pathEditSuppressed;
+
     private JTextField sourcePathField;
     private JTextField destPathField;
     private JTextField ignoreField;
@@ -192,7 +195,8 @@ public final class FileVerifierView extends JPanel {
         gbc.gridy = 0;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        sourcePathField = UiTheme.readOnlyField(28);
+        sourcePathField = UiTheme.field(28);
+        installPathField(sourcePathField);
         paths.add(sourcePathField, gbc);
 
         gbc.gridx = 2;
@@ -212,7 +216,8 @@ public final class FileVerifierView extends JPanel {
         gbc.gridy = 1;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        destPathField = UiTheme.readOnlyField(28);
+        destPathField = UiTheme.field(28);
+        installPathField(destPathField);
         paths.add(destPathField, gbc);
 
         gbc.gridx = 2;
@@ -498,6 +503,13 @@ public final class FileVerifierView extends JPanel {
 
         JPanel controlsRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         controlsRight.setOpaque(false);
+        // The version the build stamped into this artifact, in the quiet corner: which build is this
+        // window, without putting a number in the way of anything you have to press.
+        versionLabel = UiTheme.caption(AppVersion.display());
+        versionLabel.setToolTipText("File Copy Util " + AppVersion.display()
+            + " - the version this window was built from.");
+        versionLabel.setBorder(javax.swing.BorderFactory.createEmptyBorder(0, 0, 0, 14));
+        controlsRight.add(versionLabel);
         JButton clearLogBtn = UiTheme.button("Clear log");
         clearLogBtn.addActionListener(e -> clearLog());
         controlsRight.add(clearLogBtn);
@@ -613,8 +625,15 @@ public final class FileVerifierView extends JPanel {
             return;
         }
 
-        Path source = Path.of(sourcePath);
-        Path dest = Path.of(destPath);
+        Path source = userPath(sourcePath);
+        Path dest = userPath(destPath);
+        if (source == null || dest == null) {
+            JOptionPane.showMessageDialog(this,
+                "That path cannot be read with this system's file-name encoding. Run under a UTF-8 locale "
+                    + "(for example LC_ALL=C.UTF-8) to use directory names this one cannot represent.",
+                "Unusable Path", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         if (!Files.isDirectory(source)) {
             JOptionPane.showMessageDialog(this, "Source directory does not exist: " + sourcePath,
                 "Invalid Source", JOptionPane.ERROR_MESSAGE);
@@ -629,6 +648,16 @@ public final class FileVerifierView extends JPanel {
         ScanOptions options = currentScanOptions();
         Set<String> untickedSource = untickedOf(sourceModel);
         Set<String> untickedDest = untickedOf(destModel);
+
+        // Show the directory the scan is about to read, with '~' and relative paths resolved the way the
+        // scan itself resolves them. Written under a guard, because this is the program writing the field,
+        // not the user changing it, and it must not be read as a path change.
+        Path sourceShown = source;
+        Path destShown = dest;
+        withProgrammaticPathEdit(() -> {
+            sourcePathField.setText(sourceShown.toString());
+            destPathField.setText(destShown.toString());
+        });
 
         scanning = true;
         statusLabel.setText("Scanning files...");
@@ -774,6 +803,8 @@ public final class FileVerifierView extends JPanel {
         scanButton.setEnabled(idle);
         sourceBrowseButton.setEnabled(idle);
         destBrowseButton.setEnabled(idle);
+        sourcePathField.setEditable(idle);
+        destPathField.setEditable(idle);
         copyVerifyButton.setEnabled(idle);
         verifyOnlyButton.setEnabled(idle);
         jobTimeoutField.setEnabled(idle);
@@ -830,7 +861,7 @@ public final class FileVerifierView extends JPanel {
         FileSyncEngine.Selection sourceSelection = selectionModelOf(sourceModel);
         FileSyncEngine.Selection destSelection = selectionModelOf(destModel);
         FileSyncEngine.JobRequest request = new FileSyncEngine.JobRequest(
-            Path.of(sourcePath), Path.of(destPath), currentJobType,
+            userPath(sourcePath), userPath(destPath), currentJobType,
             sourceSelection, destSelection, currentScanOptions(), extraCheck.isSelected(),
             dryRunCheck.isSelected());
 
@@ -1034,6 +1065,74 @@ public final class FileVerifierView extends JPanel {
     }
 
     // ------------------------------------------------------------------ chooser (3.1)
+
+    /**
+     * Both path fields are editable: typing a directory is faster than opening a chooser for one you
+     * already know. Enter loads it. What must not be possible is keeping the file lists that were read
+     * from the directory that field used to name.
+     */
+    private void installPathField(JTextField field) {
+        field.setToolTipText("Type a directory, or press Browse. Enter scans both directories.");
+        field.addActionListener(e -> scanDirectories());
+        field.getDocument().addDocumentListener(new SimpleDocumentFilter(this::pathFieldChanged, null));
+    }
+
+    /**
+     * The rows on screen are ticks against paths in the directory that was scanned. Once the field names a
+     * different directory, those ticks mean nothing, so they are dropped and said out loud - the alternative
+     * is a job whose selection came from somewhere else.
+     */
+    private void pathFieldChanged() {
+        if (pathEditSuppressed || !hasLoadedLists()) {
+            return;
+        }
+        sourceModel.clear();
+        destModel.clear();
+        showResults(null);
+        lastJobResult = null;
+        updateWorkSetSummary();
+        log("Path changed - the loaded lists were cleared, because they belong to the directory this field "
+            + "used to name. Press Scan Files (Ctrl+S) to load the new one.");
+    }
+
+    /** Write a path field without the watcher treating it as the user changing directories. */
+    private void withProgrammaticPathEdit(Runnable edit) {
+        pathEditSuppressed = true;
+        try {
+            edit.run();
+        } finally {
+            pathEditSuppressed = false;
+        }
+    }
+
+    private boolean hasLoadedLists() {
+        return sourceModel.total() > 0 || destModel.total() > 0;
+    }
+
+    /**
+     * A path as the user wrote it. '~' means the home directory and a bare relative path is taken from
+     * where the program was started, which is how a shell would read the same text. Returns null when the
+     * text cannot be a path on this system at all.
+     */
+    static Path userPath(String text) {
+        String trimmed = text == null ? "" : text.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        String home = System.getProperty("user.home", "");
+        if (trimmed.equals("~") && !home.isEmpty()) {
+            trimmed = home;
+        } else if (trimmed.startsWith("~/") && !home.isEmpty()) {
+            trimmed = home + trimmed.substring(1);
+        }
+        try {
+            return Path.of(trimmed).toAbsolutePath().normalize();
+        } catch (java.nio.file.InvalidPathException e) {
+            // A name this system's file-name encoding cannot represent. Under LANG=C that includes every
+            // non-ASCII character; the same hazard the scanner reports.
+            return null;
+        }
+    }
 
     private void browseDirectory(boolean isSource) {
         JTextField field = isSource ? sourcePathField : destPathField;

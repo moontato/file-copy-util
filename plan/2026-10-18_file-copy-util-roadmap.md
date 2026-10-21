@@ -631,3 +631,19 @@ Deliberately not done, and why:
 Also worth stating plainly: the case-insensitive *consequence* is reasoning, not measurement. The detector is
 tested; what a case-insensitive mount does to a transfer was not observed, because no such mount was available
 here.
+
+---
+
+# 1.3.0 — interface changes the owner asked for
+
+- **Editable source/destination fields.** Type a path, press Enter, both lists load. `~` and relative paths are
+  resolved the way a shell would. Changing a field clears the loaded lists deliberately: they are ticks against
+  paths in the directory that field *used* to name, and the alternative is a job whose selection came from
+  somewhere else. Fields lock while a job writes. Unspellable paths (locale encoding) get a named error instead of
+  an exception. `UiTheme.readOnlyField` deleted with it — its whole reason for existing was working around the
+  look-and-feel's "disabled" wash on non-editable fields.
+- **Version in the window**, muted at the bottom right, read from a build-stamped resource rather than a literal.
+  The rule this establishes: any number the interface shows about the build comes from the build.
+
+Verified: 160 tests, 0 SpotBugs findings, both palettes rendered offscreen to confirm the label placement and
+that the now-editable fields follow the theme in dark mode.

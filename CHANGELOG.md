@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0 — two interface changes
+
+- **The source and destination fields are editable.** Type a directory and press Enter to load both lists;
+  Browse still works and still starts in the directory already named. A typed path means what a shell would
+  mean: `~` is the home directory, a relative path is taken from where the program was started, surrounding
+  spaces are ignored. Changing a field **clears the loaded file lists and says so** — the rows on screen are
+  ticks against paths in the directory that field used to name, and keeping them would let a job run with a
+  selection from somewhere else. The fields lock while a job is writing. A directory name this system's
+  file-name encoding cannot spell now produces a dialog naming the encoding instead of an exception.
+- **The window reports its own version** in the quiet corner, bottom right, in muted caption text: `v1.3.0`. It
+  is read from a resource the build stamps with the project version
+  (`com/fileverifier/version.properties`), not a hardcoded string, so the number in the window cannot disagree
+  with the jar name, the tag, or the changelog. A build that stamps nothing prints `version unknown` rather than
+  a number that might be wrong. Hover it for the full name.
+- `UiTheme.readOnlyField` is gone: it existed to work around the "disabled" wash a non-editable field gets from
+  the look-and-feel, and there are no longer any non-editable path fields.
+
+Tests: 160, including a headless window test that types a path, presses Enter, waits for the lists to fill,
+changes the path, and asserts the stale rows are gone; and one that asserts the version the window shows is the
+version the build stamped.
 ## 1.2.2 — collisions, races, and engine bookkeeping
 
 Things the copy cannot see from inside, plus two pieces of state the engine should have owned all along.
