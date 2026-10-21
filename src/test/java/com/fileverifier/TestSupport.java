@@ -114,6 +114,51 @@ final class TestSupport {
         return script;
     }
 
+    /**
+     * A stand-in rsync that fails with {@code exitCode} after leaving {@code partialFile} behind in the
+     * destination, which is what a killed transfer actually does.
+     */
+    static Path failingFakeRsync(Path dir, String output, int exitCode, String partialFile) throws IOException {
+        Path script = dir.resolve("fake-failing-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("printf '%s\\n' ").append(shellQuote(output)).append('\n');
+        if (partialFile != null) {
+            body.append("dst=$(eval echo \"\\${$#}\")\n");
+            body.append(": > \"$dst/").append(partialFile).append("\"\n");
+        }
+        body.append("exit ").append(exitCode).append('\n');
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
+    /**
+     * A stand-in rsync that transfers nothing but edits a source file while it is "running", which is how
+     * a file can move underneath a copy whose digests were taken before it started. The source directory
+     * is the second-to-last argument.
+     */
+    static Path mutatingFakeRsync(Path dir, String output, String mutationRelPath, String newContent,
+                                  int exitCode) throws IOException {
+        Path script = dir.resolve("fake-mutating-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("printf '%s\\n' ").append(shellQuote(output)).append('\n');
+        body.append("src=$(eval echo \"\\${$(($# - 1))}\")\n");
+        body.append("printf '%s' ").append(shellQuote(newContent)).append(" > \"$src/")
+            .append(mutationRelPath).append("\"\n");
+        body.append("exit ").append(exitCode).append('\n');
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
     static Path write(Path file, String content) throws IOException {
         if (file.getParent() != null) {
             Files.createDirectories(file.getParent());

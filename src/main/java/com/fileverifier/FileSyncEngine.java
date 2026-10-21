@@ -11,6 +11,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -18,6 +19,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Predicate;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -100,7 +102,21 @@ public class FileSyncEngine implements AutoCloseable {
     private static final Pattern RSYNC_TEMP_NAME = Pattern.compile("^\\.(.+)\\.([A-Za-z0-9]{6})$");
 
     private static final AtomicReference<String> RSYNC_BINARY = new AtomicReference<>("rsync");
-    private static final AtomicReference<Boolean> RSYNC_AVAILABLE = new AtomicReference<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, Boolean> RSYNC_AVAILABLE
+            = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Engines share the process default unless one of them asks for something else. */
+    private volatile String rsyncOverride;
+
+    /** Destinations with a live job in this program. Released by {@link #finishJob}. */
+    private static final Set<String> DESTINATIONS_IN_USE =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final AtomicReference<String> reservedDestination = new AtomicReference<>();
+
+    /** Preflight as this engine would run it, including its own rsync override. */
+    public List<String> preflight(JobRequest request) {
+        return validate(request, rsyncBinaryInUse());
+    }
 
     public interface ProgressListener {
         /** Called on phase transitions: "copying", "verifying", "done". */
@@ -381,6 +397,10 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     private JobResult finishJob(JobResult result, ProgressListener listener) {
+        String reserved = reservedDestination.getAndSet(null);
+        if (reserved != null) {
+            DESTINATIONS_IN_USE.remove(reserved);
+        }
         lastResult = result;
         status.set(result.status());
         deadline.set(0L);
@@ -418,6 +438,11 @@ public class FileSyncEngine implements AutoCloseable {
      * not providing the safety.
      */
     public static List<String> validate(JobRequest request) {
+        return validate(request, rsyncBinary());
+    }
+
+    /** Preflight against a specific rsync binary, which is what an engine with an override needs. */
+    public static List<String> validate(JobRequest request, String rsyncBinary) {
         List<String> problems = new ArrayList<>();
         Path source = request.sourceDir();
         Path dest = request.destDir();
@@ -445,16 +470,21 @@ public class FileSyncEngine implements AutoCloseable {
                         + "the tree it is reading: " + dest);
             }
         }
-        if (copies && !isRsyncAvailable()) {
-            problems.add("rsync was not found (looked for '" + rsyncBinary()
+        if (copies && !isRsyncAvailable(rsyncBinary)) {
+            problems.add("rsync was not found (looked for '" + rsyncBinary
                     + "'). Install rsync, or use Verify Only, which needs no rsync.");
         }
         return problems;
     }
 
-    /** Is the rsync binary present and runnable? Probed once and cached. */
+    /** Is the process default rsync present and runnable? */
     public static boolean isRsyncAvailable() {
-        Boolean cached = RSYNC_AVAILABLE.get();
+        return isRsyncAvailable(rsyncBinary());
+    }
+
+    /** Is this rsync present and runnable? Probed once per binary and cached. */
+    public static boolean isRsyncAvailable(String binary) {
+        Boolean cached = RSYNC_AVAILABLE.get(binary);
         if (cached != null) {
             return cached;
         }
@@ -462,7 +492,7 @@ public class FileSyncEngine implements AutoCloseable {
         try {
             // "Available" means runnable, not healthy: a missing binary fails to start at all, while
             // a runnable one that exits non-zero is a problem the job itself should report.
-            Process probe = new ProcessBuilder(List.of(rsyncBinary(), "--version"))
+            Process probe = new ProcessBuilder(List.of(binary, "--version"))
                     .redirectErrorStream(true)
                     .start();
             probe.getInputStream().close();
@@ -475,18 +505,34 @@ public class FileSyncEngine implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
-        RSYNC_AVAILABLE.compareAndSet(null, available);
+        RSYNC_AVAILABLE.putIfAbsent(binary, available);
         return available;
     }
 
-    /** Test seam: point the engine at a different rsync (or a non-existent one). */
+    /**
+     * Process-wide default, and the test seam: engines with no override of their own use this.
+     */
     static void setRsyncBinary(String binary) {
         RSYNC_BINARY.set(binary == null || binary.isBlank() ? "rsync" : binary);
-        RSYNC_AVAILABLE.set(null);
+        RSYNC_AVAILABLE.clear();
     }
 
     static String rsyncBinary() {
         return RSYNC_BINARY.get();
+    }
+
+    /**
+     * Use a different rsync for this engine only. Pointing the whole process at a binary was a hidden
+     * coupling: a GUI and a CLI job in one JVM would have to agree about which rsync the other runs.
+     */
+    public void useRsync(String binary) {
+        rsyncOverride = binary == null || binary.isBlank() ? null : binary;
+    }
+
+    /** The rsync this engine runs: its own override if it has one, otherwise the process default. */
+    public String rsyncBinaryInUse() {
+        String override = rsyncOverride;
+        return override != null ? override : rsyncBinary();
     }
 
     private static Path canonical(Path path) {
@@ -507,10 +553,23 @@ public class FileSyncEngine implements AutoCloseable {
         Path sourceDir = request.sourceDir().toAbsolutePath();
         Path destDir = request.destDir().toAbsolutePath();
 
-        List<String> problems = validate(request);
+        List<String> problems = validate(request, rsyncBinaryInUse());
         if (!problems.isEmpty()) {
             return failure("Preflight failed: " + String.join("; ", problems), problems, List.of(), 0);
         }
+
+        // One job per destination per program. Two jobs writing the same directory interleave: each sees
+        // the other's files as its own results, and a partial-transfer report can name a file the other
+        // job is still writing. This is an in-process guard, not a lock - a second process is a different
+        // story, and writing a lock file into someone's destination tree is not a decision to make here.
+        String destinationKey = canonical(destDir).toString();
+        if (!DESTINATIONS_IN_USE.add(destinationKey)) {
+            return failure("Another job in this program is already using the destination " + destDir
+                    + ". Wait for it to finish, or point this job at a different directory: two jobs writing"
+                    + " one directory produce numbers neither of them can vouch for.",
+                    List.of("destination busy: " + destinationKey), List.of(), 0);
+        }
+        reservedDestination.set(destinationKey);
 
         Selection src = normalize(request.sourceSelection());
         Selection dst = normalize(request.destinationSelection());
@@ -582,6 +641,19 @@ public class FileSyncEngine implements AutoCloseable {
         if (!notFound.isEmpty()) {
             warnings.add(notFound.size() + " selected file(s) were not found in the source and were not "
                     + "touched: " + notFoundText + ".");
+        }
+
+        // Two names that differ only by case, or only by how an accent is composed, are two files here and
+        // one file on a case-insensitive or normalising destination - a Windows share, exFAT, some macOS
+        // volumes. On a case-sensitive filesystem nothing is wrong, so this names the risk instead of
+        // refusing the job. What it must not do is overwrite one file with the other and then report a
+        // mismatch as if the copy had been honest.
+        List<String> collisions = collidingNames(workSet);
+        if (!collisions.isEmpty()) {
+            warnings.add(collisions.size() + " name collision(s) in the work set: "
+                    + describeNames(collisions) + ". These names differ only by case or by how an accent is"
+                    + " composed. On a case-insensitive or normalising destination they are the same file,"
+                    + " and the later transfer overwrites the earlier one.");
         }
 
         int rsyncExitCode = 0;
@@ -919,6 +991,7 @@ public class FileSyncEngine implements AutoCloseable {
         List<Future<Verdict>> futures = new ArrayList<>(Math.min(total, 1024));
         Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> unfollowedLinks = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> sourceMoved = java.util.concurrent.ConcurrentHashMap.newKeySet();
         try {
             for (int index = 0; index < total; index++) {
                 if (abortRequested()) {
@@ -926,7 +999,7 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 final int i = index;
                 futures.add(pool.submit(() -> verdict(i, workSet, extras, destDir, knownSourceHashes,
-                        readProblems, unfollowedLinks)));
+                        readProblems, unfollowedLinks, sourceMoved)));
             }
         } finally {
             pool.shutdown();
@@ -968,6 +1041,14 @@ public class FileSyncEngine implements AutoCloseable {
         for (String problem : readProblems) {
             warnings.add("Could not read file: " + problem);
         }
+        if (!sourceMoved.isEmpty()) {
+            List<String> moved = new ArrayList<>(sourceMoved);
+            Collections.sort(moved);
+            warnings.add(moved.size() + " file(s) changed in the source while the job ran: "
+                    + describeNames(moved) + ". Their comparison is against the digest taken before the copy"
+                    + " started, so the difference here is a file that moved during the job rather than one"
+                    + " the copy damaged.");
+        }
         for (String rel : unfollowedLinks) {
             warnings.add("Not compared: the destination holds a symbolic link at " + rel
                     + " where a file was expected, and this tool does not follow links, so the contents "
@@ -981,7 +1062,7 @@ public class FileSyncEngine implements AutoCloseable {
 
     private Verdict verdict(int index, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
                             Map<String, String> knownSourceHashes, Set<String> readProblems,
-                            Set<String> unfollowedLinks)
+                            Set<String> unfollowedLinks, Set<String> sourceMoved)
             throws NoSuchAlgorithmException {
         if (abortRequested()) {
             return null;
@@ -1028,6 +1109,16 @@ public class FileSyncEngine implements AutoCloseable {
         }
         if (destHash == null) {
             return new Verdict("MISSING", rel, sourceHash, null);
+        }
+        // A copy verifies against the digest taken before the transfer started. If the source has moved
+        // since then, the honest description is a file that changed under the job, not one that was
+        // damaged by it - and only a copy has a pre-transfer digest to make that distinction.
+        String beforeCopy = knownSourceHashes.get(rel);
+        if (beforeCopy != null) {
+            String now = hashFile(sourceEntry.absolutePath(), rel, readProblems);
+            if (now != null && !now.equals(beforeCopy)) {
+                sourceMoved.add(rel);
+            }
         }
         // A source file that exists but could not be hashed is not "missing": reporting it as such
         // would hide an unreadable file behind a word that means "not there".
@@ -1158,7 +1249,7 @@ public class FileSyncEngine implements AutoCloseable {
     private List<String> buildRsyncCommand(Path sourceDir, Path destDir, Path filesFrom, ScanOptions options,
                                            boolean dryRun) {
         List<String> command = new ArrayList<>();
-        command.add(rsyncBinary());
+        command.add(rsyncBinaryInUse());
         command.add("-a");
         command.add("--checksum");
         command.add("--itemize-changes");
@@ -1334,6 +1425,35 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /** Names for a message: the first few sorted ones, then how many more there are. */
+    /**
+     * Groups of work-set paths that would name the same file on a case-insensitive or normalising
+     * destination. A group is only a collision when it holds more than one distinct path.
+     */
+    static List<String> collidingNames(Collection<FileEntry> entries) {
+        Map<String, List<String>> byKey = new TreeMap<>();
+        for (FileEntry entry : entries) {
+            byKey.computeIfAbsent(collisionKey(entry.relPath()), key -> new ArrayList<>()).add(entry.relPath());
+        }
+        List<String> collisions = new ArrayList<>();
+        for (List<String> group : byKey.values()) {
+            if (group.size() > 1) {
+                Collections.sort(group);
+                collisions.add(String.join(" / ", group));
+            }
+        }
+        return collisions;
+    }
+
+    /**
+     * What a case-insensitive or Unicode-normalising filesystem would treat as one name: composed form
+     * first, then case-folded. The directory part is part of the key, because {@code A.txt} and
+     * {@code sub/a.txt} are different files even on such a destination.
+     */
+    static String collisionKey(String relPath) {
+        return java.text.Normalizer.normalize(relPath, java.text.Normalizer.Form.NFC)
+                .toLowerCase(java.util.Locale.ROOT);
+    }
+
     static String describeNames(List<String> names) {
         int shown = Math.min(names.size(), 10);
         String head = String.join(", ", names.subList(0, shown));

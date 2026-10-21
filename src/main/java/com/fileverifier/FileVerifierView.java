@@ -836,7 +836,7 @@ public final class FileVerifierView extends JPanel {
 
         // Preflight before touching anything, so the user gets one clear dialog instead of a
         // failed job in the log. The engine repeats every check itself.
-        List<String> problems = FileSyncEngine.validate(request);
+        List<String> problems = engine.preflight(request);
         if (!problems.isEmpty()) {
             JOptionPane.showMessageDialog(this, String.join("\n", problems),
                 "Preflight failed", JOptionPane.ERROR_MESSAGE);
