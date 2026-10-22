@@ -98,8 +98,11 @@
   the interval is refused rather than overwritten; where hard links are unavailable the fallback creates the file
   and writes only into the file just created. `ATOMIC_MOVE` was the first attempt and is gone: an atomic rename
   is still `rename(2)`, which is permitted to replace an existing target, so it was never the guarantee it was
-  taken for. `--csv`/`--json` no longer create a missing directory: a path that does not exist is a mistake to
-  report.
+  taken for - measured here: on OpenJDK 17.0.20.1+1 (`sun.nio.fs.LinuxFileSystemProvider`),
+  `Files.move(temp, existing, ATOMIC_MOVE)` against an existing target succeeded and the target took the temporary
+  file's bytes; `UnixCopyFile.move` calls `rename` in its atomic branch and returns before the
+  `FileAlreadyExistsException` check. `--csv`/`--json` no longer create a missing directory: a path that does not
+  exist is a mistake to report.
 - **Report paths are checked before the job starts.** An existing or forbidden target, a missing parent
   directory, `--csv` and `--json` naming the same file, or an in-tree report that has not been allowed is a
   usage error (exit 2) and nothing is copied. The old order - start the copy, write one report, then refuse the

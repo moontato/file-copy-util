@@ -488,9 +488,14 @@ instead of overwritten, and the bytes published are the bytes that were validate
 hard link, the fallback is `Files.createFile(target)` - which fails if anything is already there - and only then
 copying the content into the file just created, never into a file that was already there.
 
-`ATOMIC_MOVE` was the first implementation and is deliberately gone. An atomic rename is still `rename(2)`, and
-`rename` is permitted to *replace* an existing target; building "never overwrites" on it was an assumption about
-the platform rather than a guarantee from it.
+`ATOMIC_MOVE` was the first implementation and is deliberately gone, because it was measured rather than assumed.
+OpenJDK 17's `UnixCopyFile.move` (java.base/sun/nio/fs/UnixCopyFile.java) takes the atomic branch first - line
+406 `if (flags.atomicMove)`, line 408 `rename(source, target)`, then `return` - so the no-replacement check at line
+448 (`throw new FileAlreadyExistsException`) sits in the *non*-atomic path and is never reached. Measured on this
+machine (OpenJDK 17.0.20.1+1, `sun.nio.fs.LinuxFileSystemProvider`): `Files.move(temp, existing, ATOMIC_MOVE)`
+against an existing target **succeeded** and the target held the temporary file's bytes. A no-clobber guarantee
+cannot be built on a rename; it has to be built on an operation that cannot replace, which is what link-and-create
+does.
 
 **When a report problem shows up decides the exit code.** Report paths are validated before the job starts, so
 an existing target, a missing parent directory, `--csv` and `--json` naming one path, or an in-tree report that
