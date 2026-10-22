@@ -50,7 +50,7 @@ import java.util.regex.Pattern;
  *
  * <p><b>Work set.</b> Every job is driven by the caller's {@link Selection}s:
  * <ul>
- *   <li>COPY_AND_VERIFY: selected source files (their directories are implied by
+ *   <li>COPY_AND_VERIFY and COPY_ONLY: selected source files (their directories are implied by
  *       {@code --files-from}). Selected destination rows are ignored - copying is source-driven.</li>
  *   <li>VERIFY_ONLY: selected source files, minus rows the user explicitly unticked in the
  *       destination list; plus files found only at the destination when
@@ -60,9 +60,12 @@ import java.util.regex.Pattern;
  * destination list that is out of date can never silently skip a file the user asked to verify. A
  * file present only at the destination is reported as "extra".
  *
- * <p><b>Verification is hash-based.</b> Copy &amp; Verify hashes each selected source file once,
- * before {@code rsync} runs, and compares those digests against the copies after {@code rsync}
- * exits; the source is therefore read exactly once per job. Verify Only hashes both sides. Hashing
+ * <p><b>Verification is hash-based, and it is optional.</b> A verifying job hashes each selected
+ * source file once, before {@code rsync} runs, and compares those digests against the copies after
+ * {@code rsync} exits; the source is therefore read exactly once per job. Verify Only hashes both
+ * sides. A job with verification turned off hashes nothing at all - reading every file to compute a
+ * digest nobody asked for is the expensive part of the job - and its results are the files rsync
+ * reported as written, each recorded as COPIED rather than as a verdict. Hashing
  * runs on a small bounded pool, but classification and per-file callbacks happen in work-set order
  * so counters and log order stay deterministic.
  *
@@ -78,11 +81,46 @@ import java.util.regex.Pattern;
  */
 public class FileSyncEngine implements AutoCloseable {
 
-    public enum JobType { COPY_AND_VERIFY, VERIFY_ONLY }
+    /**
+     * What a job does. The interface expresses this as two controls rather than three modes: whether
+     * the job copies, and whether it also compares hashes afterwards.
+     *
+     * <ul>
+     *   <li>{@link #COPY_AND_VERIFY}: copy the selection, then compare it.</li>
+     *   <li>{@link #COPY_ONLY}: copy the selection and report what was written, comparing nothing.</li>
+     *   <li>{@link #VERIFY_ONLY}: compare, and never run rsync at all. This is the only way to look at
+     *       a backup without touching it, which is why it stays a mode and not a checkbox.</li>
+     * </ul>
+     */
+    public enum JobType {
+        COPY_AND_VERIFY, COPY_ONLY, VERIFY_ONLY;
+
+        /** True when rsync runs, so files can be written. */
+        public boolean copies() {
+            return this != VERIFY_ONLY;
+        }
+
+        /** True when digests are compared and each file in the work set gets a verdict. */
+        public boolean verifies() {
+            return this != COPY_ONLY;
+        }
+
+        /** How the job announces itself to a human. */
+        public String describe() {
+            return switch (this) {
+                case COPY_AND_VERIFY -> "Copy and verify";
+                case COPY_ONLY -> "Copy only (verification off)";
+                case VERIFY_ONLY -> "Verify only (nothing is copied)";
+            };
+        }
+    }
     public enum JobStatus { IDLE, RUNNING, COMPLETED, FAILED }
 
     /** Copy phase occupies 0..70% of the bar, verification 70..100%. */
     static final int COPY_PROGRESS_END = 70;
+
+    /** How long the tree gets to stop itself before it is killed outright. */
+    private static final int TERM_GRACE_SECONDS = 3;
     /** Deadline enforcement granularity. */
     static final long WATCHDOG_PERIOD_MS = 250;
     /** No deadline (default). */
@@ -96,6 +134,14 @@ public class FileSyncEngine implements AutoCloseable {
 
     /** rsync progress line, e.g. "  1,500,000,006  99%  975.13MB/s  0:00:01 (xfr#2, to-chk=2/4)". */
     private static final Pattern RSYNC_PERCENT = Pattern.compile("^\\s+[\\d,]+\\s+(\\d{1,3})%");
+
+    /**
+     * A {@code --info=progress2} stats line: bytes transferred so far, the overall percentage, a rate,
+     * and an elapsed time. The percentage is of the whole transfer, not of the file in flight, so the
+     * per-file figure has to be derived from it.
+     */
+    private static final Pattern RSYNC_TRANSFER = Pattern.compile(
+            "^\\s+([\\d,]+)\\s+(\\d{1,3})%\\s+([\\d.]+\\s*[kMG]?B/s)\\s+(\\d+:\\d+:\\d+)");
     /** rsync's own completed-transfer counter in the same line: "(xfr#2, to-chk=2/4)". */
     private static final Pattern RSYNC_XFR = Pattern.compile("xfr#(\\d+)");
     /** A partial transfer rsync left behind: ".big.bin.YC9p2z". */
@@ -184,9 +230,11 @@ public class FileSyncEngine implements AutoCloseable {
 
     /**
      * One verified file's outcome, with full digests so a report can be exported from it. {@code kind}
-     * is {@code OK}, {@code MISMATCH}, {@code MISSING} or {@code EXTRA}; a hash is null when that side
-     * had no file. A COPIED event is not an outcome - it is a transfer, and the same file gets a
-     * verification outcome afterwards.
+     * is {@code OK}, {@code MISMATCH}, {@code MISSING}, {@code EXTRA} or {@code COPIED}; a hash is null
+     * when that side had no file, which is also the case for every COPIED row. A verifying job reports
+     * the verdict instead of COPIED: the same file does not appear twice, once as a transfer and once as
+     * a result. COPIED appears only when verification is off, where the transfer is the only fact the
+     * job knows, and it is deliberately not coloured like a passed check - nothing was checked.
      */
     public record FileOutcome(String relPath, String kind, String sourceHash, String destHash) {
     }
@@ -214,6 +262,13 @@ public class FileSyncEngine implements AutoCloseable {
     private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
     private volatile boolean closed;
     private final AtomicReference<Process> liveProcess = new AtomicReference<>();
+    /**
+     * Every process the live rsync had spawned, snapshotted while the parent was still alive. A local
+     * rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only the one Java started
+     * leaves the other two reading the source after this program has exited. The snapshot is refreshed
+     * when the job ends, because a child forked after the first snapshot would otherwise never be seen.
+     */
+    private final AtomicReference<List<ProcessHandle>> spawnedTree = new AtomicReference<>(List.of());
     private final AtomicLong deadline = new AtomicLong(0L);
     private final AtomicLong startedAt = new AtomicLong(0L);
     private final AtomicLong lastActivityAt = new AtomicLong(0L);
@@ -446,7 +501,7 @@ public class FileSyncEngine implements AutoCloseable {
         List<String> problems = new ArrayList<>();
         Path source = request.sourceDir();
         Path dest = request.destDir();
-        boolean copies = request.jobType() == JobType.COPY_AND_VERIFY;
+        boolean copies = request.jobType().copies();
 
         if (source == null || !Files.isDirectory(source)) {
             problems.add("Source is not a directory: " + source);
@@ -574,7 +629,8 @@ public class FileSyncEngine implements AutoCloseable {
         Selection src = normalize(request.sourceSelection());
         Selection dst = normalize(request.destinationSelection());
         ScanOptions options = request.scanOptions();
-        boolean verifyOnly = request.jobType() == JobType.VERIFY_ONLY;
+        boolean copies = request.jobType().copies();
+        boolean verifies = request.jobType().verifies();
 
         if (src.selected().isEmpty() && dst.selected().isEmpty()) {
             return failure("No files were selected: an empty selection means no files, not all files.",
@@ -595,7 +651,7 @@ public class FileSyncEngine implements AutoCloseable {
                 continue;
             }
             // Exclusion requires a destination row the user actually saw and left unticked.
-            if (excludedAtDestination(dst, rel, verifyOnly)) {
+            if (excludedAtDestination(dst, rel, !copies)) {
                 continue;
             }
             workSet.add(entry);
@@ -605,7 +661,7 @@ public class FileSyncEngine implements AutoCloseable {
         // at the top of the job keeps that scan inside a frame that ends immediately: on a 300k-file tree
         // its entry list was tens of megabytes held for the whole job for information one checkbox asks
         // for. With the checkbox off the scan does not happen at all.
-        DestinationSides destination = verifyOnly && request.detectExtraFiles()
+        DestinationSides destination = !copies && request.detectExtraFiles()
                 ? scanDestinationSides(destDir, options, sourceRels, dst)
                 : new DestinationSides(List.of(), List.of());
         List<FileEntry> extras = destination.extras();
@@ -664,13 +720,33 @@ public class FileSyncEngine implements AutoCloseable {
         // Where each selected file would land: used to recognise the hidden partial files a killed
         // rsync leaves behind (see interruptedTempFiles).
         List<Path> destinationTargets = new ArrayList<>();
+        // When verification is off, the names rsync announced are the job's whole record of what it
+        // wrote, and they become the COPIED rows. When it is on they are redundant - every file gets a
+        // verdict row - so nothing is retained.
+        List<String> copiedPaths = new ArrayList<>();
 
-        if (!verifyOnly) {
-            listener.onPhase(dryRun ? "dry run" : "copying");
-            jobPhase = "copy";
-            progress.update(0, "Hashing " + workSet.size() + " source file(s) before copying...");
+        if (copies && verifies) {
+            // Its own phase, because it is its own wait: hashing reads the whole source before rsync has
+            // written a single byte, and calling that "copying" is exactly how a job looks stalled on the
+            // first file for an hour with an empty destination folder.
+            listener.onPhase("hashing source");
+            jobPhase = "hash";
+            progress.update(0, "Hashing " + workSet.size()
+                    + " source file(s) - nothing is written to the destination during this part...");
             // Hashed once, before the copy: these same digests are reused for the comparison below.
             sourceHashes = hashFiles(workSet, "source", warnings);
+        }
+
+        if (copies) {
+            listener.onPhase(dryRun ? "dry run" : "copying");
+            jobPhase = "copy";
+            if (verifies) {
+                progress.update(0, "Transferring " + workSet.size() + " file(s)...");
+            } else {
+                // Reading every file to compute a digest that nothing will use is the expensive part of
+                // the job, so a job that will not compare reads nothing until rsync does.
+                progress.update(0, "Copying without verification: source files are not hashed.");
+            }
 
             for (FileEntry entry : workSet) {
                 destinationTargets.add(destDir.resolve(entry.relPath()));
@@ -682,27 +758,47 @@ public class FileSyncEngine implements AutoCloseable {
                         + "carriage return or NUL byte); deselect them and retry.", errors, warnings, 0);
             }
             try {
+                // Asked to stop, and rsync has not started yet: starting it now would put a process on the
+                // source disk that nothing in this program is watching any more.
+                if (cancelRequested.get()) {
+                    return abortedBeforeTransfer("Job cancelled before rsync started: no file was transferred.",
+                            outcomes, errors, warnings, verifies);
+                }
+                if (timeoutWasTriggered()) {
+                    return abortedBeforeTransfer("Job aborted: it exceeded the " + jobTimeoutMillis
+                            + " ms timeout before rsync started.", outcomes, errors, warnings, verifies);
+                }
+
                 Process process = new ProcessBuilder(
                         buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
                         .redirectErrorStream(true)
                         .start();
                 liveProcess.set(process);
+                spawnedTree.set(snapshotTree(process));
+                // A cancellation that landed between the check above and the spawn still has to reach this
+                // process, because the person who pressed Cancel has already been told the job stopped.
+                if (cancelRequested.get() || deadlineExceeded()) {
+                    terminateRsync();
+                }
 
-                int copied = pumpRsyncOutput(process, progress, errors, warnings, listener, dryRun);
+                int copied = pumpRsyncOutput(process, sourceDir, progress, errors, warnings, listener, dryRun,
+                        verifies ? null : copiedPaths);
                 rsyncExitCode = process.waitFor();
+                sweepRsyncTree(process);
                 markActivity("rsync exit " + rsyncExitCode);
 
                 if (timeoutWasTriggered()) {
-                    return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
+                    return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun,
+                            verifies);
                 }
                 if (cancelRequested.get()) {
                     return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
-                            destinationTargets, dryRun);
+                            destinationTargets, dryRun, verifies);
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
                     return rsyncFailedDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
-                            destinationTargets, dryRun);
+                            destinationTargets, dryRun, verifies);
                 }
                 if (rsyncExitCode == 24) {
                     warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
@@ -713,17 +809,45 @@ public class FileSyncEngine implements AutoCloseable {
             }
         }
 
+        if (!verifies) {
+            // Nothing was compared, so the transfer is the only fact known about each file. Without these
+            // rows a copy-only job leaves an empty Results tab and an empty export, which reads as though
+            // nothing happened when hundreds of files were in fact written.
+            // A dry run wrote nothing, so its rows are named for what would have happened. An export that
+            // says COPIED for a file that was never written would be a record of an event that did not occur.
+            String copyKind = dryRun ? "WOULD_COPY" : "COPIED";
+            for (String rel : copiedPaths) {
+                recordOutcome(outcomes, listener, rel, copyKind, null, null);
+            }
+            if (progress.copied() > copiedPaths.size()) {
+                warnings.add("Only the first " + copiedPaths.size() + " copied file(s) are listed; the copy"
+                        + " reported " + progress.copied() + ". Raise the results limit (--max-results) if"
+                        + " the export must name every file.");
+            }
+            if (timeoutWasTriggered()) {
+                return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+            }
+            if (cancelRequested.get()) {
+                return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
+                        destinationTargets, dryRun, verifies);
+            }
+            progress.finish(dryRun ? "Dry run complete" : "Copy complete");
+            listener.onPhase("done");
+            return completedResult(progress, outcomes, errors, warnings, rsyncExitCode, dryRun,
+                    request.jobType());
+        }
+
         listener.onPhase("verifying");
         jobPhase = "verify";
-        progress.verifyStart(!verifyOnly);
+        progress.verifyStart(copies);
 
-        if (verifyOnly) {
+        if (!copies) {
             sourceHashes = Map.of();
         }
         verifyEntries(workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
-                warnings, verifyOnly);
+                warnings, !copies);
         if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
+            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
         if (cancelRequested.get()) {
             return cancelledDuringVerify(progress, outcomes, errors, warnings);
@@ -735,7 +859,7 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun);
+            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
         if (cancelRequested.get()) {
             return cancelledDuringVerify(progress, outcomes, errors, warnings);
@@ -743,7 +867,36 @@ public class FileSyncEngine implements AutoCloseable {
 
         progress.finish("Verification complete");
         listener.onPhase("done");
+        return completedResult(progress, outcomes, errors, warnings, rsyncExitCode, dryRun, request.jobType());
+    }
 
+    /**
+     * The COMPLETED result, built the same way whether it came out of a copy, a comparison, or both.
+     * A job whose verification was switched off says so here as well as in the warnings: a copy that was
+     * never compared has to be readable as that, and not mistaken for a copy that passed.
+     */
+    private JobResult completedResult(ProgressReporter progress, List<FileOutcome> outcomes, List<String> errors,
+                                      List<String> warnings, int rsyncExitCode, boolean dryRun, JobType jobType) {
+        if (dryRun && jobType.copies()) {
+            warnings.add(0, "Dry run: rsync ran with --dry-run, so no file was written or changed.");
+        }
+        if (!jobType.verifies()) {
+            warnings.add("Verification was turned off: no file was hashed or compared. This job reports what"
+                    + " was copied, not whether the copies are correct.");
+        }
+        return new JobResult(JobStatus.COMPLETED, completionMessage(progress, dryRun, jobType),
+                progress.processed(), progress.matched(), progress.mismatched(), progress.missing(),
+                progress.extra(), progress.copied(), rsyncExitCode, outcomes, errors, warnings);
+    }
+
+    private static String completionMessage(ProgressReporter progress, boolean dryRun, JobType jobType) {
+        if (!jobType.verifies()) {
+            return dryRun
+                ? "Dry run - nothing was written: " + progress.copied()
+                    + " file(s) would have been copied. Verification was turned off, so nothing was compared."
+                : "Copy complete: " + progress.copied() + " file(s) copied. Verification was turned off, so"
+                    + " none of them were compared.";
+        }
         StringBuilder message = new StringBuilder(dryRun ? "Dry run - nothing was written: " : "Job complete: ")
                 .append(progress.matched()).append(" matched, ")
                 .append(progress.mismatched()).append(" mismatched, ")
@@ -752,13 +905,7 @@ public class FileSyncEngine implements AutoCloseable {
         if (progress.extra() > 0) {
             message.append(", ").append(progress.extra()).append(" destination-only");
         }
-        message.append(".");
-        if (dryRun && !verifyOnly) {
-            warnings.add(0, "Dry run: rsync ran with --dry-run, so no file was written or changed.");
-        }
-        return new JobResult(JobStatus.COMPLETED, message.toString(),
-                progress.processed(), progress.matched(), progress.mismatched(), progress.missing(),
-                progress.extra(), progress.copied(), rsyncExitCode, outcomes, errors, warnings);
+        return message.append(".").toString();
     }
 
     /** Records one verification outcome and the matching streaming-log callback (short hashes). */
@@ -779,12 +926,13 @@ public class FileSyncEngine implements AutoCloseable {
      */
     private JobResult rsyncFailedDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
                                             int exitCode, List<String> errors, List<String> warnings,
-                                            List<Path> destinationTargets, boolean dryRun) {
+                                            List<Path> destinationTargets, boolean dryRun, boolean verifies) {
         int announced = progress.copied();
         int completed = completedTransfers(progress, announced, dryRun);
         String message = "rsync failed (exit code " + exitCode + "): "
                 + transfersPhrase(progress, announced, completed, dryRun)
-                + ". Nothing was verified; files already in the destination were left as they are.";
+                + ". " + (verifies ? "Nothing was verified" : "Verification was off")
+                + "; files already in the destination were left as they are.";
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(interruptedTempFiles(destinationTargets)));
         return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
@@ -794,13 +942,15 @@ public class FileSyncEngine implements AutoCloseable {
 
     private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
                                           int exitCode, List<String> errors, List<String> warnings,
-                                          List<Path> destinationTargets, boolean dryRun) {
+                                          List<Path> destinationTargets, boolean dryRun, boolean verifies) {
         int announced = progress.copied();
         int completed = completedTransfers(progress, announced, dryRun);
+        String checked = verifies
+                ? progress.processed() + " file(s) were verified (matched: " + progress.matched()
+                    + ", mismatched: " + progress.mismatched() + ", missing: " + progress.missing() + ")"
+                : "verification was off, so nothing was compared";
         String message = "Job cancelled by the user: " + transfersPhrase(progress, announced, completed, dryRun)
-                + ", and " + progress.processed() + " file(s) were verified (matched: "
-                + progress.matched() + ", mismatched: " + progress.mismatched() + ", missing: "
-                + progress.missing() + "). rsync exit code: " + exitCode + ".";
+                + ", and " + checked + ". rsync exit code: " + exitCode + ".";
         List<String> leftovers = interruptedTempFiles(destinationTargets);
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(leftovers));
@@ -855,12 +1005,13 @@ public class FileSyncEngine implements AutoCloseable {
 
     private JobResult timeoutResult(ProgressReporter progress, List<FileOutcome> outcomes,
                                     List<String> errors, List<String> warnings, List<Path> destinationTargets,
-                                    boolean dryRun) {
+                                    boolean dryRun, boolean verifies) {
         int announced = progress.copied();
         int completed = completedTransfers(progress, announced, dryRun);
         String message = "Job aborted: it exceeded the " + jobTimeoutMillis + " ms timeout. "
                 + transfersPhrase(progress, announced, completed, dryRun) + ", and "
-                + progress.processed() + " file(s) were verified.";
+                + (verifies ? progress.processed() + " file(s) were verified."
+                    : "verification was off, so nothing was compared.");
         List<String> extended = new ArrayList<>(warnings);
         extended.add("Increase or clear the job timeout if this job is expected to take longer.");
         if (!destinationTargets.isEmpty()) {
@@ -1035,7 +1186,7 @@ public class FileSyncEngine implements AutoCloseable {
             }
             recordOutcome(outcomes, listener, verdict.relPath(), verdict.kind(),
                     verdict.sourceHash(), verdict.destHash());
-            progress.verifiedFile(!verifyOnly);
+            progress.verifiedFile(!verifyOnly, verdict.relPath());
         }
 
         for (String problem : readProblems) {
@@ -1271,11 +1422,14 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /**
-     * Reads merged rsync stdout/stderr until the process exits, reporting copy progress as it goes.
-     * Returns the number of files rsync announced as transferring.
+     * Reads rsync's output until it ends, reporting progress as it goes, and returns the number of files
+     * rsync announced. When {@code copiedNames} is non-null it also collects the announced names, for a
+     * job with verification off: those names are that job's only record of what it wrote, and they become
+     * its result rows.
      */
-    private int pumpRsyncOutput(Process process, ProgressReporter progress, List<String> errors,
-                                List<String> warnings, ProgressListener listener, boolean dryRun)
+    private int pumpRsyncOutput(Process process, Path sourceDir, ProgressReporter progress, List<String> errors,
+                                List<String> warnings, ProgressListener listener, boolean dryRun,
+                                List<String> copiedNames)
             throws IOException {
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
@@ -1291,13 +1445,25 @@ public class FileSyncEngine implements AutoCloseable {
                     // announced file from a completed one.
                     progress.rsyncTransfers(Integer.parseInt(xfr.group(1)));
                 }
-                int percent = rsyncTransferPercent(line);
-                if (percent >= 0) {
-                    // rsync's own global percentage: the only trustworthy copy-progress signal, since
-                    // itemize lines appear before the file's data has moved. A --dry-run reports a
+                Matcher transfer = RSYNC_TRANSFER.matcher(line);
+                if (transfer.find()) {
+                    // rsync's own stats line: bytes moved so far and the percentage of the whole transfer.
+                    // The per-file figure is derived from these by the reporter. A --dry-run reports a
                     // meaningless 100% instantly, so it is ignored there.
                     if (!dryRun) {
-                        progress.rsyncPercent(percent);
+                        progress.transferStats(Long.parseLong(transfer.group(1).replace(",", "")),
+                                Integer.parseInt(transfer.group(2)),
+                                transfer.group(3).replaceAll("\\s+", " "), transfer.group(4));
+                    }
+                    markActivity(line.trim());
+                    continue;
+                }
+                int percent = rsyncTransferPercent(line);
+                if (percent >= 0) {
+                    // A stats line this rsync variant formats differently: the percentage is still usable,
+                    // the bytes and rate are not, so the status line says less instead of guessing.
+                    if (!dryRun) {
+                        progress.transferPercentOnly(percent);
                     }
                     markActivity(line.trim());
                     continue;
@@ -1307,7 +1473,14 @@ public class FileSyncEngine implements AutoCloseable {
                         progress.countCopied();
                         String rel = itemizePath(line);
                         if (rel != null) {
-                            listener.onFileProcessed(rel, "COPIED", null, null);
+                            // Measured on 3.1.3 and 3.4.0: this line arrives when rsync starts the file, not
+                            // when it finishes. It is what makes "which file is in flight right now"
+                            // answerable, and the xfr# count on the stats line is what says a file finished.
+                            progress.announcing(rel, sizeOfSourceFile(sourceDir, rel));
+                            listener.onFileProcessed(rel, "TRANSFERRING", null, null);
+                            if (copiedNames != null && copiedNames.size() < resultLimit) {
+                                copiedNames.add(rel);
+                            }
                         }
                         markActivity(line.trim());
                     }
@@ -1371,6 +1544,15 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     enum LineKind { COPY, DIRECTORY, ERROR, WARNING, IGNORED }
+
+    /** Size of the file rsync has just started, or 0 when it cannot be asked. */
+    private static long sizeOfSourceFile(Path sourceDir, String relPath) {
+        try {
+            return Files.size(sourceDir.resolve(relPath));
+        } catch (IOException | RuntimeException e) {
+            return 0L;
+        }
+    }
 
     /**
      * Classifies one rsync output line. With {@code -i} each change line is an update type followed by
@@ -1533,7 +1715,9 @@ public class FileSyncEngine implements AutoCloseable {
                                    Selection destination, JobType type) {
         Selection src = normalize(source);
         Selection dst = normalize(destination);
-        boolean verifyOnly = type == JobType.VERIFY_ONLY;
+        // Destination unticks exclude only in a job that does not copy: a copy is driven by the source
+        // list, and its destination rows are not something the user is being asked to interpret.
+        boolean destinationTicksApply = !type.copies();
         int atSource = 0;
         int excluded = 0;
         List<String> names = new ArrayList<>();
@@ -1542,7 +1726,7 @@ public class FileSyncEngine implements AutoCloseable {
                 continue;
             }
             atSource++;
-            if (excludedAtDestination(dst, rel, verifyOnly)) {
+            if (excludedAtDestination(dst, rel, destinationTicksApply)) {
                 excluded++;
                 if (names.size() < NAMED_EXCLUSIONS) {
                     names.add(rel);
@@ -1647,27 +1831,121 @@ public class FileSyncEngine implements AutoCloseable {
         return false;
     }
 
-    /** Kills the live rsync process and everything it spawned. Safe to call more than once. */
+    /**
+     * Kills the live rsync and everything it spawned. Safe to call more than once.
+     *
+     * <p>The whole tree is snapshotted before anyone is signalled: once the parent dies its children are
+     * re-parented to init, and a {@code descendants()} call made after that finds nothing at all. The
+     * signal is SIGTERM first - rsync responds to it by deleting the hidden partial file it was writing,
+     * which is what a cancelled job should leave behind in someone's destination folder, nothing - and
+     * only survivors get SIGKILL.
+     */
     private void terminateRsync() {
         Process process = liveProcess.get();
         if (process == null) {
             return;
         }
-        process.descendants().forEach(handle -> {
+        List<ProcessHandle> tree = snapshotTree(process);
+        signalTree(process, tree, false);
+        if (!awaitTree(process, tree, TERM_GRACE_SECONDS)) {
+            signalTree(process, tree, true);
+            awaitTree(process, tree, TERM_GRACE_SECONDS);
+        }
+    }
+
+    private static List<ProcessHandle> snapshotTree(Process process) {
+        try {
+            return process.descendants().toList();
+        } catch (IllegalStateException | SecurityException e) {
+            // Already gone, or not ours to read.
+            return List.of();
+        }
+    }
+
+    private static void signalTree(Process process, List<ProcessHandle> tree, boolean forcibly) {
+        // Parent first: it is the one that cleans up partial files, and it passes the signal on.
+        try {
+            if (forcibly) {
+                process.destroyForcibly();
+            } else {
+                process.destroy();
+            }
+        } catch (IllegalStateException | SecurityException e) {
+            // Already gone.
+        }
+        for (ProcessHandle handle : tree) {
             try {
-                handle.destroyForcibly();
+                if (forcibly) {
+                    handle.destroyForcibly();
+                } else {
+                    handle.destroy();
+                }
             } catch (IllegalStateException | SecurityException e) {
                 // Already gone, or not ours to kill.
             }
-        });
-        process.destroy();
+        }
+    }
+
+    private static boolean awaitTree(Process process, List<ProcessHandle> tree, int seconds) {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
         try {
-            if (!process.waitFor(5, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
+            while (System.nanoTime() < until) {
+                if (process.isAlive()) {
+                    Thread.sleep(100);
+                    continue;
+                }
+                for (ProcessHandle handle : tree) {
+                    if (handle.isAlive()) {
+                        return false;
+                    }
+                }
+                return true;
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        return false;
+    }
+
+    /**
+     * rsync's parent can exit while its children are still finishing. Their data has been transferred -
+     * rsync only reports success once the transfer is complete - but a child that outlives its parent is
+     * orphaned to init and this program has no way to reach it again, so anything still alive here is
+     * killed. This is what a "three rsync processes I never started" report means.
+     */
+    private void sweepRsyncTree(Process process) {
+        List<ProcessHandle> tree = new ArrayList<>(spawnedTree.get());
+        for (ProcessHandle handle : snapshotTree(process)) {
+            if (!tree.contains(handle)) {
+                tree.add(handle);
+            }
+        }
+        spawnedTree.set(List.of());
+        List<ProcessHandle> alive = new ArrayList<>();
+        for (ProcessHandle handle : tree) {
+            try {
+                if (handle.isAlive()) {
+                    alive.add(handle);
+                }
+            } catch (IllegalStateException e) {
+                // Already gone.
+            }
+        }
+        if (alive.isEmpty()) {
+            return;
+        }
+        markActivity("killing " + alive.size() + " rsync process(es) that outlived their parent");
+        signalTree(process, alive, false);
+        if (!awaitTree(process, alive, 2)) {
+            signalTree(process, alive, true);
+        }
+    }
+
+    /** A job that was stopped before rsync was ever run: nothing moved, and it must not claim otherwise. */
+    private JobResult abortedBeforeTransfer(String message, List<FileOutcome> outcomes, List<String> errors,
+                                            List<String> warnings, boolean verifies) {
+        String full = verifies ? message : message + " Verification was off, so nothing was compared.";
+        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, outcomes, errors, warnings);
     }
 
     private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode) {
@@ -1690,6 +1968,15 @@ public class FileSyncEngine implements AutoCloseable {
         private int extra;
         private int copied;
         private int rsyncPercent = -1;
+        /** The file rsync is writing right now, and how big it is. */
+        private String inFlight;
+        private long inFlightSize;
+        /** Bytes moved overall, and the part of that which belongs to files already finished. */
+        private long transferredBytes = -1;
+        private long transferredOfFinished;
+        private int transfersDone;
+        private String transferRate;
+        private String transferElapsed;
         /** rsync's completed-transfer count; -1 until rsync reports one. */
         private int rsyncTransfers = -1;
         private int lastPercent = -1;
@@ -1740,6 +2027,7 @@ public class FileSyncEngine implements AutoCloseable {
             rsyncTransfers = Math.max(rsyncTransfers, count);
         }
 
+        /** One item rsync announced: a file, a changed file, a copied link. Counted whether or not the line carried a name. */
         void countCopied() {
             copied++;
         }
@@ -1768,11 +2056,69 @@ public class FileSyncEngine implements AutoCloseable {
             emit(percent, label);
         }
 
-        /** Copy progress driven by rsync's own transfer percentage (0..100 of the copy phase). */
-        void rsyncPercent(int percent) {
+        /**
+         * rsync has started transferring {@code relPath}. Its itemize line arrives at the start of that
+         * file's transfer, so the previous file in flight - if there was one - has finished: rsync moves
+         * files one at a time.
+         */
+        void announcing(String relPath, long size) {
+            if (inFlight != null) {
+                transfersDone++;
+                transferredOfFinished += inFlightSize;
+            }
+            inFlight = relPath;
+            inFlightSize = Math.max(0L, size);
+            emitCopyProgress();
+        }
+
+        /** rsync's own stats line: bytes moved so far, the overall percentage, a rate, an elapsed time. */
+        void transferStats(long bytes, int percent, String rate, String elapsed) {
+            transferredBytes = Math.max(transferredBytes, bytes);
             rsyncPercent = Math.max(rsyncPercent, percent);
-            emit((int) Math.round(rsyncPercent * COPY_PROGRESS_END / 100.0),
-                    "Copying: " + copied + " announced, " + rsyncPercent + "% transferred");
+            transferRate = rate;
+            transferElapsed = elapsed;
+            emitCopyProgress();
+        }
+
+        /**
+         * The bar follows rsync's overall percentage; the words say what the bar cannot: which file is
+         * being written now, how much of it has landed, how many files are finished, and how fast it is
+         * moving. A 30 GB file would otherwise show one number that barely moves for an hour.
+         */
+        /** A percentage with no byte counts behind it: the bar moves, the words stay general. */
+        void transferPercentOnly(int percent) {
+            rsyncPercent = Math.max(rsyncPercent, percent);
+            emitCopyProgress();
+        }
+
+        private void emitCopyProgress() {
+            int percent = (int) Math.round(Math.max(0, Math.min(100, rsyncPercent)) * COPY_PROGRESS_END / 100.0);
+            StringBuilder text = new StringBuilder("Copying ");
+            if (transferredBytes >= 0) {
+                text.append(bytesText(transferredBytes)).append(" so far (").append(rsyncPercent).append("%)");
+            } else {
+                text.append(copied).append(" file(s) announced");
+            }
+            if (inFlight != null) {
+                text.append(" | now writing: ").append(inFlight);
+                if (inFlightSize > 0) {
+                    long mine = Math.max(0L, transferredBytes - transferredOfFinished);
+                    long clamped = Math.min(mine, inFlightSize);
+                    text.append(" (").append(bytesText(clamped)).append(" of ").append(bytesText(inFlightSize))
+                        .append(", ").append(Math.round(clamped * 100.0 / inFlightSize)).append("%)");
+                }
+            }
+            if (workTotal > 0) {
+                // rsync's own completed-transfer count is the authority: it also counts the last file,
+                // which no later announcement would have implied.
+                int done = Math.max(transfersDone, Math.max(0, rsyncTransfers));
+                text.append(" | ").append(Math.min(done, workTotal)).append(" of ").append(workTotal)
+                    .append(" done");
+            }
+            if (transferRate != null) {
+                text.append(" | ").append(transferRate).append(", elapsed ").append(transferElapsed);
+            }
+            emit(percent, text.toString());
         }
 
         void copyComplete(int copied, boolean dryRun) {
@@ -1784,16 +2130,30 @@ public class FileSyncEngine implements AutoCloseable {
             emit(afterCopy ? COPY_PROGRESS_END : 0, "Verified 0 of " + workTotal);
         }
 
-        void verifiedFile(boolean afterCopy) {
+        void verifiedFile(boolean afterCopy, String relPath) {
             double ratio = processed / (double) workTotal;
             int percent = afterCopy
                     ? (int) Math.round(COPY_PROGRESS_END + ratio * (100 - COPY_PROGRESS_END))
                     : (int) Math.round(ratio * 100);
-            emit(percent, "Verified " + processed + " of " + workTotal);
+            emit(percent, "Verified " + processed + " of " + workTotal + " | just compared: " + relPath);
         }
 
         void finish(String label) {
             emit(100, label);
+        }
+
+        /** A size in the unit a person would read for it, not a raw byte count. */
+        private static String bytesText(long bytes) {
+            if (bytes >= 1L << 30) {
+                return String.format("%.2f GB", bytes / (double) (1L << 30));
+            }
+            if (bytes >= 1L << 20) {
+                return String.format("%.1f MB", bytes / (double) (1L << 20));
+            }
+            if (bytes >= 1L << 10) {
+                return String.format("%.1f kB", bytes / (double) (1L << 10));
+            }
+            return bytes + " B";
         }
 
         private void emit(int percent, String label) {

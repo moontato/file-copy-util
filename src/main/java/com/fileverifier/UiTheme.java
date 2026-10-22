@@ -612,11 +612,15 @@ public final class UiTheme {
     /** Colour a status word or badge by outcome kind. */
     public static Color outcomeColor(String kind) {
         return switch (kind) {
-            case "OK", "MATCHED", "COPIED" -> active.ok();
+            case "OK", "MATCHED" -> active.ok();
+            // Nothing was checked about a copied file, so it is not coloured like a file that passed a
+            // check; the green would be read as "verified" by someone who never verified anything.
+            case "COPIED" -> active.muted();
+            case "WOULD_COPY" -> active.info();
             case "MISMATCH" -> active.bad();
             case "MISSING" -> active.warn();
             case "EXTRA" -> active.info();
-            case "TRUNCATED", "INFO", "WARNING" -> active.muted();
+            case "TRUNCATED", "INFO", "WARNING", "TRANSFERRING" -> active.muted();
             default -> active.text();
         };
     }

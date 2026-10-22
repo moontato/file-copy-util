@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.4.0 — verification is a switch, not a mode
+
+- **The mode control is now `Copy | Verify only`, with a `Verify after copying` checkbox beside it**
+  (default: on). Instead of choosing between three modes you choose whether the job copies, and separately
+  whether it compares what it copied. Verify only stays a mode because it has no substitute: it is the only
+  job that looks at a destination without touching it, and that cannot be a checkbox on a copy job.
+- **A copy with verification off says so.** The button reads `Run copy`, the status line reads
+  "Copy complete - nothing was compared.", the log carries
+  "Verification is OFF: files will be copied but not compared", and the job's own summary is
+  "Copy complete: 214 file(s) copied. Verification was turned off, so none of them were compared." A CLI job
+  prints `totals: copied=214 (verification was off: ...)` instead of a line of zeroes that reads like trouble.
+- **Every file such a job wrote is listed as `COPIED`** in the Results tab and in CSV/JSON exports, with no
+  hashes, because the transfer is the only fact that job knows. A dry run names them `WOULD_COPY` instead: an
+  export that says COPIED for a file nobody wrote records an event that did not happen. A verifying job still
+  writes one row per file — its verdict — and never both a copy row and a verdict row. `COPIED` is deliberately
+  not coloured like a check that passed.
+- **Nothing is hashed when nothing will be compared.** A copy-only job does not read the source to compute
+  digests, which on a large tree is most of the job's cost. Verified by contrast: the same unreadable source
+  file produces a "Could not read" warning in a verifying job and no such warning in a copy-only one, because
+  the copy-only job never opened it.
+- Cancelled, timed-out and failed copies no longer claim files "were verified" when verification was off.
+- CLI: `--no-verify`; `--verify-only` unchanged; the two together are a usage error rather than last-flag-wins.
+- Settings remember the switch separately from the mode, so turning verification off survives switching
+  between Copy and Verify only.
+
+### Large copies: why a file appears at the end, and what cancelling now stops
+
+- **The copy phase now names the file in flight.** The status line reads
+  `Copying 9.9 MB so far (8%) | now writing: big.bin (9.9 MB of 114.4 MB, 9%) | 0 of 1 done | 1.95MB/s, elapsed 0:00:54`
+  - which file is going into the destination, how much of *that file* has landed, how many files are finished,
+  the rate, and rsync's elapsed time. Derived from rsync's own stats lines plus the announced file names:
+  measured on rsync 3.1.3 and 3.4.0, an itemize line arrives when a file's transfer **starts**, and the
+  `xfr#` count on the stats line is what says a file **finished**. The completed-file figure follows rsync's
+  `xfr#` so it reaches the last file instead of stalling at zero.
+- **`Phase: copying` no longer covers hashing the source.** A job now reports `hashing source` → `copying` →
+  `verifying`. Hashing 15-30 GB before rsync writes anything is most of the first hour of a big copy, and
+  calling that "copying" with an empty destination folder is exactly what makes a job look stalled.
+- **Why the destination looked empty, said out loud.** Once per job the window and the CLI now log it: rsync
+  writes each file as a **hidden temporary file** in its destination folder (`.big.bin.qjX7kX`) and renames it
+  to its real name only when that file's transfer completes. Measured: at 2 s into a 30 MB copy the destination
+  holds `.a.bin.v7asq2` at 2.8 MB growing to 30 MB; `a.bin` appears only when the transfer completes. A large
+  file is therefore in the destination the whole time - show hidden files to watch it grow.
+- **Cancelling stops the whole rsync tree, and it is tested.** A local copy is three processes (measured:
+  parent, child, grandchild). The tree is snapshotted **before** anyone is signalled - after the parent dies
+  its children are re-parented to init and a `descendants()` call then finds nothing - SIGTERM goes to all of
+  them first (so rsync deletes the partial file it was writing), and only survivors get SIGKILL. After a
+  *successful* copy anything still alive in the tree is killed too, because rsync's parent can exit while its
+  children are finishing and an orphaned child is unreadable to this program afterwards.
+- **A cancelled job can no longer start rsync.** Cancelling during the hashing pass used to let the job reach
+  the spawn and launch a reader on the source disk that nothing was watching any more. The copy phase now
+  refuses to start, and a cancellation that lands between the check and the fork kills the process
+  immediately.
+- **A cancelled copy leaves no partial file behind** (measured: the destination is empty after cancelling;
+  previously `.a.bin.AG4rJt` stayed there). The leftover report still exists for the cases where rsync is
+  killed outright and cannot clean up.
+
+Tests: 176, five of them new for this: no rsync survives a mid-transfer cancel and no partial file is left; no
+rsync survives the window being closed mid-transfer; nothing is left after a *completed* copy; a job cancelled
+during hashing never launches rsync (a stand-in rsync records whether it ran); and the copy status names the
+file in flight with its own percentage. Also measured against real rsync through the shipped jar.
+Tests: 171, including 5 new engine tests for copying without comparing, 3 CLI tests, and window tests for
+the switch, the button label, the copied rows reaching the results table, and the setting surviving a restart.
+The theme test now asserts that `COPIED` is not coloured like a check that passed.
 ## 1.3.0 — two interface changes
 
 - **The source and destination fields are editable.** Type a directory and press Enter to load both lists;

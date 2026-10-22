@@ -67,15 +67,6 @@ class FileSyncEngineLifecycleTest {
     }
 
     /** Sparse file: instant to create, but still costs rsync ~1s per GB to transfer. */
-    private static void sparseFile(Path file, long bytes) throws IOException {
-        if (file.getParent() != null) {
-            Files.createDirectories(file.getParent());
-        }
-        try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "rw")) {
-            raf.setLength(bytes);
-        }
-    }
-
     private static long rsyncProcesses() {
         return ProcessHandle.allProcesses()
                 .filter(handle -> handle.info().command()
@@ -232,7 +223,7 @@ class FileSyncEngineLifecycleTest {
         // ~1.5 GB of work outstanding: the kill cannot race the end of the job.
         TestSupport.write(source.resolve("a.txt"), "small\n");
         TestSupport.write(source.resolve("b.txt"), "small\n");
-        sparseFile(source.resolve("zz-huge.bin"), BIG_FILE_BYTES);
+        TestSupport.sparse(source.resolve("zz-huge.bin"), BIG_FILE_BYTES);
 
         final FileSyncEngine[] holder = new FileSyncEngine[1];
         AtomicInteger copiedEvents = new AtomicInteger();
@@ -241,7 +232,7 @@ class FileSyncEngineLifecycleTest {
             @Override
             public void onFileProcessed(String relPath, String status, String srcHash, String dstHash) {
                 super.onFileProcessed(relPath, status, srcHash, dstHash);
-                if (status.equals("COPIED") && copiedEvents.incrementAndGet() == 1) {
+                if (status.equals("TRANSFERRING") && copiedEvents.incrementAndGet() == 1) {
                     holder[0].cancel();
                 }
             }
@@ -282,7 +273,7 @@ class FileSyncEngineLifecycleTest {
     @Test
     void jobTimeoutTerminatesASlowRsync() throws Exception {
         assumeRsync();
-        sparseFile(source.resolve("huge.bin"), BIG_FILE_BYTES);
+        TestSupport.sparse(source.resolve("huge.bin"), BIG_FILE_BYTES);
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             engine.setJobTimeoutMillis(250);
@@ -363,7 +354,7 @@ class FileSyncEngineLifecycleTest {
     @Test
     void defaultIsNoTimeoutSoAJobFinishes() throws Exception {
         assumeRsync();
-        sparseFile(source.resolve("large.bin"), BIG_FILE_BYTES);
+        TestSupport.sparse(source.resolve("large.bin"), BIG_FILE_BYTES);
 
         try (FileSyncEngine engine = new FileSyncEngine()) {
             assertEquals(FileSyncEngine.NO_TIMEOUT, engine.jobTimeoutMillis());

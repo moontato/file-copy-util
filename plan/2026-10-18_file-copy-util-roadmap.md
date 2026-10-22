@@ -647,3 +647,90 @@ here.
 
 Verified: 160 tests, 0 SpotBugs findings, both palettes rendered offscreen to confirm the label placement and
 that the now-editable fields follow the theme in dark mode.
+
+---
+
+# 1.4.0 (in progress) — verification became a switch
+
+The owner asked for fewer modes: a copy job with verification as an optional checkbox. What was settled before
+writing code, and what it turned out to mean:
+
+- **Verify only stays a mode.** It is the only job that reads a destination without touching it, and no
+  checkbox on a copy job produces that. So the control is `Copy | Verify only` plus `Verify after copying`
+  (default on) - three modes became two plus a switch, which is the simplification asked for without deleting
+  the audit path.
+- **Default is verify on**, after the owner's own reconsideration: defaulting to no verification makes an
+  unverified copy the surprise outcome of a tool whose name promises verification.
+- **A copy that compares nothing has to say so**, everywhere it reports: button label (`Run copy`), status
+  line, log line, the job summary, the CLI totals line, and a standing warning. Otherwise "verification off"
+  is invisible precisely where the numbers are read.
+- **`COPIED` rows**: each file such a job wrote is a result row, no hashes, coloured muted rather than as a
+  passed check; a dry run writes `WOULD_COPY` because nothing was written. A verifying job still writes one
+  row per file (its verdict) and never both.
+- **Hashing is skipped entirely** when nothing will be compared. Proven by contrast rather than by reading the
+  code: the same unreadable source file yields a "Could not read" warning in a verifying job and none in a
+  copy-only job.
+
+Known limit, stated rather than papered over: a copy-only job that is **cancelled or timed out** produces no
+`COPIED` rows. rsync announced N files and completed at most M; which ones is not known, and an export that
+listed the announced ones as copied would record transfers that may not have finished. Those jobs report the
+count, the leftovers left in the destination, and that verification was off.
+
+Verification so far: 171 tests, 0 SpotBugs findings, rsync 3.1.3/3.4.0 matrix green locally (CI runs 3.1.3 /
+3.2.7 / 3.4.0), both palettes rendered offscreen to check the new mode row and the three button labels, and a
+copy-only job run through the shipped jar with a CSV export showing the three `COPIED` rows.
+
+---
+
+# 1.4.0 (continued) — a large copy that reported nothing, and rsync processes that outlived the program
+
+Reported by the owner from real use: a 15-30 GB copy sat on "Phase: copying" for over an hour with an empty
+destination folder; after cancelling and closing the program the source HDD kept blinking and System Monitor
+showed three rsync processes; killing them made several large files appear in the destination.
+
+Measured before changing anything:
+
+- **A local rsync copy is three processes.** With 3.4.0: pid A (spawned by Java), pid B (`ppid=A`), pid C
+  (`ppid=B`). Killing only the first leaves two reading the source disk after the program has exited - which is
+  what the owner saw, and the existing test helper `awaitNoRsyncProcesses()` was already asserting this in the
+  cancellation and timeout paths, so the hole was in a path no test reached.
+- **rsync writes a hidden partial file and renames at completion.** At 2 s into a 30 MB copy the destination
+  held `.a.bin.v7asq2` at 2.8 MB, growing to 30.6 MB; `a.bin` appeared at 22 s, after `xfr#1` was reported.
+  Nothing visible in an ordinary file manager during the transfer - the answer to "I don't see any file".
+- **An itemize line arrives at the *start* of a file's transfer, not its end.** `>f+++++++++ a.bin` at 0.1 s;
+  `xfr#1` and `>f+++++++++ b.bin` both at 20.4 s. So "which file is in flight" is answerable from the last
+  announcement, and "how many finished" only from `xfr#`.
+- **`--info=progress2` gives overall bytes/percentage only**, never the current file name, when its output is a
+  pipe (tested progress1/2/3/4 and with itemize on/off: rsync suppresses the filename line when itemize is on).
+  So the per-file figure has to be derived: overall bytes − bytes of finished files, over the announced file's
+  size (sizes known from the scan).
+
+What was wrong in the program:
+
+1. **A cancelled job could still launch rsync.** Cancellation during the hashing pass set the flag, the copy
+   phase checked nothing before the `ProcessBuilder`, and the engine then sat in `process.waitFor()` on a
+   process nothing was watching. Now the copy phase refuses to start, and a cancellation landing between the
+   check and the fork kills the process at once.
+2. **The kill order left rsync unable to clean up** (children SIGKILLed before the parent was signalled): the
+   destination kept `.a.bin.AG4rJt` after a cancel. Snapshot the tree first, SIGTERM everyone, SIGKILL only
+   survivors. Measured after the change: destination empty after cancelling, no survivors.
+3. **Nothing swept the tree after a *successful* copy.** rsync's parent can exit while a child is still
+   finishing; an orphaned child is unreachable afterwards. A completed copy now sweeps it.
+4. **"Phase: copying" covered the hashing pass**, which for 15-30 GB is the first hour, with an empty
+   destination - the exact report. Phases are now `hashing source` → `copying` → `verifying`.
+5. **The copy status said "Copying: 1 announced, 12% transferred"** - one overall number for an hour. It now
+   names the file in flight and its own progress, verified through the shipped jar:
+   `Copying 9.9 MB so far (8%) | now writing: big.bin (9.9 MB of 114.4 MB, 9%) | 0 of 1 done | 1.95MB/s, elapsed 0:00:54`
+   and the done-count follows rsync's `xfr#` so it reaches the last file.
+6. **rsync's hidden-temp-file behaviour was never stated to the user.** It is logged once per copy job in the
+   window and the CLI, and documented in Troubleshooting.
+
+New tests (5): no rsync survives a mid-transfer cancel and no partial file is left; none survives the engine
+being closed mid-transfer; none survives a completed copy; a job cancelled during hashing never runs rsync (a
+stand-in rsync records whether it was invoked, ignoring the engine's `--version` probe); the copy status names
+the file in flight with its own percentage and rate. Suite: 176 tests, 0 SpotBugs findings.
+
+Deliberate limit: the program cannot make rsync show the file under its real name during the transfer - that is
+rsync's rename-on-completion behaviour, and forcing it (e.g. `--inplace`) risks damaged destination files on a
+interrupted run. What the program can do is say which file is in flight, how far along it is, and that it is
+sitting in the destination under a hidden name.

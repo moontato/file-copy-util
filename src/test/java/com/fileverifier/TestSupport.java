@@ -159,6 +159,49 @@ final class TestSupport {
         return script;
     }
 
+    /**
+     * A file of the given apparent size with no data behind it: a hole. Used by tests that need a transfer
+     * long enough to interrupt, without writing gigabytes to the machine running the tests.
+     */
+    static Path sparse(Path file, long bytes) throws IOException {
+        if (file.getParent() != null) {
+            Files.createDirectories(file.getParent());
+        }
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file.toFile(), "rw")) {
+            raf.setLength(bytes);
+        }
+        return file;
+    }
+
+    /**
+     * Processes whose own command is {@code program} - argv[0] equal to it, or ending in "/program". This
+     * is how a test checks that a cancelled copy really stopped: a local rsync run is three processes, and
+     * a program that killed only one of them leaves two reading the source disk after it has exited.
+     */
+    static List<String> processesRunning(String program) {
+        List<String> found = new ArrayList<>();
+        ProcessHandle.allProcesses().forEach(handle -> handle.info().command().ifPresent(command -> {
+            if (command.equals(program) || command.endsWith("/" + program)) {
+                found.add("pid " + handle.pid() + ": " + command);
+            }
+        }));
+        return found;
+    }
+
+    /** Wait briefly for the given program to disappear, then fail with what is still running. */
+    static void assertNoProcessesRunning(String program, String when) throws InterruptedException {
+        List<String> alive = List.of();
+        for (int attempt = 0; attempt < 20; attempt++) {
+            alive = processesRunning(program);
+            if (alive.isEmpty()) {
+                return;
+            }
+            Thread.sleep(250);
+        }
+        org.junit.jupiter.api.Assertions.assertTrue(processesRunning(program).isEmpty(),
+            when + ": processes still running: " + alive);
+    }
+
     static Path write(Path file, String content) throws IOException {
         if (file.getParent() != null) {
             Files.createDirectories(file.getParent());

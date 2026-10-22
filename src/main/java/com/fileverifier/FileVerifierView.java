@@ -47,12 +47,14 @@ public final class FileVerifierView extends JPanel {
     private static final String PREF_DRY_RUN = "dryRun";
     private static final String PREF_EXTRA = "detectExtra";
     private static final String PREF_JOB_TYPE = "jobType";
+    private static final String PREF_VERIFY_AFTER_COPY = "verifyAfterCopy";
     private static final String PREF_THEME = "darkMode";
 
     private final Preferences prefs = Preferences.userRoot().node("com/fileverifier");
 
     private JLabel versionLabel;
     private boolean pathEditSuppressed;
+    private boolean explanationShown;
 
     private JTextField sourcePathField;
     private JTextField destPathField;
@@ -80,8 +82,9 @@ public final class FileVerifierView extends JPanel {
     private JButton sourceBrowseButton;
     private JButton destBrowseButton;
     private JButton scanButton;
-    private JToggleButton copyVerifyButton;
+    private JToggleButton copyButton;
     private JToggleButton verifyOnlyButton;
+    private JCheckBox verifyCheck;
     private JButton runButton;
     private JButton cancelButton;
     private JButton exportCsvButton;
@@ -102,6 +105,8 @@ public final class FileVerifierView extends JPanel {
 
     /** Kept so the Results tab can be re-filtered or exported after the job ends. */
     private FileSyncEngine.JobResult lastJobResult;
+    /** What the finished job actually was, so its results can be described correctly afterwards. */
+    private FileSyncEngine.JobType launchedJobType;
 
     public FileVerifierView() {
         // Theme before any widget exists: every control picks up its colours at construction.
@@ -283,12 +288,31 @@ public final class FileVerifierView extends JPanel {
         JPanel segments = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         segments.setOpaque(false);
         segments.add(UiTheme.fieldLabel("Mode"));
-        copyVerifyButton = UiTheme.segmentButton("Copy & Verify", "left");
-        copyVerifyButton.addActionListener(e -> selectJobType(FileSyncEngine.JobType.COPY_AND_VERIFY));
+        // Two segments, not three modes: whether the job copies, and separately whether it compares
+        // afterwards. Verify only stays a mode because it is the only job that looks at a destination
+        // without touching it - that cannot be a checkbox on a copy job.
+        copyButton = UiTheme.segmentButton("Copy", "left");
+        copyButton.setToolTipText("Run rsync and write the ticked source files into the destination.");
+        copyButton.addActionListener(e -> selectCopyMode(true));
         verifyOnlyButton = UiTheme.segmentButton("Verify only", "right");
-        verifyOnlyButton.addActionListener(e -> selectJobType(FileSyncEngine.JobType.VERIFY_ONLY));
-        segments.add(copyVerifyButton);
+        verifyOnlyButton.setToolTipText("Compare source and destination by hash without copying anything. "
+            + "rsync never runs, so nothing in the destination is written, changed or deleted.");
+        verifyOnlyButton.addActionListener(e -> selectCopyMode(false));
+        segments.add(copyButton);
         segments.add(verifyOnlyButton);
+
+        verifyCheck = UiTheme.check("Verify after copying");
+        verifyCheck.setSelected(true);
+        verifyCheck.setToolTipText("Compare hashes of what was copied against what landed in the destination. "
+            + "Turn it off for a plain copy: nothing is hashed, files that were written are listed as COPIED,"
+            + " and the job says in its own summary that it compared nothing.");
+        verifyCheck.addActionListener(e -> {
+            currentJobType = resolvedJobType();
+            updateRunButtonLabel();
+            updateWorkSetSummary();
+            savePreferences();
+        });
+        segments.add(verifyCheck);
         modeRow.add(segments, BorderLayout.WEST);
 
         // 5.6: what the two checkbox lists add up to, in the engine's own rule, shown before Run is
@@ -296,14 +320,14 @@ public final class FileVerifierView extends JPanel {
         // (and another thing to get wrong); a line that says which rule applied is enough.
         workSetLabel = UiTheme.caption("Work set: nothing scanned yet");
         workSetLabel.setToolTipText("How many files the selected operation would process, using the same "
-            + "rule the job uses: Copy & Verify follows the source ticks; Verify only follows the source "
-            + "ticks minus destination rows that were shown and left unticked.");
+            + "rule the job uses: a copy follows the source ticks; Verify only follows the source ticks minus "
+            + "destination rows that were shown and left unticked.");
         modeRow.add(workSetLabel, BorderLayout.CENTER);
 
         panel.add(paths, BorderLayout.NORTH);
         panel.add(options, BorderLayout.CENTER);
         panel.add(modeRow, BorderLayout.SOUTH);
-        selectJobType(FileSyncEngine.JobType.COPY_AND_VERIFY);
+        selectCopyMode(true);
         return panel;
     }
 
@@ -548,8 +572,15 @@ public final class FileVerifierView extends JPanel {
         symlinkCombo.setSelectedItem(policyFromName(prefs.get(PREF_SYMLINKS, "SKIP")));
         jobTimeoutField.setText(prefs.get(PREF_TIMEOUT, "0"));
         dryRunCheck.setSelected(prefs.getBoolean(PREF_DRY_RUN, false));
-        selectJobType(prefs.get(PREF_JOB_TYPE, "COPY_AND_VERIFY").equals("VERIFY_ONLY")
-            ? FileSyncEngine.JobType.VERIFY_ONLY : FileSyncEngine.JobType.COPY_AND_VERIFY);
+        // The mode is stored as what the last job actually was; the verification switch is stored
+        // separately so it survives switching between Copy and Verify only. An older setting names a mode
+        // that no longer exists (COPY_AND_VERIFY was the only copy mode), which maps straight onto it.
+        String storedType = prefs.get(PREF_JOB_TYPE, FileSyncEngine.JobType.COPY_AND_VERIFY.name());
+        boolean wasVerifyOnly = FileSyncEngine.JobType.VERIFY_ONLY.name().equals(storedType);
+        boolean storedVerify = prefs.getBoolean(PREF_VERIFY_AFTER_COPY,
+            !FileSyncEngine.JobType.COPY_ONLY.name().equals(storedType));
+        verifyCheck.setSelected(storedVerify);
+        selectCopyMode(!wasVerifyOnly);
         darkModeCheck.setSelected(prefs.getBoolean(PREF_THEME, false));
     }
 
@@ -562,7 +593,9 @@ public final class FileVerifierView extends JPanel {
         prefs.put(PREF_SYMLINKS, selectedPolicy().name());
         prefs.put(PREF_TIMEOUT, jobTimeoutField.getText().trim());
         prefs.putBoolean(PREF_DRY_RUN, dryRunCheck.isSelected());
+        currentJobType = resolvedJobType();
         prefs.put(PREF_JOB_TYPE, currentJobType.name());
+        prefs.putBoolean(PREF_VERIFY_AFTER_COPY, verifyCheck.isSelected());
         prefs.putBoolean(PREF_THEME, darkModeCheck.isSelected());
     }
 
@@ -732,19 +765,46 @@ public final class FileVerifierView extends JPanel {
 
     // ------------------------------------------------------------------ job control
 
-    private void selectJobType(FileSyncEngine.JobType jobType) {
+    /** The mode half of the choice: does this job copy, or only compare. */
+    private void selectCopyMode(boolean copy) {
         if (engine.isRunning()) {
             return;
         }
-        currentJobType = jobType;
-        boolean copyMode = jobType == FileSyncEngine.JobType.COPY_AND_VERIFY;
         // The two mode buttons are one segmented control, so exactly one of them is selected.
-        // setSelected, not doClick: a click would re-enter selectJobType through the action listener.
-        copyVerifyButton.setSelected(copyMode);
-        verifyOnlyButton.setSelected(!copyMode);
-        UiTheme.paintSegment(copyVerifyButton, copyMode);
-        UiTheme.paintSegment(verifyOnlyButton, !copyMode);
+        // setSelected, not doClick: a click would re-enter this method through the action listener.
+        copyButton.setSelected(copy);
+        verifyOnlyButton.setSelected(!copy);
+        UiTheme.paintSegment(copyButton, copy);
+        UiTheme.paintSegment(verifyOnlyButton, !copy);
+        currentJobType = resolvedJobType();
+        updateRunButtonLabel();
+        verifyCheck.setEnabled(copy);
         updateWorkSetSummary();
+    }
+
+    /**
+     * The job this combination means. Verification only means anything to a job that copies, so the switch
+     * is read only in Copy mode - a Verify only job compares, whatever the switch says.
+     */
+    private FileSyncEngine.JobType resolvedJobType() {
+        if (!copyButton.isSelected()) {
+            return FileSyncEngine.JobType.VERIFY_ONLY;
+        }
+        return verifyCheck.isSelected()
+            ? FileSyncEngine.JobType.COPY_AND_VERIFY : FileSyncEngine.JobType.COPY_ONLY;
+    }
+
+    /** A button that says "job" while quietly not verifying is the kind of vagueness this tool avoids. */
+    private void updateRunButtonLabel() {
+        if (runButton == null) {
+            return;
+        }
+        currentJobType = resolvedJobType();
+        runButton.setText(switch (currentJobType) {
+            case COPY_AND_VERIFY -> "Run job";
+            case COPY_ONLY -> "Run copy";
+            case VERIFY_ONLY -> "Run verify";
+        });
     }
 
     /**
@@ -762,7 +822,7 @@ public final class FileVerifierView extends JPanel {
         }
         // A copy ignores the destination ticks, so for one the unticked set is empty by definition. The
         // lookups keep this proportional to how many rows the user actually unticked, not to list size.
-        Iterable<String> untickedAtDestination = currentJobType == FileSyncEngine.JobType.COPY_AND_VERIFY
+        Iterable<String> untickedAtDestination = currentJobType.copies()
             ? List.of()
             : destModel.untickedPaths();
         FileSyncEngine.WorkSetPlan plan = FileSyncEngine.planWorkSet(sourceModel.selectedCount(),
@@ -771,8 +831,11 @@ public final class FileVerifierView extends JPanel {
                 return row != null && row.selected();
             });
         StringBuilder text = new StringBuilder("Work set: ").append(plan.willProcess()).append(" file(s)");
-        if (currentJobType == FileSyncEngine.JobType.COPY_AND_VERIFY) {
+        if (currentJobType.copies()) {
             text.append(" - source ticks only; a copy ignores the destination list");
+            if (!currentJobType.verifies()) {
+                text.append(", and nothing is compared afterwards");
+            }
         } else if (plan.untickedAtDestination() > 0) {
             text.append(" - ").append(plan.selectedAtSource()).append(" ticked at source, ")
                 .append(plan.untickedAtDestination()).append(" unticked at the destination");
@@ -805,8 +868,9 @@ public final class FileVerifierView extends JPanel {
         destBrowseButton.setEnabled(idle);
         sourcePathField.setEditable(idle);
         destPathField.setEditable(idle);
-        copyVerifyButton.setEnabled(idle);
+        copyButton.setEnabled(idle);
         verifyOnlyButton.setEnabled(idle);
+        verifyCheck.setEnabled(idle && copyButton.isSelected());
         jobTimeoutField.setEnabled(idle);
         dryRunCheck.setEnabled(idle);
         ignoreField.setEnabled(idle);
@@ -886,8 +950,12 @@ public final class FileVerifierView extends JPanel {
         }
 
         savePreferences();
-        log("Starting " + (currentJobType == FileSyncEngine.JobType.COPY_AND_VERIFY
-            ? "Copy & Verify" : "Verify Only") + " job...");
+        currentJobType = resolvedJobType();
+        launchedJobType = request.jobType();
+        log("Starting " + currentJobType.describe() + "...");
+        if (!currentJobType.verifies()) {
+            log("Verification is OFF: files will be copied but not compared.");
+        }
         log("Source: " + sourcePath);
         log("Destination: " + destPath);
         log("Selected: " + selectedSource + " source file(s), "
@@ -907,6 +975,17 @@ public final class FileVerifierView extends JPanel {
                 SwingUtilities.invokeLater(() -> {
                     phaseLabel.setText("Phase: " + phase);
                     log(phase + "...");
+                    if ("copying".equals(phase) && !explanationShown) {
+                        // Measured behaviour of rsync, and the single most confusing thing about a large
+                        // copy: the file you are waiting for is in the destination the whole time, under a
+                        // hidden name, and only gets its real name at the end of its transfer.
+                        explanationShown = true;
+                        log("  rsync writes each file as a hidden temporary file in its destination folder"
+                            + " (for example .big.iso.qjX7kX) and renames it to its real name only when that"
+                            + " file's transfer is complete. A large file therefore appears in the"
+                            + " destination at the end of its copy, not the start - show hidden files in"
+                            + " your file manager to watch it grow.");
+                    }
                 });
             }
 
@@ -944,6 +1023,8 @@ public final class FileVerifierView extends JPanel {
             case "MISSING" -> "[MISSING]  ";
             case "EXTRA" -> "[EXTRA]    ";
             case "COPIED" -> "[COPIED]   ";
+            case "TRANSFERRING" -> "[> copying]";
+            case "WOULD_COPY" -> "[WOULD COPY]";
             default -> "[INFO]     ";
         };
         StringBuilder line = new StringBuilder("  ").append(icon).append(relPath);
@@ -964,7 +1045,9 @@ public final class FileVerifierView extends JPanel {
         if (result.isSuccess()) {
             progressBar.setString("Complete");
             progressBar.setValue(100);
-            statusLabel.setText("Job completed.");
+            // A copy that compared nothing has to read as that on the status line too, not only in the log.
+            statusLabel.setText(launchedJobType != null && !launchedJobType.verifies()
+                ? "Copy complete - nothing was compared." : "Job completed.");
             log("");
             log("=== JOB COMPLETED ===");
             log(result.message());
@@ -1007,7 +1090,13 @@ public final class FileVerifierView extends JPanel {
         }
         int shown = 0;
         for (FileSyncEngine.FileOutcome outcome : result.outcomes()) {
-            boolean problem = !"OK".equals(outcome.kind());
+            // A file that was written, or would have been, is not a problem: it is the job's own record of
+            // what it did. Only a comparison verdict that failed, or a file that is not where it should be,
+            // counts as one.
+            boolean problem = switch (outcome.kind()) {
+                case "MISMATCH", "MISSING", "EXTRA" -> true;
+                default -> false;
+            };
             if (onlyProblemsCheck.isSelected() && !problem) {
                 continue;
             }

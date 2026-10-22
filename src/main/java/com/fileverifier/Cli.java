@@ -42,6 +42,8 @@ public final class Cli {
           --source DIR              source directory (required)
           --dest DIR                destination directory (required)
           --verify-only             compare hashes instead of copying
+          --no-verify               copy without comparing: nothing is hashed, and the report lists each
+                                    written file as COPIED instead of as a verdict
           --files a.txt,sub/b.txt   relative paths to include; repeatable
           --all                     every file the scan finds (see --exclude)
           --exclude a.txt,...       drop these relative paths from --all; repeatable
@@ -68,6 +70,7 @@ public final class Cli {
 
         Examples:
           --cli --source /data/src --dest /backup/dst --all                       copy everything, verify it
+          --cli --source /data/src --dest /backup/dst --all --no-verify            copy everything, compare nothing
           --cli --source /data/src --dest /backup/dst --all --dry-run             show what would happen first
           --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
           --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
@@ -139,6 +142,8 @@ public final class Cli {
         String source = null;
         String dest = null;
         JobType jobType = JobType.COPY_AND_VERIFY;
+        boolean askedVerifyOnly = false;
+        boolean askedNoVerify = false;
         List<String> fileArgs = new ArrayList<>();
         List<String> excludeArgs = new ArrayList<>();
         List<String> excludeDestArgs = new ArrayList<>();
@@ -173,7 +178,14 @@ public final class Cli {
                     }
                     i++;
                 }
-                case "--verify-only" -> jobType = JobType.VERIFY_ONLY;
+                case "--verify-only" -> {
+                    jobType = JobType.VERIFY_ONLY;
+                    askedVerifyOnly = true;
+                }
+                case "--no-verify" -> {
+                    jobType = JobType.COPY_ONLY;
+                    askedNoVerify = true;
+                }
                 case "--exclude-dest" -> {
                     String value = value(args, i, arg);
                     if (value.isBlank()) {
@@ -262,6 +274,12 @@ public final class Cli {
                 }
                 default -> throw new UsageException("Unknown option: " + arg);
             }
+        }
+
+        if (askedVerifyOnly && askedNoVerify) {
+            // Whichever came last would silently win, and the two flags describe opposite jobs.
+            throw new UsageException("--verify-only and --no-verify contradict each other: one compares"
+                    + " without copying, the other copies without comparing.");
         }
 
         if (source == null || source.isBlank()) {
@@ -379,7 +397,7 @@ public final class Cli {
         }
 
         if (!options.destinationExcluded().isEmpty()
-                && options.request().jobType() != JobType.VERIFY_ONLY) {
+                && options.request().jobType().copies()) {
             // Say it rather than let a flag quietly do nothing.
             err.println("Note: --exclude-dest does not apply to a copy; a copy follows the source "
                     + "selection. Use --verify-only to leave files out of the comparison.");
@@ -389,7 +407,7 @@ public final class Cli {
         engine.setJobTimeoutMillis(options.timeoutMillis());
         engine.setBandwidthLimitKbps(options.bandwidthLimitKbps());
         engine.setResultLimit(options.maxResults());
-        ProgressReporter reporter = new ProgressReporter(out, options.quiet());
+        ProgressReporter reporter = new ProgressReporter(out, options.quiet(), options.request().jobType());
         JobResult result;
         try {
             result = engine.execute(options.request(), reporter);
@@ -404,9 +422,16 @@ public final class Cli {
             out.println("error: " + error);
         }
         out.println(result.message());
-        out.printf("totals: checked=%d copied=%d matched=%d mismatched=%d missing=%d destination-only=%d%n",
-                result.filesChecked(), result.filesCopied(), result.filesMatched(),
-                result.filesMismatched(), result.filesMissing(), result.filesExtra());
+        if (!options.request().jobType().verifies()) {
+            // The usual totals would read "checked=0 matched=0 mismatched=0" for a job that compared
+            // nothing on purpose, which looks like a report of a problem rather than an absence of one.
+            out.printf("totals: copied=%d (verification was off: nothing was hashed or compared)%n",
+                result.filesCopied());
+        } else {
+            out.printf("totals: checked=%d copied=%d matched=%d mismatched=%d missing=%d destination-only=%d%n",
+                    result.filesChecked(), result.filesCopied(), result.filesMatched(),
+                    result.filesMismatched(), result.filesMissing(), result.filesExtra());
+        }
 
         int exit = exitCode(result);
         writeReports(options, result, out);
@@ -455,11 +480,14 @@ public final class Cli {
     private static final class ProgressReporter implements ProgressListener {
         private final PrintStream out;
         private final boolean quiet;
+        private final boolean compares;
+        private boolean explained;
         private int lastPercent = -1;
 
-        private ProgressReporter(PrintStream out, boolean quiet) {
+        private ProgressReporter(PrintStream out, boolean quiet, JobType jobType) {
             this.out = out;
             this.quiet = quiet;
+            this.compares = jobType.verifies();
         }
 
         @Override
@@ -484,7 +512,23 @@ public final class Cli {
 
         @Override
         public void onFileProcessed(String relativePath, String kind, String sourceHash, String destHash) {
-            if (quiet || "OK".equals(kind) || "COPIED".equals(kind)) {
+            // A verifying job already names every file with its verdict, so the transfer announcement is
+            // noise. A job that compares nothing has no verdict, and the announcement is the only per-file
+            // record it produces, so it is printed.
+            if (quiet || "OK".equals(kind)) {
+                return;
+            }
+            if ("TRANSFERRING".equals(kind)) {
+                if (!explained) {
+                    explained = true;
+                    out.println("  rsync writes each file as a hidden temporary file in its destination"
+                        + " folder (.big.iso.qjX7kX) and renames it when that file's transfer completes.");
+                }
+                out.println("  > " + relativePath);
+                return;
+            }
+            boolean transferNoise = compares && ("COPIED".equals(kind) || "WOULD_COPY".equals(kind));
+            if (transferNoise) {
                 return;
             }
             out.println("  " + kind + "  " + relativePath

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JList;
 import javax.swing.JTextArea;
@@ -46,7 +47,8 @@ class FileVerifierViewTest {
         // exactly as it found them.
         savedPrefs = new java.util.HashMap<>();
         for (String key : List.of("sourceDir", "destDir", "ignorePatterns", "includeHidden",
-            "symlinkPolicy", "timeoutSeconds", "dryRun", "detectExtra", "jobType", "darkMode")) {
+            "symlinkPolicy", "timeoutSeconds", "dryRun", "detectExtra", "jobType", "verifyAfterCopy",
+            "darkMode")) {
             savedPrefs.put(key, prefs.get(key, null));
         }
     }
@@ -77,7 +79,7 @@ class FileVerifierViewTest {
         for (String name : List.of(
             "sourcePathField", "destPathField", "sourceBrowseButton", "destBrowseButton",
             "ignoreField", "hiddenCheck", "extraCheck", "symlinkCombo", "scanButton",
-            "copyVerifyButton", "verifyOnlyButton", "workSetLabel", "sourceList", "destList",
+            "copyButton", "verifyOnlyButton", "verifyCheck", "workSetLabel", "sourceList", "destList",
             "sourceFilterField", "destFilterField", "progressBar", "statusLabel", "phaseLabel",
             "logArea", "outputTabs", "resultsTable", "onlyProblemsCheck", "exportCsvButton",
             "exportJsonButton", "dryRunCheck", "jobTimeoutField", "darkModeCheck", "runButton",
@@ -89,7 +91,7 @@ class FileVerifierViewTest {
     @Test
     void modeChoiceIsOneControlAndTheWorkSetLineStartsHonest() throws Exception {
         FileVerifierView view = build();
-        JToggleButton copy = (JToggleButton) field(view, "copyVerifyButton");
+        JToggleButton copy = (JToggleButton) field(view, "copyButton");
         JToggleButton verify = (JToggleButton) field(view, "verifyOnlyButton");
         JLabel workSet = (JLabel) field(view, "workSetLabel");
 
@@ -101,6 +103,104 @@ class FileVerifierViewTest {
         verify.doClick();
         assertTrue(verify.isSelected());
         assertFalse(copy.isSelected(), "both halves of a segmented control cannot be selected");
+    }
+
+    @Test
+    void verificationIsASwitchOnTheCopyJobRatherThanAThirdMode() throws Exception {
+        // Starting from no stored settings, so "what the default is" is a fact about the program and not
+        // about whatever the last test or the developer left behind.
+        prefs.remove("jobType");
+        prefs.remove("verifyAfterCopy");
+
+        FileVerifierView view = build();
+        JToggleButton copy = (JToggleButton) field(view, "copyButton");
+        JToggleButton verifyOnly = (JToggleButton) field(view, "verifyOnlyButton");
+        JCheckBox verify = (JCheckBox) field(view, "verifyCheck");
+        JButton run = (JButton) field(view, "runButton");
+
+        assertTrue(verify.isSelected(),
+            "the default job compares: not comparing is the user's choice to make, not the program's");
+        assertEquals(FileSyncEngine.JobType.COPY_AND_VERIFY, field(view, "currentJobType"));
+        assertEquals("Run job", run.getText());
+
+        SwingUtilities.invokeAndWait(verify::doClick);
+        assertEquals(FileSyncEngine.JobType.COPY_ONLY, field(view, "currentJobType"));
+        assertEquals("Run copy", run.getText(),
+            "a button that still says 'job' while quietly comparing nothing is the kind of vagueness"
+                + " this tool is supposed to remove");
+
+        SwingUtilities.invokeAndWait(verifyOnly::doClick);
+        assertEquals(FileSyncEngine.JobType.VERIFY_ONLY, field(view, "currentJobType"));
+        assertEquals("Run verify", run.getText());
+        assertFalse(verify.isEnabled(),
+            "the switch means nothing for a job that copies nothing, so it cannot look adjustable");
+
+        SwingUtilities.invokeAndWait(copy::doClick);
+        assertTrue(verify.isEnabled());
+        assertFalse(verify.isSelected(), "the switch keeps the setting the user last chose");
+        assertEquals(FileSyncEngine.JobType.COPY_ONLY, field(view, "currentJobType"));
+    }
+
+    @Test
+    void theVerificationSwitchSurvivesRestart() throws Exception {
+        prefs.remove("jobType");
+        prefs.remove("verifyAfterCopy");
+
+        FileVerifierView view = build();
+        JCheckBox verify = (JCheckBox) field(view, "verifyCheck");
+        SwingUtilities.invokeAndWait(verify::doClick);
+
+        FileVerifierView restarted = build();
+        assertFalse(((JCheckBox) field(restarted, "verifyCheck")).isSelected(),
+            "a switch the user turned off should not silently turn itself back on next time");
+        assertEquals(FileSyncEngine.JobType.COPY_ONLY, field(restarted, "currentJobType"));
+    }
+
+    @Test
+    void copiedRowsReachTheTableAndAreNotCountedAsProblems() throws Exception {
+        FileVerifierView view = build();
+        JTable table = (JTable) field(view, "resultsTable");
+        JCheckBox onlyProblems = (JCheckBox) field(view, "onlyProblemsCheck");
+        javax.swing.JTabbedPane tabs = (javax.swing.JTabbedPane) field(view, "outputTabs");
+        JButton exportCsv = (JButton) field(view, "exportCsvButton");
+
+        // A copy with verification off has verdicts for nothing, and its whole record is the transfer. An
+        // empty table for a job that wrote two files would read as "nothing happened".
+        FileSyncEngine.JobResult result = new FileSyncEngine.JobResult(
+            FileSyncEngine.JobStatus.COMPLETED,
+            "Copy complete: 2 file(s) copied. Verification was turned off, so none of them were compared.",
+            0, 0, 0, 0, 0, 2, 0,
+            List.of(new FileSyncEngine.FileOutcome("a.txt", "COPIED", null, null),
+                new FileSyncEngine.FileOutcome("b.txt", "COPIED", null, null)),
+            List.of(), List.of());
+
+        java.lang.reflect.Method showResults = FileVerifierView.class
+            .getDeclaredMethod("showResults", FileSyncEngine.JobResult.class);
+        showResults.setAccessible(true);
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                showResults.invoke(view, result);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        assertEquals(2, table.getRowCount(), "what was written is this job's record");
+        assertEquals("COPIED", table.getValueAt(0, 0));
+        assertEquals("", table.getValueAt(0, 2), "no hashes were computed, so the row cannot invent any");
+        assertEquals("Results (2)", tabs.getTitleAt(1));
+        assertTrue(exportCsv.isEnabled(), "an export of what was copied is the point of listing it");
+
+        SwingUtilities.invokeAndWait(() -> {
+            onlyProblems.setSelected(true);
+            try {
+                showResults.invoke(view, result);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        assertEquals(0, table.getRowCount(),
+            "'only problems' means a comparison that failed; a file that was merely copied is not one");
     }
 
     @Test

@@ -119,7 +119,10 @@ class UiThemeTest {
     void outcomeKindsMapToColours() {
         UiTheme.install(false);
         assertEquals(UiTheme.LIGHT.ok(), UiTheme.outcomeColor("OK"));
-        assertEquals(UiTheme.LIGHT.ok(), UiTheme.outcomeColor("COPIED"));
+        // A file that was copied but never compared must not wear the colour of a file that passed a
+        // check: that green would be read as "verified" by someone who verified nothing.
+        assertEquals(UiTheme.LIGHT.muted(), UiTheme.outcomeColor("COPIED"));
+        assertEquals(UiTheme.LIGHT.info(), UiTheme.outcomeColor("WOULD_COPY"));
         assertEquals(UiTheme.LIGHT.bad(), UiTheme.outcomeColor("MISMATCH"));
         assertEquals(UiTheme.LIGHT.warn(), UiTheme.outcomeColor("MISSING"));
         assertEquals(UiTheme.LIGHT.info(), UiTheme.outcomeColor("EXTRA"));

@@ -421,8 +421,8 @@ class FileSyncEngineTest {
         assertEquals(0, result.filesMismatched());
         assertEquals(0, result.filesMissing());
         assertEquals("source version\n", Files.readString(dest.resolve("stale.txt")));
-        assertEquals("COPIED", rec.eventFor("stale.txt").status());
-        assertEquals("COPIED", rec.eventFor("keep.txt").status());
+        assertEquals("TRANSFERRING", rec.eventFor("stale.txt").status());
+        assertEquals("TRANSFERRING", rec.eventFor("keep.txt").status());
     }
 
     // ---------------------------------------------------------------- B5
@@ -460,8 +460,10 @@ class FileSyncEngineTest {
         assertTrue(result.isSuccess(), result.message());
         assertEquals(100, rec.lastPercent());
         rec.assertProgressIsCoarse();
-        assertEquals(List.of("copying", "verifying", "done"), rec.phases, rec.phases.toString());
-        assertTrue(rec.files.stream().anyMatch(f -> f.status().equals("COPIED")), rec.files.toString());
+        assertEquals(List.of("hashing source", "copying", "verifying", "done"), rec.phases,
+            "hashing the source is not copying, and a job that is doing it must not be labelled copying: "
+                + rec.phases);
+        assertTrue(rec.files.stream().anyMatch(f -> f.status().equals("TRANSFERRING")), rec.files.toString());
         assertTrue(rec.percents.contains(FileSyncEngine.COPY_PROGRESS_END),
                 "the bar must reach the end of the copy phase: " + rec.percents);
     }
@@ -489,8 +491,10 @@ class FileSyncEngineTest {
             // 100 (verified).
             assertEquals(List.of(0, 21, 42, FileSyncEngine.COPY_PROGRESS_END, 100), rec.percents,
                     rec.percents.toString());
-            assertTrue(rec.statusTexts.stream().anyMatch(s -> s.contains("30% transferred")),
-                    rec.statusTexts.toString());
+            assertTrue(rec.statusTexts.stream().anyMatch(s -> s.contains("30%") && s.contains("one.txt")),
+                "the copy status has to name the file being written and how far along the transfer is - "
+                    + "a 30 GB file otherwise shows one number that barely moves for an hour: "
+                    + rec.statusTexts);
         } finally {
             FileSyncEngine.setRsyncBinary("rsync");
         }

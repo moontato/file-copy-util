@@ -346,3 +346,44 @@ exception.
 with the project version. A hardcoded version string in the UI is a number that drifts out of sync with the jar
 name, the tag, and the changelog, and then it is worse than nothing because it is trusted. A build that stamps
 nothing says `version unknown`.
+
+**A mode is for what a job does to your files; a switch is for how far it goes.** *Copy* and *Verify only* are
+one two-way control because they are different acts - one writes into your destination, one does not - and no
+checkbox attached to a copy job can produce "look without touching". Verification is a switch on the copy job,
+on by default, because comparing is the reason this tool exists; turning it off is the user's decision, not the
+program's. What is not allowed is a job that skipped a check and does not say so: the button label, the status
+line, the log, the job's own summary, the CLI totals and the export all carry that fact.
+
+**A result row states one fact about one file.** A verifying job writes the verdict, and not also a row for the
+transfer. A job that compares nothing writes `COPIED` - or `WOULD_COPY` in a dry run, because nothing was
+written - because the transfer is the only fact it has, and a job that wrote 214 files must not leave an empty
+table that reads as "nothing happened". `COPIED` is not coloured like a check that passed, and it carries no
+hashes because none were computed.
+
+**A job that will not compare does not read the files.** Hashing is the expensive part of a large job, and a
+digest nobody is going to use is not preparation, it is cost. This is observable rather than assumed: an
+unreadable source file produces a "Could not read" warning in a verifying job and no such warning in a copy-only
+one, because the copy-only job never opened it.
+
+**Cancelling means the whole process tree, not the process we spawned.** A local `rsync` copy is three
+processes (measured: parent, child, grandchild). The tree is snapshotted before anyone is signalled, because
+after the parent dies its children are re-parented to init and a `descendants()` call then finds nothing at
+all. SIGTERM goes to everyone first - rsync answers it by deleting the partial file it was writing, so a
+cancelled job leaves nothing in the destination - and only survivors are killed outright. A *successful* copy
+sweeps the tree too: rsync's parent can exit while a child is still finishing, and an orphaned child is
+something this program can never reach again. A job that has been told to stop never starts rsync, and a
+cancellation landing between that check and the fork kills the process immediately: a reader left on the
+source disk with nothing watching it is the exact failure a person experiences as "I cancelled it, the window
+closed, and the drive is still going".
+
+**A phase is named for the work being done.** Hashing 30 GB of source before rsync writes a single byte is not
+copying, and calling it copying - with an empty destination folder - is what makes a job look stalled. The
+phases are `hashing source`, `copying`, `verifying`.
+
+**Progress names the file in flight.** One overall percentage is not information during a 30 GB transfer: it
+moves too slowly to tell you the program is alive. The status names the file being written, how much of it has
+landed, how many files are finished, the rate and the elapsed time, derived from rsync's own stats lines and
+announcements - measured on rsync 3.1.3 and 3.4.0, an itemize line arrives when a file's transfer *starts* and
+the `xfr#` count is what says a file *finished*. Where the program cannot know something it says less, not
+more: a stats line this rsync variant formats differently moves the bar and drops the per-file figures rather
+than guessing.

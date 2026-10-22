@@ -175,6 +175,45 @@ class CliTest {
     }
 
     @Test
+    void copyingWithoutComparingIsItsOwnMode() throws Exception {
+        TestSupport.write(source.resolve("a.txt"), "a");
+
+        Cli.Options options = Cli.parse(new String[]{"--cli", "--source", source.toString(),
+            "--dest", dest.toString(), "--all", "--no-verify"});
+
+        assertEquals(JobType.COPY_ONLY, options.request().jobType());
+        assertTrue(options.request().jobType().copies());
+        assertFalse(options.request().jobType().verifies());
+    }
+
+    @Test
+    void verifyOnlyAndNoVerifyCannotBothBeAskedFor() throws Exception {
+        // Parsed in order, the later flag would silently win, and the two describe opposite jobs.
+        TestSupport.write(source.resolve("a.txt"), "a");
+        Output o = new Output();
+        assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+            "--all", "--verify-only", "--no-verify"));
+        assertTrue(o.err().contains("contradict each other"), o.err());
+    }
+
+    @Test
+    void aHeadlessCopyThatVerifiesNothingSaysSoInsteadOfReportingZeroChecks() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+        TestSupport.write(source.resolve("a.txt"), "a");
+        TestSupport.write(source.resolve("b.txt"), "b");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
+            "--all", "--no-verify");
+
+        assertEquals(0, exit, o.out() + o.err());
+        assertTrue(o.out().contains("Copy complete: 2 file(s) copied"), o.out());
+        assertTrue(o.out().contains("verification was off"), o.out());
+        assertFalse(o.out().contains("checked=0 matched=0"),
+            "totals full of zeroes read as a report of problems, not as an absence of comparison: " + o.out());
+    }
+
+    @Test
     void flagsMapOntoEngineSettings() throws Exception {
         TestSupport.write(source.resolve("a.txt"), "a");
 

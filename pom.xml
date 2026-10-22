@@ -9,7 +9,7 @@
          (see FileVerifierFrame.setTitle). Package and groupId stay com.fileverifier to match the code. -->
     <groupId>com.fileverifier</groupId>
     <artifactId>file-copy-util</artifactId>
-    <version>1.3.0</version>
+    <version>1.4.0</version>
     <packaging>jar</packaging>
 
     <name>File Copy Util</name>
