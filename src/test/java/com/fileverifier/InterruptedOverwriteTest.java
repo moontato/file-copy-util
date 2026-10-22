@@ -211,6 +211,71 @@ class InterruptedOverwriteTest {
             "and its transfer is called uncertain rather than copied: " + rows);
     }
 
+    /**
+     * A completed symlink in the same interrupted job.
+     *
+     * <p>A symlink is the case where "expected size from the source" is meaningless: the size of a link is
+     * the size of its target path string on some systems and its own inode's on others, and it is not what
+     * says the copy worked. What says it worked is that the destination did not have that name before, and
+     * has a link with the same target text now. This fixture also proves the ledger does not turn a link
+     * into uncertain merely because a later file in the same job was interrupted.
+     */
+    @Test
+    void aCompletedSymlinkInAnInterruptedJobIsCopiedNotUncertain(@TempDir Path tmp) throws Exception {
+        assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        fill(src.resolve("a-small.txt"), 'N', 8_000);
+        Files.createSymbolicLink(src.resolve("a-link.bin"), Path.of("a-small.txt"));   // relative target
+        fill(src.resolve("b-overwrite.bin"), 'N', SIZE);
+        fill(dst.resolve("b-overwrite.bin"), 'O', SIZE);
+
+        AtomicReference<FileSyncEngine> engineRef = new AtomicReference<>();
+        AtomicBoolean sawInFlight = new AtomicBoolean();
+        Thread watcher = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + 60_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (hiddenTemporaryFor(dst, "b-overwrite.bin") != null) {
+                    sawInFlight.set(true);
+                    engineRef.get().cancel();
+                    return;
+                }
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "interrupt-after-the-link");
+        watcher.setDaemon(true);
+
+        JobResult result;
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engineRef.set(engine);
+            engine.setBandwidthLimitKbps(THROTTLE_KBPS);
+            watcher.start();
+            result = engine.execute(TestSupport.request(src, dst, JobType.COPY_ONLY,
+                TestSupport.selection("a-small.txt", "a-link.bin", "b-overwrite.bin"), Selection.none(),
+                new ScanOptions(ScanOptions.DEFAULTS.ignorePatterns(), true,
+                    ScanOptions.SymlinkPolicy.LINK), false), SILENT);
+        }
+
+        assertTrue(sawInFlight.get(), result.message());
+        assertEquals(JobStatus.FAILED, result.status(), result.message());
+        List<String> rows = kinds(result.outcomes());
+        assertTrue(rows.contains("COPIED:a-link.bin"),
+            "the link was created before the interruption and its destination is a link with the same"
+                + " target text: " + rows);
+        assertTrue(rows.contains("COPIED:a-small.txt"), "the small file finished first: " + rows);
+        assertTrue(rows.contains("UNCERTAIN:b-overwrite.bin"),
+            "while the interrupted same-size overwrite stays uncertain: " + rows);
+        assertTrue(Files.isSymbolicLink(dst.resolve("a-link.bin")),
+            "and it really is a link at the destination, not a copy of the target's contents");
+        assertEquals("a-small.txt", Files.readSymbolicLink(dst.resolve("a-link.bin")).toString(),
+            "the link text is what it was in the source");
+    }
+
     private static void fill(Path file, char marker, int bytes) throws IOException {
         Files.createDirectories(file.getParent());
         try (var channel = java.nio.channels.FileChannel.open(file,
@@ -240,6 +305,68 @@ class InterruptedOverwriteTest {
      * disappears when the transfer completes or is killed, so it is a fact about the destination rather
      * than about this program's reading of rsync's output.
      */
+    /**
+     * The snapshot itself is cancellable, and says so when it was cut short.
+     *
+     * <p>Recording the before-state costs one metadata call per selected file. On a slow mount that can be
+     * the longest thing a job does before rsync even starts, so a Cancel pressed during it must stop the
+     * job rather than run to the end of the list - and the names it never reached must not be reported as
+     * if their transfer had been checked.
+     */
+    @Test
+    void aSnapshotCutShortByCancellationNamesItselfAndConfirmsNothingForTheRest(@TempDir Path tmp)
+            throws Exception {
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        List<FileEntry> workSet = new java.util.ArrayList<>();
+        for (int i = 0; i < 1_000; i++) {
+            String name = String.format("f%04d.bin", i);
+            TestSupport.write(src.resolve(name), "x");
+            workSet.add(new FileEntry(name, src.resolve(name)));
+        }
+
+        List<String> warnings = new java.util.ArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger checks = new java.util.concurrent.atomic.AtomicInteger();
+        TransferLedger ledger = new TransferLedger(src, dst, workSet, warnings,
+                () -> checks.incrementAndGet() > 2);
+
+        assertTrue(warnings.stream().anyMatch(w -> w.contains("stopped early")), warnings.toString());
+
+        // rsync "completed" nothing here: the job was cut short, so only the before-and-after comparison
+        // can say anything, and it can only say something about the names it recorded.
+        String early = workSet.get(0).relPath();
+        String late = workSet.get(workSet.size() - 1).relPath();
+        // Nothing was copied, so neither is COPIED; the point is that the unrecorded one can never become
+        // COPIED by any evidence, and the recorded one is at least a name the engine knows the state of.
+        assertEquals(FileSyncEngine.TransferDisposition.UNCERTAIN, ledger.disposition(late, false, false),
+            "the file the snapshot never reached cannot be confirmed");
+        assertEquals(FileSyncEngine.TransferDisposition.UNCERTAIN, ledger.disposition(early, false, false),
+            "a file that was not written is not copied, recorded or not");
+    }
+
+    /** A completed creation in a job that was otherwise cut short is provable, and is claimed. */
+    @Test
+    void aFileCreatedBeforeTheInterruptionIsConfirmedByTheSnapshot(@TempDir Path tmp) throws Exception {
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("made.txt"), "12345");
+        TestSupport.write(src.resolve("untouched.txt"), "9");
+        List<FileEntry> workSet = List.of(
+            new FileEntry("made.txt", src.resolve("made.txt")),
+            new FileEntry("untouched.txt", src.resolve("untouched.txt")));
+
+        List<String> warnings = new java.util.ArrayList<>();
+        TransferLedger ledger = new TransferLedger(src, dst, workSet, warnings, () -> false);
+        // Pretend the first file arrived and the second did not.
+        TestSupport.write(dst.resolve("made.txt"), "12345");
+
+        assertEquals(FileSyncEngine.TransferDisposition.COPIED, ledger.disposition("made.txt", false, false),
+            "absent before, present after at the expected kind and size: this job created it");
+        assertEquals(FileSyncEngine.TransferDisposition.UNCERTAIN, ledger.disposition("untouched.txt",
+                false, false), "rsync announced it, nothing is there, so nothing may be claimed");
+        assertTrue(warnings.isEmpty(), warnings.toString());
+    }
+
     private static String hiddenTemporaryFor(Path directory, String name) {
         try (var entries = Files.newDirectoryStream(directory)) {
             for (Path sibling : entries) {

@@ -395,6 +395,27 @@ Rules: capture source digests and sizes before and assert unchanged after; where
 - **Suite now:** 189 tests, 0 failures, 0 errors, 0 skipped; SpotBugs 0 findings; `mvn clean verify`
   succeeds with `-Werror`. Nothing is still red.
 
+**Source review of the first remediation commits, and what was fixed (2026-10-22)**
+
+Five implementation gaps found by reading the code, each fixed with a regression case:
+
+| Gap | Fix | Regression |
+| --- | --- | --- |
+| `Cli.readNameList` split the line channel on regex `\R`, which also ends a line at vertical tab, form feed, NEL, U+2028 and U+2029: `foo\u000Bbar` became the two selections `foo` and `bar` | the delimiter is defined as a line feed; a CR ends a line only when **every** line in the file ends CRLF; a mixed file is refused with a pointer to `--files-from0`; nothing else is a line ending | `theNewlineChannelSplitsOnLineFeedsOnly` (each of the five characters, parse level) and `aNameContainingATabLikeControlCharacterIsNotSplitIntoTheFilesBesideIt` (end to end, with `foo`, `bar`, `baz` present in the source as decoys and required absent from the destination), plus `aNameEndingInACarriageReturnIsRefusedInALineChannelRatherThanGuessedAt` (mixed refused, whole-file CRLF accepted, NUL channel carries it) |
+| the legacy space-separated itemize form still dropped a name's leading space (`>f+++++++++  a ` → `a `) and treated a pipe inside a name as the column boundary (`>f+++++++++ pipe|name`) | the delimiter is the **first** separator after the itemize column - the itemize column contains neither a space nor a pipe - and exactly one character is removed | `theParserStillReadsTheFormWithoutAnOutFormat`, now `assertAll` with the two failing shapes and `>f+++++++++  ` (a name that is one space) |
+| `TransferLedger` derived the expected kind from `Files.size()`, which follows a source symlink, so a completed link could fall to `UNCERTAIN`; and a change of object kind alone was accepted as replacement evidence | the ledger now records what the job *intended* - source kind, source size and link text read from the source **before** the transfer, not measured afterwards - and compares a created link by target text; a created regular file by expected size; and a replacement only by a changed `(dev, ino)` identity. No kind-change fallback | `aCompletedSymlinkInAnInterruptedJobIsCopiedNotUncertain` (link completed before the interrupted overwrite: `COPIED`, with the link text checked, while the overwrite stays `UNCERTAIN`), `aFileCreatedBeforeTheInterruptionIsConfirmedByTheSnapshot`, `aSnapshotCutShortByCancellationNamesItselfAndConfirmsNothingForTheRest` |
+| CSV and JSON serialised only kind, path and digests, so a verifying job stopped before its comparison exported `PENDING` for a completed transfer and an unknown one identically | CSV gains `transfer` and `verification` columns appended after the existing four (order and meaning of the first four unchanged); JSON gains `transfer` and `verification` fields; the Results table gains a `Transfer` column, also last | `twoPendingRowsWithDifferentTransfersExportDifferently` and `aCopyOnlyRowExportsItsTransferAndSaysNoComparisonWasMade`, both asserting the emitted CSV lines and JSON text, not the in-memory records |
+| the four-version CI job ran only `RsyncVersionMatrixTest`, and the safety fixtures therefore tested the runner's packaged rsync; the workflow ran `mvn verify` while the recorded command was `mvn clean verify` | `FCU_RSYNC` pins the binary a whole run uses (and `TestSupport` plus `RsyncVersionMatrixTest` refuse to run when a pinned binary cannot run, instead of skipping every rsync test); the matrix job now checks each built binary reports the version it was built as, then runs the safety fixtures once per binary with that binary pinned, with `-Dsurefire.failIfNoSpecifiedTests=true`; `mvn -B -ntp clean verify` | local equivalent run: `FCU_RSYNC=…/rsync-3.1.3/rsync mvn test -Dtest='RsyncVersionMatrixTest,AuditNameFidelityTest,InterruptedOverwriteTest,FileSyncEngineTest,CancellationAndProcessTreeTest,CollisionAndRaceTest,RobustnessTest,VerificationOptionalTest,CliTest'` → 121 tests, 0 failures; the same set pinned to 3.4.0 → green; `FCU_RSYNC=/nonexistent` → the run errors out rather than skipping |
+
+**Ledger cost, measured before any scale claim was restated** (one container, local filesystem; the numbers
+are this environment's, not a bound): the pre-copy snapshot took **0.8 s for 100k selected files** when the
+destination was empty and **0.5 s** when it already held every file, adding **13-19 MB** of heap; **2.5 s and
+38 MB for 300k files**. Peak RSS during a 100k-file copy-only job: about **410 MB**. The snapshot loop is
+cancellable (checked every 256 entries): Cancel during it stops the job, the files it had not reached are
+named as unconfirmable, and that is stated in the warnings. README now says plainly that metadata latency on
+a network mount can be several times higher, and no automatic size threshold was added - attribution is not
+silently weakened for large jobs.
+
 **Next, in order**
 
 1. Phase 2: write safety - A01 overlap refusal, §2.6 export protection, A04 containment across the whole

@@ -171,6 +171,20 @@ costs kilobytes):
 | 100k files | ~1 s | ~2.4 s | ~6 s (dry run) | fits in 128 MB | 1.3 s, ~490 MB |
 | 300k files | ~3.6 s | ~7 s | ~17 s (dry run) | ~256 MB verify, ~320 MB copy | 7.1 s, ~710 MB |
 
+**A job that copies also records what it is about to overwrite** (see *When a copy is interrupted*), and
+that record is one small entry per selected file. Measured on this container's local disk, re-measured
+after the record was added:
+
+| Tree | Snapshot before the copy | Memory the snapshot adds | Peak RSS of the JVM |
+|---|---|---|---|
+| 100k files | 0.8 s (destination empty), 0.5 s (destination already holds every file) | 13–19 MB | ~410 MB during a 100k copy |
+| 300k files | 2.5 s | 38 MB | ~410 MB for the snapshot alone |
+
+These are timings on one local filesystem in one container, not a general bound: on a network mount the
+metadata calls can be several times slower, which is why the snapshot is cancellable — Cancel during it
+stops the job rather than walking the whole list, and the files it had not reached are reported as
+unconfirmable rather than assumed.
+
 Time scales linearly. Memory is the constraint, and it is deliberately bounded: results are decided one
 file at a time (no digest map per side), the destination is scanned only when destination-only reporting
 is on, and the results list is capped at 50000 entries — raise it with `--max-results N` when the export
@@ -183,10 +197,14 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-176 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), the CLI front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
+198 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, the CLI
+front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
 checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
-`FCU_RSYNC_BINARIES=path,path` at other binaries to extend the matrix.
+`FCU_RSYNC_BINARIES=path,path` at other binaries to extend the matrix, or `FCU_RSYNC=/path/to/rsync` to run
+the whole suite against one specific build — which is what CI does per matrix entry, and a pinned binary that
+cannot run fails the run instead of skipping the rsync tests.
 
 `mvn verify` also runs the static-analysis gates: `javac -Xlint:all -Werror` and SpotBugs at Medium
 severity. CI (`.github/workflows/ci.yml`) runs `mvn -B verify` plus a CLI smoke test against the packaged
@@ -217,6 +235,19 @@ jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the
 ```
 
 `FileSyncEngine` has no Swing dependency, so the copy/verify logic can be run and tested headlessly.
+
+## What a report row says
+
+Each row answers two separate questions, because a job can know one and not the other:
+
+- **`transfer`** — what happened to the bytes: `COPIED`, `WOULD_COPY` (dry run), `UNCERTAIN`, `NOT_COPIED`.
+- **`verification`** — whether the two ends were compared: `compared`, `pending` (the job meant to compare
+  this file and never got to it), `not-applicable` (verification was turned off).
+
+CSV carries both as the `transfer` and `verification` columns, JSON as `transfer` and `verification`
+fields, and the window shows the transfer answer in the Results table's `Transfer` column. Both are
+appended after the columns that were already there, so anything already reading `status`, `path` and the
+two digests still reads the same thing.
 
 ## When a copy is interrupted
 

@@ -40,6 +40,36 @@
 - A file's transfer and its verdict are recorded separately, so a copied-and-verified file is one file with
   `copied=1, checked=1, matched=1`.
 
+### Fixed — after source review of the first remediation commits
+
+- **The line-delimited CLI channels no longer split a name at the wrong character.** They used a regex
+  `\R`, which treats vertical tab, form feed, NEL, line separator and paragraph separator as line endings
+  too: a file named `foo\u000Bbar` became two selections, `foo` and `bar`. The delimiter is now defined - a
+  line feed, and a carriage return before it only when the whole file uses CRLF - and a file that mixes the
+  two is refused with a pointer to `--files-from0` rather than guessed at. Every other character stays part
+  of the name.
+- **The older rsync output format no longer loses filename data.** Without an out-format, the delimiter is
+  the space after the itemize column: `>f+++++++++  a ` is the file `" a "`, and `>f+++++++++ pipe|name` is
+  the file `pipe|name`. Only the delimiter itself is removed.
+- **An interrupted symlink is no longer reported as uncertain when it completed.** What a copied symlink
+  must match is its target text, not a size - and the expected kind and size are now taken from the source
+  *before* the transfer, not measured afterwards, so a source that changed mid-job cannot be matched
+  against its own new size. Where a replacement cannot be shown by a changed file identity, the answer is
+  `UNCERTAIN`: a change of object kind alone is not evidence this job did it.
+- **Exports carry the transfer answer.** CSV gains `transfer` and `verification` columns (appended, so the
+  existing four columns keep their meaning and order) and JSON gains `transfer` and `verification` fields.
+  The Results table gains a `Transfer` column. Before this, a verifying job stopped before its comparison
+  exported `PENDING` for a file whose transfer completed and for a file whose transfer is unknown - the
+  distinction the record exists to keep, lost on the way out.
+- **The snapshot the copy record needs is cancellable.** Cancel during it stops the job instead of walking
+  the rest of the list, and the files it had not reached are named as unconfirmable.
+
+### Added
+
+- `FCU_RSYNC`: pin the rsync binary this program (or one test run) uses, instead of taking whatever is on
+  `PATH`. A test run with `FCU_RSYNC` set to a binary it cannot run now refuses to run at all rather than
+  quietly skipping every rsync-dependent test.
+
 ### CI and releases
 
 - One reusable validation workflow - tests, CLI smoke tests, and an rsync matrix built from checksum-pinned

@@ -80,37 +80,38 @@ final class RsyncNameCodec {
     /**
      * The file name in one of rsync's mention lines.
      *
-     * <p>With {@code --out-format='%i|%n'} the two fields are separated by the first {@code '|'} and
-     * the name is the rest of the line, kept verbatim: a name containing {@code '|'}, a leading or
-     * trailing space, or a tab survives intact. Without an out-format, rsync separates the itemize
-     * column from the name with a single space, and the same "first separator, rest verbatim" rule
-     * applies. Both forms are accepted here so the engine keeps working whichever way it asked.
+     * <p>Two shapes are read. With {@code --out-format='%i|%n'} - what this engine asks for - the itemize
+     * column is followed by {@code '|'} and the name is the rest of the line. Without an out-format, rsync
+     * follows the itemize column with a single space and the name is the rest of the line. In both cases
+     * the delimiter is the <b>first</b> separator after the itemize column, because the itemize column
+     * itself contains neither a space nor a pipe, and every later separator belongs to the name.
+     *
+     * <p>Exactly one character is removed: the delimiter. Trimming the remainder is what used to lose a
+     * name's leading or trailing space, and searching the line for a pipe is what used to treat a pipe
+     * inside a name as the column boundary. Both are wrong in the same way - they decide the name is
+     * something other than the bytes rsync printed for it.
      */
     static String nameOf(String line) {
         if (line.isEmpty()) {
             return null;
         }
-        int separator = line.indexOf('|');
-        int splitAt = separator >= 0 ? separator : line.indexOf(' ');
-        if (splitAt < 0 || splitAt == line.length() - 1) {
+        int pipe = line.indexOf('|');
+        int space = line.indexOf(' ');
+        int delimiter;
+        if (pipe < 0) {
+            delimiter = space;
+        } else if (space < 0) {
+            delimiter = pipe;
+        } else {
+            delimiter = Math.min(pipe, space);
+        }
+        if (delimiter < 0 || delimiter == line.length() - 1) {
             return null;
         }
-        String name = line.substring(splitAt + 1);
-        if (separator < 0) {
-            // rsync pads the name with the separator space; a name may itself start with a space,
-            // so only the one separating space is dropped - never anything else.
-            name = name.startsWith(" ") ? name.substring(1) : name;
-        }
-        name = stripTrailingLineBreak(name);
+        // The reader has already removed the line terminator; a carriage return left here would be part
+        // of a name, and rsync escapes control characters, so it cannot arrive raw. Nothing is stripped.
+        String name = line.substring(delimiter + 1);
         return name.isEmpty() ? null : decode(name);
-    }
-
-    private static String stripTrailingLineBreak(String value) {
-        int end = value.length();
-        while (end > 0 && (value.charAt(end - 1) == '\n' || value.charAt(end - 1) == '\r')) {
-            end--;
-        }
-        return value.substring(0, end);
     }
 
     /**

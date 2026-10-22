@@ -168,10 +168,19 @@ and `(dev, ino)` identity before the copy, and afterwards calls a transfer:
   kind and size; or it was present and its identity changed (rsync writes a temporary and renames it, so a
   completed replacement is a new inode).
 - `WOULD_COPY` — a dry run wrote nothing.
-- `UNCERTAIN` — rsync started the file and the destination cannot show what happened. The case this exists
+  The expected kind and size come from the source read **before** the transfer: a source that changed
+  mid-job must not be matched against its own new size. A symlink is compared by its target text, never by
+  a size or by opening it.
+- `UNCERTAIN` — rsync started the file and the destination cannot show what happened. A change of object
+  kind alone is not accepted as evidence: without a changed file identity the claim is dropped. The case this exists
   for is an interrupted overwrite of a file that was already the same size as the source: the destination
   then holds the old bytes, the old inode, the same size and matching permissions, and every "looks right"
   check passes. Size, containment and object kind are supporting observations, never proof.
+
+The record is one entry per selected file at both ends, taken before any byte moves - see the measured
+cost in README. Its snapshot loop is cancellable, because on a network mount it can be the longest thing a
+job does before rsync starts, and a Cancel that lands during it must stop the job. A snapshot cut short is
+reported: the files it never reached are named as unconfirmable.
 
 Metadata tuples, mtimes and content samples are diagnostics: they may appear in a warning, and they can
 never turn an `UNCERTAIN` into a `COPIED`. The attribution assumes nothing else was writing to that
@@ -272,7 +281,9 @@ filtered view for the filter boxes.
 - rsync output is verified against 3.1.3, 3.2.7, 3.3.0 and 3.4.0 (`RsyncVersionMatrixTest`: identical
   counters for the same tree, dry runs that write nothing, interrupted jobs that claim only finished
   transfers). A version outside that range is unverified; the matrix takes extra binaries through
-  `FCU_RSYNC_BINARIES`, so a new release can be added without touching the tests.
+  `FCU_RSYNC_BINARIES`, so a new release can be added without touching the tests. `FCU_RSYNC` pins the one
+  binary the process uses; a test run with `FCU_RSYNC` naming an unusable binary refuses to run rather than
+  skipping every rsync-dependent test, which is what a version matrix must never do silently.
 - The per-side selection rule is modelled (`Selection.selected`/`known`) and stated in the window (each
   list reports how many of its rows are ticked, and the work-set line names the rule that produced the
   count). There is deliberately no third "effective files" list: a third thing to keep in sync was the

@@ -38,7 +38,10 @@ class RsyncVersionMatrixTest {
 
     static List<String> configuredBinaries() {
         List<String> binaries = new ArrayList<>();
-        binaries.add("rsync");
+        String pinned = System.getenv("FCU_RSYNC");
+        // A pinned binary is the one under test, not an extra: this is how CI runs the matrix against a
+        // specific rsync build instead of whatever the machine happens to ship.
+        binaries.add(pinned == null || pinned.isBlank() ? "rsync" : pinned);
         String extra = System.getenv("FCU_RSYNC_BINARIES");
         if (extra != null) {
             for (String candidate : extra.split(",")) {
@@ -56,6 +59,11 @@ class RsyncVersionMatrixTest {
             if (canRun(binary)) {
                 runnable.add(binary);
             }
+        }
+        String pinned = System.getenv("FCU_RSYNC");
+        if (pinned != null && !pinned.isBlank() && !canRun(pinned)) {
+            throw new IllegalStateException("FCU_RSYNC names " + pinned + " but it cannot be run."
+                    + " A run that pins a rsync and then tests a different one is not a matrix.");
         }
         if (runnable.isEmpty()) {
             // Nothing to test against: the rest of the suite skips rsync-dependent tests the same way.

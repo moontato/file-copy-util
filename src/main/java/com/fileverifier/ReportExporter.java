@@ -3,9 +3,20 @@ package com.fileverifier;
 import java.util.List;
 
 /**
- * Serialises a {@link FileSyncEngine.JobResult} for export (Phase 3). CSV is the flat results table
- * (one row per verified file, full digests); JSON additionally carries the totals, warnings, errors
- * and rsync exit code.
+ * Serialises a {@link FileSyncEngine.JobResult} for export. CSV is the flat results table (one row per
+ * reported file, full digests); JSON additionally carries the totals, warnings, errors and rsync exit code.
+ *
+ * <p>Each row answers its two questions separately, because a job can know one and not the other:
+ * <b>what happened to the bytes</b> ({@code transfer}: COPIED, WOULD_COPY, UNCERTAIN, NOT_COPIED) and
+ * <b>whether the two ends were compared</b> ({@code verification}: compared, pending, not-applicable). A
+ * verifying job stopped before the comparison would otherwise export the same word - PENDING - for a file
+ * whose transfer completed and a file whose transfer is unknown, which is exactly the distinction the
+ * ledger exists to keep.
+ *
+ * <p>Compatibility: the four columns JSON's {@code status}/{@code path}/{@code sourceSha256}/
+ * {@code destinationSha256} have always carried are unchanged and keep their order; {@code transfer} and
+ * {@code verification} are appended. Names are written raw (an export is a record, not a display), and CSV
+ * formula characters are neutralised in CSV only.
  *
  * <p>No dependencies: the project has none, and a job report does not need a JSON library.
  */
@@ -14,16 +25,41 @@ public final class ReportExporter {
     private ReportExporter() {
     }
 
-    /** One row per verified file: status, path, full source digest, full destination digest. */
+    /**
+     * One row per reported file: verdict, path, both full digests, then the transfer answer and the
+     * verification state. The new columns are last so anything already reading the first four still works.
+     */
     public static String toCsv(FileSyncEngine.JobResult result) {
-        StringBuilder csv = new StringBuilder("status,path,source_sha256,destination_sha256\n");
+        StringBuilder csv = new StringBuilder(
+                "status,path,source_sha256,destination_sha256,transfer,verification\n");
         for (FileSyncEngine.FileOutcome outcome : result.outcomes()) {
             csv.append(csvField(outcome.kind())).append(',')
                     .append(csvField(outcome.relPath())).append(',')
                     .append(csvField(outcome.sourceHash())).append(',')
-                    .append(csvField(outcome.destHash())).append('\n');
+                    .append(csvField(outcome.destHash())).append(',')
+                    .append(csvField(transferOf(outcome))).append(',')
+                    .append(csvField(verificationOf(outcome))).append('\n');
         }
         return csv.toString();
+    }
+
+    /** What the job did to this file's bytes, or blank when the job had no transfer to report. */
+    static String transferOf(FileSyncEngine.FileOutcome outcome) {
+        return outcome.transfer() == null ? "" : outcome.transfer().name();
+    }
+
+    /**
+     * Whether this row's verdict comes from an actual comparison.
+     *
+     * <p>{@code pending} means the job was going to compare this file and never got to it; a person reading
+     * the export must not take a pending row for a passed one, and must not take it for a failed one either.
+     */
+    static String verificationOf(FileSyncEngine.FileOutcome outcome) {
+        return switch (outcome.kind()) {
+            case "OK", "MISMATCH", "MISSING", "EXTRA" -> "compared";
+            case "PENDING" -> "pending";
+            default -> "not-applicable";
+        };
     }
 
     public static String toJson(FileSyncEngine.JobResult result) {
@@ -48,6 +84,8 @@ public final class ReportExporter {
                     .append(", \"path\": ").append(field(outcome.relPath()))
                     .append(", \"sourceSha256\": ").append(nullableField(outcome.sourceHash()))
                     .append(", \"destinationSha256\": ").append(nullableField(outcome.destHash()))
+                    .append(", \"transfer\": ").append(nullableField(transferOf(outcome)))
+                    .append(", \"verification\": ").append(field(verificationOf(outcome)))
                     .append('}');
             if (i + 1 < outcomes.size()) {
                 json.append(',');

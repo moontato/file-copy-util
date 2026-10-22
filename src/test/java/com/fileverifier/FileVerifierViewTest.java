@@ -212,7 +212,12 @@ class FileVerifierViewTest {
             "JScrollPane(JTable) does not attach the header on its own, and a table without column "
                 + "titles has no way to reach its sorter");
         assertNotNull(table.getRowSorter());
-        assertEquals(4, table.getColumnCount());
+        // "Transfer" is the fifth column and the last one, so anything that already read the first four
+        // columns still reads the same thing.
+        assertEquals(5, table.getColumnCount());
+        assertEquals(java.util.List.of("Status", "Path", "Source SHA-256", "Destination SHA-256", "Transfer"),
+            java.util.List.of(table.getColumnName(0), table.getColumnName(1), table.getColumnName(2),
+                table.getColumnName(3), table.getColumnName(4)));
     }
 
     @Test

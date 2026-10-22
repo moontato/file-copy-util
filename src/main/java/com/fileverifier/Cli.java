@@ -47,9 +47,12 @@ public final class Cli {
           --files a.txt,sub/b.txt   relative paths to include; repeatable
           --all                     every file the scan finds (see --exclude)
           --exclude a.txt,...       drop these relative paths from --all; repeatable
-          --files-from FILE         names to include, one per line, exactly as written
+          --files-from FILE         names to include, one per line, exactly as written. A line ends at a
+                                    line feed; a CR ends a line only if every line in the file ends CRLF,
+                                    and a file that mixes the two is refused. Nothing else - vertical tab,
+                                    form feed, NEL, U+2028 - ends a line
           --files-from0 FILE        the same, NUL-delimited: the only channel that can name a file
-                                    whose name contains a newline
+                                    whose name contains a newline or a trailing carriage return
           --exclude-from FILE       names to drop, same two formats as above
           --exclude-from0 FILE
           --exclude-dest-from FILE  the same for --exclude-dest
@@ -75,6 +78,10 @@ public final class Cli {
 
         An empty selection is never treated as "all files": either --files, --files-from(0) or --all is
         required.
+
+        Which rsync is used is the one on PATH, or the one FCU_RSYNC names. Pin it when you need the run to
+        mean something: the itemize lines, the progress stats and the hidden temporary files are rsync
+        behaviour, and behaviour differs between versions.
 
         Name syntax. --files/--exclude/--exclude-dest are comma separated and each name is trimmed, which
         cannot express a name with a comma in it, a leading or trailing space, or a name starting with '#'
@@ -421,20 +428,76 @@ public final class Cli {
             throw new UsageException(option + " is not valid UTF-8 (" + file + "). Fix the file's encoding: "
                     + "a name decoded through a replacement character would name a different file.");
         }
-        List<String> names = new ArrayList<>();
-        for (String name : text.split(nulDelimited ? String.valueOf((char) 0) : "\\R", -1)) {
-            if (name.isEmpty()) {
-                continue;
-            }
-            if (name.indexOf('\0') >= 0) {
-                throw new UsageException(option + " contains a NUL byte inside a name (" + file
-                        + "): no path can name that file.");
-            }
-            names.add(name);
-        }
+        List<String> names = nulDelimited ? splitOnNul(text, file, option) : splitOnLineFeed(text, file, option);
         if (names.isEmpty()) {
             throw new UsageException(option + " lists no names (" + file + "): a list of nothing selects "
                     + "nothing.");
+        }
+        return names;
+    }
+
+    /** NUL-delimited: every byte between two NULs is the name, and there is nothing else to decide. */
+    private static List<String> splitOnNul(String text, Path file, String option) throws UsageException {
+        List<String> names = new ArrayList<>();
+        for (String name : text.split("\0", -1)) {
+            if (!name.isEmpty()) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Line-delimited, and the line ending is <b>LF</b>. Nothing else is a line ending here.
+     *
+     * <p>A regex {@code \R} would split on vertical tab, form feed, NEL, line separator and paragraph
+     * separator as well. A file named {@code foo\u000Bbar} would then become two selections, {@code foo}
+     * and {@code bar} - and if those two files happen to exist, the "exact" channel has just selected the
+     * wrong files, which is the exact failure this whole phase exists to remove. So the delimiter is the
+     * one character the format is defined on, and every other character is part of the name.
+     *
+     * <p>CRLF is accepted, and accepted only as a whole-file decision: if every LF in the file is preceded
+     * by a CR, the file is CRLF and that CR is part of the line ending. A file that mixes the two is
+     * refused, because a name ending in a real CR is indistinguishable from a CRLF line ending, and the
+     * answer for such a name is {@code --files-from0}, not a guess.
+     */
+    private static List<String> splitOnLineFeed(String text, Path file, String option) throws UsageException {
+        int feeds = 0;
+        int crlf = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') {
+                feeds++;
+                if (i > 0 && text.charAt(i - 1) == '\r') {
+                    crlf++;
+                }
+            }
+        }
+        boolean wholeFileIsCRLF = feeds > 0 && crlf == feeds;
+
+        List<String> names = new ArrayList<>();
+        int start = 0;
+        while (start <= text.length()) {
+            int end = text.indexOf('\n', start);
+            String entry = end < 0 ? text.substring(start) : text.substring(start, end);
+            if (wholeFileIsCRLF && entry.endsWith("\r")) {
+                entry = entry.substring(0, entry.length() - 1);
+            } else if (entry.endsWith("\r") && !entry.isEmpty()) {
+                throw new UsageException(option + " (" + file + ") has a name ending in a carriage return"
+                        + " next to a line ending that is not CRLF. A trailing carriage return cannot be told"
+                        + " apart from a line ending in a line-delimited file: use "
+                        + option.replace("-from", "-from0") + " for that name.");
+            }
+            if (!entry.isEmpty()) {
+                if (entry.indexOf('\0') >= 0) {
+                    throw new UsageException(option + " contains a NUL byte inside a name (" + file
+                            + "): no path can name that file.");
+                }
+                names.add(entry);
+            }
+            if (end < 0) {
+                break;
+            }
+            start = end + 1;
         }
         return names;
     }

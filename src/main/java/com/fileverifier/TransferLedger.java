@@ -1,7 +1,6 @@
 package com.fileverifier;
 
 import java.io.IOException;
-import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -9,97 +8,143 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
- * What this job did to each file it transferred, and how much of that the destination can prove.
+ * What this job was meant to write, and what the destination held before it started.
  *
  * <p>rsync announces a file when it <b>starts</b> the transfer - measured on 3.1.3 and 3.4.0, where a
  * transfer cut short after a third of a 300 MB copy still printed that file's itemize line - so an
- * announcement says nothing about completion. The only two things that can prove a transfer finished
- * are a <b>completion report</b> (the job ran to the end with a clean exit) and the <b>destination
- * itself</b>, compared against what was there before rsync started:
+ * announcement says nothing about completion. Two things can show that a transfer finished: the job ran to
+ * a clean end, or the destination changed in a way that only a completed transfer explains. Both need a
+ * record taken <b>before</b> rsync ran, which is what this class is.
  *
- * <ul>
- *   <li>a file that did not exist before and exists now, of the expected type and size, was created
- *       by this job;</li>
- *   <li>a file that existed before and whose identity changed - the device and inode number, which a
- *       copy-over replaces because rsync writes a temporary file and renames it - was replaced by
- *       this job.</li>
- * </ul>
+ * <p>An interrupted overwrite is the case the record exists for. Measured on rsync 3.4.0: interrupt a copy
+ * that overwrites a 40 MB destination file with a same-sized source and the destination keeps the
+ * <b>original</b> bytes, the <b>same inode</b> and the <b>same digest</b>, while rsync had already printed
+ * the itemize line for that file. Name, size, containment and permissions all match the source; not one of
+ * them shows what happened. Reporting that as copied records an event nobody observed, so it is reported as
+ * uncertain.
  *
- * <p>Anything else is {@link FileSyncEngine.TransferDisposition#UNCERTAIN}, and an interrupted
- * overwrite is exactly that case. Measured on rsync 3.4.0: interrupting a copy that overwrites a
- * 40 MB destination file with a same-sized source leaves the destination with the <b>original</b>
- * bytes, the <b>same inode</b> and the <b>same digest</b> as before the job, while rsync had already
- * printed the itemize line for it. Size, type, containment and permissions all match the source; not
- * one of them can show what happened. So the honest report names that file and says the transfer is
- * uncertain, instead of writing "copied" over a fact nobody observed.
- *
- * <p>Both proofs assume this program is the only writer of the destination - see the single-writer
- * rule in DESIGN.md section 3.4. Nothing here coordinates with other processes; that was considered
- * and declined, so a concurrent writer can make an attribution wrong.
+ * <p>Both proofs assume this program is the only writer of the destination - the single-writer rule in
+ * DESIGN.md section 7. Nothing here coordinates with other processes; that was considered and declined, so
+ * a concurrent writer can make an attribution wrong.
  */
 final class TransferLedger {
 
-    /** How the destination looked before rsync was started. */
+    /** What the job intended to write, read from the source before rsync started. */
+    private record Expected(boolean present, boolean regular, boolean link, long size, String linkText) {
+        static final Expected UNKNOWN = new Expected(false, false, false, -1, null);
+    }
+
+    /** What the destination held before rsync started. */
     private record Before(boolean exists, Object fileKey, long size, boolean regular, boolean link) {
         static final Before ABSENT = new Before(false, null, -1, false, false);
     }
 
     private final Path destDir;
     private final Map<String, Before> before;
-    private final transient List<String> unreadableNames = new ArrayList<>();
+    private final Map<String, Expected> expected;
+    private final List<String> unreadableNames = new ArrayList<>();
 
     /**
-     * Records the destination state for every name the job may write. One stat per selected file:
-     * unavoidable, because a fact about "what this job changed" needs a before-and-after comparison.
+     * Records the source intent and the destination state for every name the job may write.
+     *
+     * <p>Cost is deliberately stated: one metadata call per selected file, at both ends, before any byte is
+     * transferred. There is no cheaper way to answer "did this job finish writing this file", because the
+     * question is a before-and-after question. Metadata only - no file content is read here, and a copy job
+     * with verification off reads no source data at all. On a network mount the metadata latency can be far
+     * higher than on a local disk, which is why the loop is cancellable.
+     *
+     * @param abort checked periodically so a Cancel during a long snapshot stops the job instead of
+     *              running to the end of a list the user has already asked to stop
      */
-    TransferLedger(Path destDir, List<FileEntry> workSet, List<String> warnings) {
+    TransferLedger(Path sourceDir, Path destDir, List<FileEntry> workSet, List<String> warnings,
+                   BooleanSupplier abort) {
         this.destDir = destDir;
-        this.before = new java.util.HashMap<>(Math.max(16, workSet.size() * 2));
+        int capacity = Math.max(16, workSet.size() * 2);
+        this.before = new java.util.HashMap<>(capacity);
+        this.expected = new java.util.HashMap<>(capacity);
+        boolean snapshotStoppedEarly = false;
+        int index = 0;
         for (FileEntry entry : workSet) {
-            String rel = entry.relPath();
-            try {
-                BasicFileAttributes attrs = Files.readAttributes(destDir.resolve(rel),
-                        BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                before.put(rel, new Before(true, attrs.fileKey(), attrs.size(),
-                        attrs.isRegularFile(), attrs.isSymbolicLink()));
-            } catch (java.nio.file.NoSuchFileException absent) {
-                before.put(rel, Before.ABSENT);
-            } catch (IOException problem) {
-                // No snapshot for this name: the after-state can then prove nothing, and the report
-                // says so instead of guessing.
-                before.put(rel, null);
-                if (unreadableNames.size() < 20) {
-                    unreadableNames.add(rel);
-                }
+            if ((index++ & 0xFF) == 0 && abort.getAsBoolean()) {
+                snapshotStoppedEarly = true;
+                break;
             }
+            String rel = entry.relPath();
+            expected.put(rel, readSource(sourceDir.resolve(rel)));
+            before.put(rel, readDestination(destDir.resolve(rel), rel, warnings));
+        }
+        if (index < workSet.size()) {
+            snapshotStoppedEarly = true;
+        }
+        if (snapshotStoppedEarly) {
+            warnings.add("The snapshot taken before the copy was stopped early: the transfer result of the"
+                    + " files it had not reached cannot be confirmed afterwards.");
         }
         if (!unreadableNames.isEmpty()) {
             warnings.add("The destination could not be inspected before the copy for "
                     + unreadableNames.size() + " file(s), starting with "
-                    + unreadableNames.get(0) + ": their transfer result cannot be confirmed afterwards.");
+                    + RsyncNameCodec.forDisplay(unreadableNames.get(0)) + ": their transfer result cannot be"
+                    + " confirmed afterwards.");
+        }
+    }
+
+    private static Expected readSource(Path source) {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(source, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            String linkText = attrs.isSymbolicLink() ? readLinkText(source) : null;
+            return new Expected(true, attrs.isRegularFile(), attrs.isSymbolicLink(), attrs.size(), linkText);
+        } catch (IOException problem) {
+            // The source vanished between the scan and the copy. Nothing can then be shown about the
+            // destination, which is the honest answer.
+            return Expected.UNKNOWN;
+        }
+    }
+
+    private Before readDestination(Path target, String rel, List<String> warnings) {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(target, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            return new Before(true, attrs.fileKey(), attrs.size(), attrs.isRegularFile(),
+                    attrs.isSymbolicLink());
+        } catch (java.nio.file.NoSuchFileException absent) {
+            return Before.ABSENT;
+        } catch (IOException problem) {
+            unreadableNames.add(rel);
+            // A name with no recorded pre-state can never be confirmed afterwards.
+            return null;
+        }
+    }
+
+    private static String readLinkText(Path path) {
+        try {
+            return Files.readSymbolicLink(path).toString();
+        } catch (IOException problem) {
+            return null;
         }
     }
 
     /**
-     * The verdict for one file that rsync announced.
+     * What the destination can prove about one file rsync announced.
      *
-     * @param rel            the file's path relative to the source directory
-     * @param sourceSize     size of the source file, or -1 when it is not known
+     * @param rel             the file's path relative to the source directory
      * @param cleanCompletion the copy phase ran to the end with an exit rsync considers clean
      * @param dryRun          nothing was written at all
      */
-    FileSyncEngine.TransferDisposition disposition(String rel, long sourceSize, boolean cleanCompletion,
-                                                   boolean dryRun) {
+    FileSyncEngine.TransferDisposition disposition(String rel, boolean cleanCompletion, boolean dryRun) {
         if (dryRun) {
             return FileSyncEngine.TransferDisposition.WOULD_COPY;
         }
         if (cleanCompletion) {
+            // The completion itself is the evidence: rsync ran this file and the job ended cleanly.
             return FileSyncEngine.TransferDisposition.COPIED;
         }
         Before previous = before.get(rel);
-        if (previous == null) {
+        Expected intent = expected.get(rel);
+        if (previous == null || intent == null || intent == Expected.UNKNOWN) {
             return FileSyncEngine.TransferDisposition.UNCERTAIN;
         }
         Path target = destDir.resolve(rel);
@@ -107,40 +152,48 @@ final class TransferLedger {
         try {
             now = Files.readAttributes(target, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         } catch (IOException cannotRead) {
-            // Nothing there, or unreadable. Either way there is nothing to compare against the pre-state,
-            // and a file rsync started and cannot be found now is exactly the case that must not be
-            // reported as copied.
+            // Nothing there, or unreadable. A file rsync started and that cannot now be found is exactly
+            // the case that must not be reported as copied.
             return FileSyncEngine.TransferDisposition.UNCERTAIN;
         }
+
         if (!previous.exists) {
-            // Creation: a new file of the expected kind and size. The size is what says the whole file
-            // arrived; a half-written transfer is shorter than the source.
-            boolean kindMatches = sourceSize >= 0 ? now.isRegularFile() : (now.isRegularFile()
-                    || now.isDirectory() || now.isSymbolicLink());
-            boolean sizeMatches = sourceSize < 0 || now.size() == sourceSize;
-            return kindMatches && sizeMatches
+            return createdFileIsComplete(rel, intent, now, target)
                 ? FileSyncEngine.TransferDisposition.COPIED
                 : FileSyncEngine.TransferDisposition.UNCERTAIN;
         }
-        // Overwrite: rsync writes a temporary file and renames it, so a completed replacement changes
-        // the inode. The same identity means the bytes on disk are the ones that were already there.
+
+        // Overwrite. rsync writes a temporary file and renames it, so a completed replacement is a
+        // different file identity. Where the filesystem reports no usable identity, or the identity is
+        // unchanged, the bytes on disk are the ones that were already there and nothing can be claimed.
         Object nowKey = now.fileKey();
-        if (nowKey != null && previous.fileKey != null && !nowKey.equals(previous.fileKey)) {
-            return FileSyncEngine.TransferDisposition.COPIED;
-        }
-        if (previous.link != now.isSymbolicLink() || previous.regular != now.isRegularFile()) {
+        if (previous.fileKey != null && nowKey != null && !nowKey.equals(previous.fileKey)) {
             return FileSyncEngine.TransferDisposition.COPIED;
         }
         return FileSyncEngine.TransferDisposition.UNCERTAIN;
     }
 
-    /** Names whose pre-state could not be recorded; their transfer can never be confirmed. */
-    List<String> unconfirmableNames() {
-        return List.copyOf(unreadableNames);
-    }
-
-    /** Only used for error messages, so a missing destination directory is not fatal here. */
-    boolean destinationExists() {
-        return Files.isDirectory(destDir);
+    /**
+     * A file the destination did not have before. The object must be the kind the source was, and a regular
+     * file must be the size the source was - the size is what shows the whole file arrived rather than half
+     * of it. A symlink is compared by its target text, never by opening it.
+     */
+    private static boolean createdFileIsComplete(String rel, Expected intent, BasicFileAttributes now,
+                                                 Path target) {
+        if (intent.link) {
+            if (!now.isSymbolicLink()) {
+                return false;
+            }
+            String text = readLinkText(target);
+            return intent.linkText != null && intent.linkText.equals(text);
+        }
+        if (intent.regular) {
+            // The size the source had when the job planned the copy, not a size read after the transfer:
+            // a source that changed mid-job must not be matched against its own new size.
+            return now.isRegularFile() && intent.size >= 0 && now.size() == intent.size;
+        }
+        // A source that was neither a regular file nor a link (a device, a FIFO, or a source that vanished
+        // before the copy) has no size or content to compare against, so nothing may be claimed.
+        return false;
     }
 }

@@ -19,6 +19,19 @@ final class TestSupport {
     private TestSupport() {
     }
 
+    /**
+     * A pinned rsync is not optional. When {@code FCU_RSYNC} names a binary, a test run that cannot use it
+     * has to fail: otherwise every rsync-dependent test skips itself and the run quietly becomes a partial
+     * check, which is what a version matrix must never do.
+     */
+    static {
+        String pinned = System.getenv("FCU_RSYNC");
+        if (pinned != null && !pinned.isBlank() && !FileSyncEngine.isRsyncAvailable(pinned)) {
+            throw new IllegalStateException("FCU_RSYNC names " + pinned + " but that rsync cannot be run;"
+                    + " refusing to run the rsync tests against anything else.");
+        }
+    }
+
     static boolean rsyncAvailable() {
         return FileSyncEngine.isRsyncAvailable();
     }

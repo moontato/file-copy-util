@@ -180,6 +180,24 @@ class AuditNameFidelityTest {
                 "an updated existing file is announced with a 'c' in the flag column"));
     }
 
+    /**
+     * The two shapes the space-separated form used to get wrong. Without an out-format the delimiter is a
+     * space, so the name's own leading space must survive, and a pipe inside a name must not be mistaken
+     * for a column boundary.
+     */
+    @Test
+    void theParserStillReadsTheFormWithoutAnOutFormat() {
+        assertAll(
+            () -> assertEquals(" a ", parsedName(">f+++++++++  a "),
+                "one space divides the columns; the space after it belongs to the file"),
+            () -> assertEquals("pipe|name", parsedName(">f+++++++++ pipe|name"),
+                "in this form the delimiter is the space, so a pipe in the name is part of the name"),
+            () -> assertEquals("one.txt", parsedName(">f+++++++++ one.txt")),
+            () -> assertEquals(" ", parsedName(">f+++++++++  "),
+                "a file whose whole name is one space is a file, not an empty name"),
+            () -> assertEquals("sub/deep/x.txt", parsedName(">f+++++++++ sub/deep/x.txt")));
+    }
+
     @Test
     void theEndOfALineWithNothingAfterItIsNotAFileNamedEmptyString() {
         assertAll(
@@ -213,6 +231,79 @@ class AuditNameFidelityTest {
             new TreeSet<>(written),
             "the exact channel must select exactly these names, spaces and all: "
                 + quoted(written));
+    }
+
+    /**
+     * A regex {@code \R} also splits on vertical tab, form feed, NEL, line separator and paragraph
+     * separator. In a directory that holds {@code foo}, {@code bar}, {@code baz}, {@code qux} and
+     * {@code end} as well, that turns one requested file into five different requested files - exactly the
+     * failure this phase exists to remove.
+     */
+    @Test
+    void theNewlineChannelSplitsOnLineFeedsOnly(@TempDir Path tmp) throws Exception {
+        // The parsing rule first: a regex \R would also split on vertical tab, form feed, NEL, line
+        // separator and paragraph separator, and each one of those would turn one requested file into two
+        // requested files.
+        List<String> separators = List.of("\u000B", "\u000C", "\u0085", "\u2028", "\u2029");
+        for (String separator : separators) {
+            Path list = tmp.resolve("names-" + separator.hashCode() + ".lst");
+            Files.write(list, ("foo" + separator + "bar\n").getBytes(StandardCharsets.UTF_8));
+            assertEquals(List.of("foo" + separator + "bar"), Cli.readNameList(list, false, "--files-from"),
+                "only a line feed ends a line; U+"
+                    + String.format("%04X", (int) separator.charAt(0)) + " is part of the name");
+        }
+    }
+
+    /**
+     * The same rule where it costs files rather than strings: the directory holds the odd name and the
+     * two names a wrong split would ask for. Those two exist, so a wrong split is a silent wrong selection.
+     */
+    @Test
+    void aNameContainingATabLikeControlCharacterIsNotSplitIntoTheFilesBesideIt(@TempDir Path tmp)
+            throws Exception {
+        assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        String odd = "foo\u000Bbar\u000Cbaz";
+        TestSupport.write(src.resolve(odd), "the one file that was asked for\n");
+        TestSupport.write(src.resolve("foo"), "must not be touched\n");
+        TestSupport.write(src.resolve("bar"), "must not be touched\n");
+        TestSupport.write(src.resolve("baz"), "must not be touched\n");
+
+        Path list = tmp.resolve("names.lst");
+        Files.write(list, (odd + "\n").getBytes(StandardCharsets.UTF_8));
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int exit = Cli.run(new String[]{"--cli", "--source", src.toString(), "--dest", dst.toString(),
+            "--no-verify", "--files-from", list.toString()},
+            new java.io.PrintStream(out, true, StandardCharsets.UTF_8));
+        assertEquals(0, exit, out.toString(StandardCharsets.UTF_8));
+        assertEquals(List.of(odd), TestSupport.relPathsUnder(dst),
+            "foo, bar and baz exist in the source and must stay out of the destination: "
+                + out.toString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void aNameEndingInACarriageReturnIsRefusedInALineChannelRatherThanGuessedAt(@TempDir Path tmp)
+            throws Exception {
+        Path mixed = tmp.resolve("mixed.lst");
+        Files.write(mixed, ("trailing\r\nnormal\n").getBytes(StandardCharsets.UTF_8));
+        Path crlf = tmp.resolve("crlf.lst");
+        Files.write(crlf, ("normal\r\n").getBytes(StandardCharsets.UTF_8));
+        Path nul = tmp.resolve("nul.lst");
+        Files.write(nul, ("trailing\r\u0000").getBytes(StandardCharsets.UTF_8));
+
+        // Mixed line endings: a trailing CR cannot be told apart from a line ending, so the input is
+        // refused and pointed at the channel that can carry it.
+        Cli.UsageException refusal = org.junit.jupiter.api.Assertions.assertThrows(
+            Cli.UsageException.class, () -> Cli.readNameList(mixed, false, "--files-from"));
+        assertTrue(refusal.getMessage().contains("carriage return"), refusal.getMessage());
+
+        // A file that is wholly CRLF is read as CRLF: there the CR belongs to the line ending.
+        assertEquals(List.of("normal"), Cli.readNameList(crlf, false, "--files-from"));
+
+        // The NUL channel carries such a name exactly.
+        assertEquals(List.of("trailing\r"), Cli.readNameList(nul, true, "--files-from0"));
     }
 
     @Test

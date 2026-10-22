@@ -147,7 +147,19 @@ public class FileSyncEngine implements AutoCloseable {
     /** A partial transfer rsync left behind: ".big.bin.YC9p2z". */
     private static final Pattern RSYNC_TEMP_NAME = Pattern.compile("^\\.(.+)\\.([A-Za-z0-9]{6})$");
 
-    private static final AtomicReference<String> RSYNC_BINARY = new AtomicReference<>("rsync");
+    /**
+     * The rsync this process uses unless an engine asks for another. {@code FCU_RSYNC} sets it, which is
+     * how a test run or a deployment pins one specific build - "the rsync on PATH" is not a reproducible
+     * thing, and a result about names, cancellation or an interrupted overwrite is only evidence about the
+     * rsync it actually ran.
+     */
+    private static final AtomicReference<String> RSYNC_BINARY =
+            new AtomicReference<>(configuredRsyncBinary());
+
+    private static String configuredRsyncBinary() {
+        String pinned = System.getenv("FCU_RSYNC");
+        return pinned == null || pinned.isBlank() ? "rsync" : pinned;
+    }
     private static final java.util.concurrent.ConcurrentHashMap<String, Boolean> RSYNC_AVAILABLE
             = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -802,7 +814,11 @@ public class FileSyncEngine implements AutoCloseable {
                 destinationTargets.add(destDir.resolve(entry.relPath()));
             }
             if (!dryRun) {
-                ledger = new TransferLedger(destDir, workSet, warnings);
+                // Snapshot before the transfer: what the job intended to write, and what the destination
+                // held beforehand. The snapshot loop is cancellable because on a slow mount it can be the
+                // longest thing the job does before rsync starts.
+                ledger = new TransferLedger(sourceDir, destDir, workSet, warnings,
+                        () -> cancelRequested.get() || deadlineExceeded());
             }
 
             Path filesFrom = writeFilesFrom(workSet, warnings);
@@ -845,7 +861,7 @@ public class FileSyncEngine implements AutoCloseable {
                 // the files it did and did not finish.
                 boolean cleanCopy = !timeoutWasTriggered() && !cancelRequested.get()
                         && isSuccessfulExit(rsyncExitCode);
-                transfers = transferFacts(ledger, sourceDir, announcedNames, cleanCopy, dryRun);
+                transfers = transferFacts(ledger, announcedNames, cleanCopy, dryRun);
                 if (!cleanCopy) {
                     // A job that is about to be reported as cancelled, timed out or failed still owes the
                     // user a per-file answer. Without it the report is a count with no names, and a count
@@ -1022,7 +1038,7 @@ public class FileSyncEngine implements AutoCloseable {
      * still has the same identity, nothing can: the bytes on disk are the ones that were there already.
      * Those files are reported as UNCERTAIN rather than counted as copied.
      */
-    private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger, Path sourceDir,
+    private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger,
                                                                   List<String> announced, boolean cleanCopy,
                                                                   boolean dryRun) {
         if (announced.isEmpty()) {
@@ -1030,10 +1046,11 @@ public class FileSyncEngine implements AutoCloseable {
         }
         Map<String, TransferDisposition> facts = new LinkedHashMap<>();
         for (String rel : announced) {
-            long sourceSize = sizeOfSourceFile(sourceDir, rel);
+            // No ledger means no before-state, which means nothing may be claimed - except a dry run, where
+            // the honest answer is "would have been copied" and nothing was written.
             facts.put(rel, ledger == null
                     ? (dryRun ? TransferDisposition.WOULD_COPY : TransferDisposition.UNCERTAIN)
-                    : ledger.disposition(rel, sourceSize, cleanCopy, dryRun));
+                    : ledger.disposition(rel, cleanCopy, dryRun));
         }
         return facts;
     }

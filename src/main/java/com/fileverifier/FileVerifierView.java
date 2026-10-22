@@ -454,7 +454,7 @@ public final class FileVerifierView extends JPanel {
         UiTheme.edge(logScrollPane);
 
         resultsTable = UiTheme.table(new DefaultTableModel(
-            new Object[]{"Status", "Path", "Source SHA-256", "Destination SHA-256"}, 0) {
+            new Object[]{"Status", "Path", "Source SHA-256", "Destination SHA-256", "Transfer"}, 0) {
             @Override
             public boolean isCellEditable(int row, int column) {
                 return false;
@@ -1106,7 +1106,10 @@ public final class FileVerifierView extends JPanel {
                 // apart, and the filter box would offer a match on text that is not part of the name.
                 RsyncNameCodec.forDisplay(outcome.relPath()),
                 FileHasher.shortHash(outcome.sourceHash()),
-                FileHasher.shortHash(outcome.destHash())
+                FileHasher.shortHash(outcome.destHash()),
+                // Appended last, like the CSV column: what the job did to the bytes is a separate answer
+                // from the verdict, and a stopped job has to be able to show COPIED next to UNCERTAIN.
+                outcome.transfer() == null ? "" : outcome.transfer().name()
             });
             shown++;
         }
