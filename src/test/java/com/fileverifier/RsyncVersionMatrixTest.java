@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -35,6 +37,66 @@ class RsyncVersionMatrixTest {
 
     @TempDir
     Path root;
+
+    /**
+     * A fake-rsync test must not decide what the rest of this JVM uses. Restoring the literal
+     * {@code "rsync"} after swapping in a fake drops a {@code FCU_RSYNC} pin, and every test that runs
+     * afterwards then exercises a different rsync build than the run claims - with nothing reported.
+     */
+    @Test
+    void anOverridePutsBackExactlyTheBinaryItReplaced() throws Exception {
+        String configured = TestSupport.CONFIGURED_RSYNC;
+        String[] seenInside = new String[1];
+
+        TestSupport.withRsyncBinary("definitely-not-an-installed-rsync",
+            () -> seenInside[0] = FileSyncEngine.rsyncBinary());
+
+        assertEquals("definitely-not-an-installed-rsync", seenInside[0], "the override did not take effect");
+        assertEquals(configured, FileSyncEngine.rsyncBinary(),
+            "what the override replaced is what has to come back: restoring the literal \"rsync\" "
+                + "instead moves the rest of the run onto a different rsync build");
+    }
+
+    @Test
+    void aFakeRsyncTestLeavesTheConfiguredBinaryToTheTestsAfterIt() throws Exception {
+        assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+        Path tools = Files.createTempDirectory("fcu-fake-tools");
+        Path src = Files.createTempDirectory("fcu-fake-src");
+        Path dst = Files.createTempDirectory("fcu-fake-dst");
+        TestSupport.write(src.resolve("one.txt"), "1\n");
+
+        TestSupport.withRsyncBinary(TestSupport.copyingFakeRsync(tools, ">f+++++++++ one.txt").toString(),
+            () -> {
+                FileSyncEngine.JobResult fakeRun = FileSyncEngine.runOnce(TestSupport.request(src, dst,
+                    FileSyncEngine.JobType.COPY_ONLY, TestSupport.selection("one.txt"),
+                    FileSyncEngine.Selection.none()), new TestSupport.Recorder());
+                assertTrue(fakeRun.isSuccess(), fakeRun.message());
+            });
+
+        assertEquals(TestSupport.CONFIGURED_RSYNC, FileSyncEngine.rsyncBinary(),
+            "the binary after a fake-rsync test has to be the one this run was configured with");
+
+        // And a real job that runs afterwards really runs on it.
+        Path real = Files.createTempDirectory("fcu-after-fake");
+        Path realDst = Files.createTempDirectory("fcu-after-fake-dst");
+        TestSupport.write(real.resolve("real.txt"), "1\n");
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(real, realDst,
+                FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("real.txt"),
+                FileSyncEngine.Selection.none()), new TestSupport.Recorder());
+            assertTrue(result.isSuccess(), result.message());
+            assertEquals(TestSupport.CONFIGURED_RSYNC, FileSyncEngine.rsyncBinary());
+        }
+    }
+
+    @Test
+    void aWholeRunPinnedToABinaryKeepsThatBinary() {
+        String pinned = System.getenv("FCU_RSYNC");
+        assumeTrue(pinned != null && !pinned.isBlank(), "run the suite with FCU_RSYNC to exercise this");
+        assertEquals(pinned, TestSupport.CONFIGURED_RSYNC,
+            "the configured default is the pinned build, not whatever is on PATH");
+        assertTrue(new File(pinned).canExecute(), "a pinned binary that cannot run must fail, not skip: " + pinned);
+    }
 
     static List<String> configuredBinaries() {
         List<String> binaries = new ArrayList<>();
@@ -149,11 +211,11 @@ class RsyncVersionMatrixTest {
             FileSyncEngine engine = new FileSyncEngine();
             JobResult result;
             try {
-                FileSyncEngine.setRsyncBinary(binary);
+                engine.useRsync(binary);
                 result = engine.execute(TestSupport.request(tree[0], tree[1], JobType.COPY_AND_VERIFY,
                     ALL, Selection.none(), LINK_POLICY, false), new TestSupport.Recorder());
             } finally {
-                FileSyncEngine.setRsyncBinary("rsync");
+
                 engine.close();
             }
 
@@ -190,11 +252,11 @@ class RsyncVersionMatrixTest {
         FileSyncEngine engine = new FileSyncEngine();
         JobResult result;
         try {
-            FileSyncEngine.setRsyncBinary(binary);
+            engine.useRsync(binary);
             result = engine.execute(TestSupport.request(tree[0], tree[1], JobType.COPY_AND_VERIFY,
                 ALL, Selection.none(), LINK_POLICY, false, true), new TestSupport.Recorder());
         } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
+
             engine.close();
         }
 
@@ -219,13 +281,13 @@ class RsyncVersionMatrixTest {
         FileSyncEngine engine = new FileSyncEngine();
         JobResult result;
         try {
-            FileSyncEngine.setRsyncBinary(binary);
+            engine.useRsync(binary);
             engine.setBandwidthLimitKbps(300);
             engine.setJobTimeoutMillis(1_500);
             result = engine.execute(TestSupport.request(tree[0], tree[1], JobType.COPY_AND_VERIFY,
                 TestSupport.selection("bulk.bin"), Selection.none()), new TestSupport.Recorder());
         } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
+
             engine.close();
         }
 
@@ -260,11 +322,11 @@ class RsyncVersionMatrixTest {
         FileSyncEngine engine = new FileSyncEngine();
         JobResult result;
         try {
-            FileSyncEngine.setRsyncBinary(binary);
+            engine.useRsync(binary);
             result = engine.execute(TestSupport.request(tree[0], tree[1], JobType.COPY_AND_VERIFY,
                 ALL, Selection.none(), LINK_POLICY, false), listener);
         } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
+
             engine.close();
         }
 

@@ -36,6 +36,41 @@ final class TestSupport {
         return FileSyncEngine.isRsyncAvailable();
     }
 
+    /**
+     * The rsync this process was started with - {@code FCU_RSYNC} if it was set, otherwise the plain
+     * {@code rsync} on the PATH. Captured once, before any test replaces it.
+     */
+    static final String CONFIGURED_RSYNC = FileSyncEngine.rsyncBinary();
+
+    /** A block of test code that may throw. */
+    interface RsyncBody {
+        void run() throws Exception;
+    }
+
+    /**
+     * Run a block with the process-wide rsync replaced, and put back <b>exactly the value that was
+     * replaced</b> afterwards.
+     *
+     * <p>Restoring the literal {@code "rsync"} instead is a bug with a delayed fuse: a test that swaps in a
+     * fake, then restores {@code "rsync"}, silently drops a pinned {@code FCU_RSYNC} build. Everything that
+     * runs later in the same JVM - which is how one Maven run is organised - then tests a different rsync
+     * version than the one it was started with, and nothing reports that. The startup check cannot catch it
+     * because the change happens after the check.
+     *
+     * <p>Where a test only needs one engine to use another binary, {@link FileSyncEngine#useRsync} is the
+     * better tool: it changes that engine and nothing else. This is for the cases that genuinely need the
+     * process default, which is a fake binary reached through a static helper.
+     */
+    static void withRsyncBinary(String binary, RsyncBody body) throws Exception {
+        String previous = FileSyncEngine.rsyncBinary();
+        FileSyncEngine.setRsyncBinary(binary);
+        try {
+            body.run();
+        } finally {
+            FileSyncEngine.setRsyncBinary(previous);
+        }
+    }
+
     /** A job request with default scan options and no destination-only detection. */
     static FileSyncEngine.JobRequest request(Path source, Path dest, FileSyncEngine.JobType type,
                                              FileSyncEngine.Selection sourceSelection,

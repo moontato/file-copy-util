@@ -479,8 +479,7 @@ class FileSyncEngineTest {
                         + "      100,000,000  30%   10.00MB/s    0:00:01\n"
                         + "      200,000,000  60%   10.00MB/s    0:00:02\n"
                         + "      333,333,333 100%   10.00MB/s    0:00:03 (xfr#1, to-chk=0/1)");
-        FileSyncEngine.setRsyncBinary(fake.toString());
-        try {
+        TestSupport.withRsyncBinary(fake.toString(), () -> {
             FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
                     TestSupport.selection("one.txt"), TestSupport.none());
 
@@ -495,9 +494,8 @@ class FileSyncEngineTest {
                 "the copy status has to name the file being written and how far along the transfer is - "
                     + "a 30 GB file otherwise shows one number that barely moves for an hour: "
                     + rec.statusTexts);
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+        });
+
     }
 
     // ---------------------------------------------------------------- destination-only files
@@ -638,8 +636,7 @@ class FileSyncEngineTest {
     @Test
     void missingRsyncBinaryIsReportedAsAMissingDependencyNotAFailureMystery() throws Exception {
         TestSupport.write(source.resolve("one.txt"), "1\n");
-        FileSyncEngine.setRsyncBinary("definitely-not-an-installed-rsync");
-        try {
+        TestSupport.withRsyncBinary("definitely-not-an-installed-rsync", () -> {
             FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
                     TestSupport.selection("one.txt"), TestSupport.none());
 
@@ -657,9 +654,8 @@ class FileSyncEngineTest {
                     TestSupport.selection("one.txt"), TestSupport.selection("one.txt"));
             assertTrue(verifyOnly.isSuccess(), verifyOnly.message());
             assertEquals(1, verifyOnly.filesMatched());
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+        });
+
     }
 
     @Test
@@ -670,8 +666,7 @@ class FileSyncEngineTest {
                         + "rsync: [receiver] mkstemp \"dest/.one.txt.XXXXXX\" failed: Permission denied (13)\n"
                         + "rsync error: some files/attrs were not transferred (see previous errors) (code 23)",
                 23);
-        FileSyncEngine.setRsyncBinary(fake.toString());
-        try {
+        TestSupport.withRsyncBinary(fake.toString(), () -> {
             FileSyncEngine.JobResult result = run(FileSyncEngine.JobType.COPY_AND_VERIFY,
                     TestSupport.selection("one.txt"), TestSupport.none());
 
@@ -682,9 +677,8 @@ class FileSyncEngineTest {
                     result.errors().toString());
             assertTrue(result.errors().stream().anyMatch(e -> e.startsWith("rsync: [") && e.contains("failed:")),
                     "rsync's own per-file error line must be surfaced: " + result.errors());
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+        });
+
     }
 
     // ---------------------------------------------------------------- B9
@@ -988,8 +982,8 @@ class FileSyncEngineTest {
                 ">f+++++++++ b.bin",
                 ">f+++++++++ c.bin"), ".b.bin.ABCDEF");
 
-        FileSyncEngine.setRsyncBinary(fake.toString());
         try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(fake.toString());
             engine.setJobTimeoutMillis(1_500L);
             FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
                     FileSyncEngine.JobType.COPY_AND_VERIFY,
@@ -1007,10 +1001,8 @@ class FileSyncEngineTest {
                     .filter(w -> w.contains("partial rsync file")).findFirst().orElse("");
             assertTrue(leftover.contains(".b.bin.ABCDEF"), String.valueOf(result.warnings()));
             assertTrue(leftover.contains("for b.bin"), leftover);
-            assertTrue(leftover.contains("delete them or re-run"), leftover);
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+            assertTrue(leftover.contains("delete them or re-run"), leftover);        }
+
     }
 
     @Test
@@ -1025,8 +1017,8 @@ class FileSyncEngineTest {
                 "  1,000,000  25%  300.00kB/s    0:00:09",
                 "  2,000,000  50%  300.00kB/s    0:00:06"), ".big.bin.ABCDEF");
 
-        FileSyncEngine.setRsyncBinary(fake.toString());
         try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(fake.toString());
             engine.setJobTimeoutMillis(1_500L);
             FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
                     FileSyncEngine.JobType.COPY_AND_VERIFY,
@@ -1035,10 +1027,8 @@ class FileSyncEngineTest {
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status(), "a cancelled job did not complete");
         assertEquals(0, result.filesCopied(), result.message());
             assertTrue(result.message().contains("completed none of them"), result.message());
-            assertFalse(Files.exists(dest.resolve("big.bin")), "the hidden partial file is not the finished one");
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+            assertFalse(Files.exists(dest.resolve("big.bin")), "the hidden partial file is not the finished one");        }
+
     }
 
     @Test
@@ -1053,8 +1043,8 @@ class FileSyncEngineTest {
                 "     100%    0.00kB/s    0:00:00 (xfr#0, to-chk=0/2)",
                 ">f+++++++++ b.bin"), null);
 
-        FileSyncEngine.setRsyncBinary(fake.toString());
         try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(fake.toString());
             engine.setJobTimeoutMillis(1_500L);
             FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
                     FileSyncEngine.JobType.COPY_AND_VERIFY,
@@ -1063,10 +1053,8 @@ class FileSyncEngineTest {
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status(), "a cancelled dry run did not complete");
         assertEquals(2, result.filesCopied(), result.message());
-            assertTrue(result.message().contains("would have been copied"), result.message());
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+            assertTrue(result.message().contains("would have been copied"), result.message());        }
+
     }
 
     @Test
@@ -1075,8 +1063,8 @@ class FileSyncEngineTest {
         Path fake = TestSupport.hangingFakeRsync(tools,
                 ">f+++++++++ a.txt\n          2   50%    1.00kB/s    0:00:01 (xfr#1, to-chk=0/1)", null);
 
-        FileSyncEngine.setRsyncBinary(fake.toString());
         try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(fake.toString());
             engine.setJobTimeoutMillis(1_500L);
             FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
                     FileSyncEngine.JobType.COPY_AND_VERIFY, TestSupport.selection("a.txt"),
@@ -1085,10 +1073,8 @@ class FileSyncEngineTest {
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("No partial rsync file")),
                     String.valueOf(result.warnings()));
-            assertEquals(1, result.filesCopied(), result.message());
-        } finally {
-            FileSyncEngine.setRsyncBinary("rsync");
-        }
+            assertEquals(1, result.filesCopied(), result.message());        }
+
     }
 
     @Test
