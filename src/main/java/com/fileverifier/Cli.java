@@ -47,6 +47,13 @@ public final class Cli {
           --files a.txt,sub/b.txt   relative paths to include; repeatable
           --all                     every file the scan finds (see --exclude)
           --exclude a.txt,...       drop these relative paths from --all; repeatable
+          --files-from FILE         names to include, one per line, exactly as written
+          --files-from0 FILE        the same, NUL-delimited: the only channel that can name a file
+                                    whose name contains a newline
+          --exclude-from FILE       names to drop, same two formats as above
+          --exclude-from0 FILE
+          --exclude-dest-from FILE  the same for --exclude-dest
+          --exclude-dest-from0 FILE
           --exclude-dest a.txt,...  --verify-only only: leave these files out of the comparison, as
                                     unticking their row does in the window
           --ignore "GLOB,GLOB"      add ignore patterns to the default list (%s)
@@ -66,7 +73,15 @@ public final class Cli {
           --quiet                   no progress output
           --help                    this text
 
-        An empty selection is never treated as "all files": either --files or --all is required.
+        An empty selection is never treated as "all files": either --files, --files-from(0) or --all is
+        required.
+
+        Name syntax. --files/--exclude/--exclude-dest are comma separated and each name is trimmed, which
+        cannot express a name with a comma in it, a leading or trailing space, or a name starting with '#'
+        or ';'. The --*-from(0) channels have no such syntax: every byte between the delimiters is the name,
+        trimming nothing. A list file must be UTF-8; undecodable bytes are an error, not a replacement
+        character, because a name built out of U+FFFD names a different file. --*-from splits on newlines,
+        so it cannot name a file whose own name contains a newline - use --*-from0 for that.
 
         Examples:
           --cli --source /data/src --dest /backup/dst --all                       copy everything, verify it
@@ -147,6 +162,10 @@ public final class Cli {
         List<String> fileArgs = new ArrayList<>();
         List<String> excludeArgs = new ArrayList<>();
         List<String> excludeDestArgs = new ArrayList<>();
+        // Names read from a list file: taken exactly as written, with no comma syntax and no trimming.
+        List<String> exactFiles = new ArrayList<>();
+        List<String> exactExcludes = new ArrayList<>();
+        List<String> exactExcludeDests = new ArrayList<>();
         boolean all = false;
         List<String> extraIgnores = new ArrayList<>();
         boolean useDefaultIgnores = true;
@@ -200,6 +219,19 @@ public final class Cli {
                         fileArgs.add(value);
                     } else {
                         excludeArgs.add(value);
+                    }
+                    i++;
+                }
+                case "--files-from", "--files-from0", "--exclude-from", "--exclude-from0",
+                        "--exclude-dest-from", "--exclude-dest-from0" -> {
+                    String value = value(args, i, arg);
+                    List<String> names = readNameList(Path.of(value), arg.endsWith("0"), arg);
+                    if (arg.startsWith("--files")) {
+                        exactFiles.addAll(names);
+                    } else if (arg.startsWith("--exclude-dest")) {
+                        exactExcludeDests.addAll(names);
+                    } else {
+                        exactExcludes.addAll(names);
                     }
                     i++;
                 }
@@ -288,12 +320,12 @@ public final class Cli {
         if (dest == null || dest.isBlank()) {
             throw new UsageException("--dest is required");
         }
-        if (fileArgs.isEmpty() && !all) {
-            throw new UsageException("Nothing was selected: pass --files a.txt,b.txt or --all. "
-                    + "An empty selection means no files, not all files.");
+        if (fileArgs.isEmpty() && exactFiles.isEmpty() && !all) {
+            throw new UsageException("Nothing was selected: pass --files a.txt,b.txt, --files-from FILE or "
+                    + "--all. An empty selection means no files, not all files.");
         }
-        if (!fileArgs.isEmpty() && all) {
-            throw new UsageException("--files and --all cannot both be used");
+        if ((!fileArgs.isEmpty() || !exactFiles.isEmpty()) && all) {
+            throw new UsageException("--files (or --files-from) and --all cannot both be used");
         }
 
         Path sourceDir = Path.of(source).toAbsolutePath();
@@ -318,12 +350,14 @@ public final class Cli {
             for (String raw : excludeArgs) {
                 excluded.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(splitList(raw))));
             }
+            excluded.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(exactExcludes)));
             selected.removeAll(excluded);
         } else {
             for (String raw : fileArgs) {
                 selected.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(splitList(raw))));
             }
-            if (!excludeArgs.isEmpty()) {
+            selected.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(exactFiles)));
+            if (!excludeArgs.isEmpty() || !exactExcludes.isEmpty()) {
                 throw new UsageException("--exclude only applies to --all; --files already says exactly "
                         + "which files to touch");
             }
@@ -338,6 +372,7 @@ public final class Cli {
         for (String raw : excludeDestArgs) {
             excludedAtDestination.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(splitList(raw))));
         }
+        excludedAtDestination.addAll(FileSyncEngine.normalize(new LinkedHashSet<>(exactExcludeDests)));
         if (excludedAtDestination.containsAll(selected)) {
             throw new UsageException("--exclude-dest removes every selected file from the job: nothing left "
                     + "to verify.");
@@ -352,6 +387,56 @@ public final class Cli {
                 csvPath == null ? null : Path.of(csvPath),
                 jsonPath == null ? null : Path.of(jsonPath), quiet,
                 List.copyOf(excludedAtDestination));
+    }
+
+    /**
+     * Names read from a list file, exactly as written.
+     *
+     * <p>The comma syntax of {@code --files} cannot express a name containing a comma, a leading or
+     * trailing space, a {@code #} or a {@code ;}, and the point of these channels is to reach the files
+     * it cannot reach. So nothing here is trimmed, split on commas or otherwise rewritten.
+     *
+     * <p>The delimiter is chosen by the option name and never guessed: {@code --*-from} is newline
+     * delimited (and therefore cannot carry a name containing a newline), {@code --*-from0} is NUL
+     * delimited and carries every name this program can represent. Guessing between the two would mean a
+     * file named with a newline inside it decided how its own list was parsed.
+     *
+     * <p>Bytes are decoded with the replacement action turned off: undecodable input is a named refusal
+     * rather than a name built out of U+FFFD, which would be a file nobody asked for.
+     */
+    static List<String> readNameList(Path file, boolean nulDelimited, String option) throws UsageException {
+        byte[] raw;
+        try {
+            raw = Files.readAllBytes(file);
+        } catch (IOException problem) {
+            throw new UsageException(option + " cannot be read: " + problem.getMessage());
+        }
+        java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+        String text;
+        try {
+            text = decoder.decode(java.nio.ByteBuffer.wrap(raw)).toString();
+        } catch (java.nio.charset.CharacterCodingException problem) {
+            throw new UsageException(option + " is not valid UTF-8 (" + file + "). Fix the file's encoding: "
+                    + "a name decoded through a replacement character would name a different file.");
+        }
+        List<String> names = new ArrayList<>();
+        for (String name : text.split(nulDelimited ? String.valueOf((char) 0) : "\\R", -1)) {
+            if (name.isEmpty()) {
+                continue;
+            }
+            if (name.indexOf('\0') >= 0) {
+                throw new UsageException(option + " contains a NUL byte inside a name (" + file
+                        + "): no path can name that file.");
+            }
+            names.add(name);
+        }
+        if (names.isEmpty()) {
+            throw new UsageException(option + " lists no names (" + file + "): a list of nothing selects "
+                    + "nothing.");
+        }
+        return names;
     }
 
     private static List<String> splitList(String value) {
@@ -524,14 +609,14 @@ public final class Cli {
                     out.println("  rsync writes each file as a hidden temporary file in its destination"
                         + " folder (.big.iso.qjX7kX) and renames it when that file's transfer completes.");
                 }
-                out.println("  > " + relativePath);
+                out.println("  > " + RsyncNameCodec.forDisplay(relativePath));
                 return;
             }
             boolean transferNoise = compares && ("COPIED".equals(kind) || "WOULD_COPY".equals(kind));
             if (transferNoise) {
                 return;
             }
-            out.println("  " + kind + "  " + relativePath
+            out.println("  " + kind + "  " + RsyncNameCodec.forDisplay(relativePath)
                     + (sourceHash == null || destHash == null ? "" : "  src=" + sourceHash + " dst=" + destHash));
         }
     }

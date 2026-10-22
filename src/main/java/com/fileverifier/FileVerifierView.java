@@ -1102,7 +1102,9 @@ public final class FileVerifierView extends JPanel {
             }
             table.addRow(new Object[]{
                 outcome.kind(),
-                outcome.relPath(),
+                // Escaped for display only: a name with a newline in it would otherwise break the row
+                // apart, and the filter box would offer a match on text that is not part of the name.
+                RsyncNameCodec.forDisplay(outcome.relPath()),
                 FileHasher.shortHash(outcome.sourceHash()),
                 FileHasher.shortHash(outcome.destHash())
             });

@@ -71,12 +71,19 @@ java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backu
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --no-verify
+java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --files-from0 names.lst
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
 java -jar target/file-copy-util-1.4.0.jar --cli --help
 ```
 
-The CLI runs the same engine with the same selection rules: either `--files` or `--all` is required, and
-`--all` is expanded into an explicit list by scanning first.
+The CLI runs the same engine with the same selection rules: either `--files`, `--files-from(0)` or `--all` is
+required, and `--all` is expanded into an explicit list by scanning first.
+
+`--files a,b` is comma syntax with each name trimmed, which cannot express a name containing a comma,
+starting with `#` or `;`, or padded with spaces. The list-file channels can: `--files-from FILE` reads one
+name per line, `--files-from0 FILE` reads NUL-delimited names (the only form that can name a file whose own
+name contains a newline), and the same two forms exist for `--exclude` and `--exclude-dest`. Names in those
+files are used exactly as written; a file that is not valid UTF-8 is refused rather than guessed at.
 
 | Exit code | Meaning |
 |---|---|
@@ -210,6 +217,17 @@ jar; pushing a `v*` tag runs `.github/workflows/release.yml`, which attaches the
 ```
 
 `FileSyncEngine` has no Swing dependency, so the copy/verify logic can be run and tested headlessly.
+
+## When a copy is interrupted
+
+rsync writes each file as a hidden temporary in the destination and renames it when that transfer completes,
+so a stopped copy does not leave a half-written file carrying your file's name. What it cannot tell you is
+whether one particular transfer finished: if the destination already held a file of the same size as the
+source, then after an interrupted overwrite it holds the old bytes, the old inode and the same size —
+indistinguishable from a file the job never touched. So a stopped job names every file it started and marks
+each one `COPIED`, `WOULD_COPY` (dry run) or `UNCERTAIN`; a verifying job stopped before the comparison says
+`PENDING`. `UNCERTAIN` is not an error, it is the honest answer: re-run the job with verification on and
+that file will be compared.
 
 ## Troubleshooting
 

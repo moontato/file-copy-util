@@ -1,8 +1,11 @@
-# Audit remediation plan — File Copy Util (revision 3)
+# Audit remediation plan — File Copy Util (revision 4)
 
-**Date:** 2026-10-21
-**Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revision 2.
-**Status:** for sign-off. Nothing implemented; nothing committed.
+**Date:** 2026-10-21, status updated 2026-10-22
+**Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
+**Status:** approved and under way. Phase 0a, Phase 0b and Phase 1 are implemented and green; the two
+Phase 4 items that gate 1.5.0 (per-file transfer records for interrupted copy jobs) were brought forward
+into Phase 1 and are recorded under Phase 4. Next: Phase 2 (write safety). Branch `remediation/audit`;
+`main` is held at the approved baseline commit.
 
 ## Revision log (v4, from your second review)
 
@@ -203,6 +206,14 @@ its name source. Options, to be settled by measurement in phase 4 rather than by
 - **C.** both lines from one run, if a format exists that yields a start mention *and* a completion
   mention - `--info=copy1/copy2` combined with `--itemize-changes` was measured and produced no second
   line, so this option is unsupported so far.
+- **Measured follow-up (2026-10-22), which changes the shape of the choice: `--progress` puts the name
+  back.** `rsync -a --checksum --itemize-changes --progress --out-format='%i|%b|%n'` prints, for each
+  transfer, a header line carrying the name before any progress for that file - `#secret`, ` lead`,
+  `sub/b.txt`, then `>f+++++++++|45|#secret` - on 3.1.3 and 3.4.0. `--info=copy1` with `--progress` gives
+  the same headers. So Option B no longer has to infer the in-flight name from a hidden temporary file:
+  `--progress` supplies the start name, `%b` supplies completion, and the hidden temporary name is demoted
+  to a display hint, never a correctness claim. 3.2.7 and 3.3.0 are **not** confirmed for this yet; the
+  validate workflow's four-version matrix is where they will be.
 
 A completion report still proves neither atomic replacement nor durability, and phase 4 must measure its
 behaviour under interruption and under receiver errors before rule 2 is relied on. Phases 1-3 do not
@@ -314,11 +325,11 @@ Nonzero exit when: an explicitly requested path was absent; a selected name was 
 | Phase | Content | Gate |
 | --- | --- | --- |
 | **0a baseline** *(A1)* | commit the verified 1.4.0 tree; no tag | suite green (176 tests, SpotBugs 0, lint clean) |
-| **0b validation parity** *(A11)* | reusable validation workflow (matrix 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0, SpotBugs, lint, CLI smoke); `release.yml` depends on a successful validation run **for the same commit**; actions SHA-pinned; rsync tarballs checksum-verified; per-tag concurrency | a tag cannot be published unless that commit passed validation; the matrix runs four versions |
-| **1. names exact** | §2.1, §2.2, §2.3 *observations*, §2.9, §2.10 | decoder round-trip tests green on all four rsyncs, both locales; A02/A05 fixtures fail-before/pass-after; no selected name can vanish without a warning and a nonzero exit; **no completion claims are made or required at this phase** |
+| **0b validation parity** *(A11)* — **done** | reusable validation workflow (matrix 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0, SpotBugs, lint, CLI smoke); `release.yml` depends on a successful validation run **for the same commit**; actions SHA-pinned; rsync tarballs checksum-verified; per-tag concurrency | a tag cannot be published unless that commit passed validation; the matrix runs four versions |
+| **1. names exact** — **done** | §2.1, §2.2, §2.3 *observations*, §2.9, §2.10 | decoder round-trip tests green on all four rsyncs, both locales; A02/A05 fixtures fail-before/pass-after; no selected name can vanish without a warning and a nonzero exit; **no completion claims are made or required at this phase** |
 | **2. write-safety** | §2.6 (split rules), A01 overlap refusal, A04 containment across the path, §2.11 collisions | A01/A11 fixtures fail-before/pass-after; source digests unchanged asserted in every copy test; successful-job + failed-report exits 4 with the job half proven successful; ancestor-link case gives `MISMATCH` + warning + nonzero; no `.part` left behind |
 | **3. selection authority** | scan identity + live selection state, one immutable `JobRequest` captured at Run, single stale-options policy (refuse) | the audit's race refuses instead of running; checkbox, Select All/Deselect All, and destination-exclusion edits after scanning are honoured; out-of-order scans cannot install |
-| **4. lifecycle + completion attribution** | §2.7, §2.5 | interrupted-overwrite regression green (`UNCERTAIN`, not `COPIED`); SIGTERM-to-Java test passes the five properties; bounded cancel latency during a single large hash; blocked-I/O reported honestly; reuse after cancel, rejection after `close()`; timeout vs cancel wording |
+| **4. lifecycle + completion attribution** — *partly brought forward:* the §2.5 per-file transfer record is done, §2.7 is not | §2.7, §2.5 | interrupted-overwrite regression green (`UNCERTAIN`, not `COPIED`); SIGTERM-to-Java test passes the five properties; bounded cancel latency during a single large hash; blocked-I/O reported honestly; reuse after cancel, rejection after `close()`; timeout vs cancel wording |
 | **5. truthful verdicts and counts** | §2.13, §2.4, §2.12 | `checked` equation asserted in every consumer; symlink verdicts; partial-job records; no limit-warning lies; CSV metadata and formula safety tested |
 | **6. responsiveness** | §2.8 | EDT backlog bounded; completion never lost with a visible suppression notice; conditional truncation wording |
 | **7. packaging claims** | A15 optional theme loading + thin-classpath test; supply-chain hardening left over from 0b | thin-jar test green |
@@ -353,29 +364,50 @@ Rules: capture source digests and sizes before and assert unchanged after; where
 
 - **A1 checkpoint:** `0069285 Checkpoint the audited 1.4.0 tree (approved as A1)` - the audited source,
   tests and documentation, no tag, no push. Fresh validation for that commit: 176 tests, 0 failures,
-  0 errors, 0 skipped; SpotBugs 0 findings; `BUILD SUCCESS`.
-- **Red-first regressions committed** (suite is deliberately red until the matching phase lands:
-  183 tests, 7 failures, all 7 in the two files below):
-  - `AuditNameFidelityTest` - 6 failures. A02 (selecting `" a "` copies the excluded `a` instead);
-    A05 (`#secret` and `;semi` never reach the destination while `exit 0` and `copied=2` - note `-dash`
-    already survives, so the leading-dash worry is not a defect); a newline-named file is silently left
-    out; and the parser losing leading/trailing spaces, `|` in names, `cL` link rows, and every
-    `\#ooo` escape.
-  - `InterruptedOverwriteTest` - 1 failure. Every disk-level property already holds (the interrupted
-    file keeps its old content and size, the unrelated file is untouched, the completed file holds the
-    new data, the copied count does not overcount). What fails is the report: a cancelled copy job emits
-    **no per-file rows at all**, so the file it did finish is unnamed and the interrupted one is neither
-    named nor marked uncertain (A10's "positive count, empty report").
+  0 errors, 0 skipped; SpotBugs 0 findings; `BUILD SUCCESS`. `main` is held at this commit.
+- **Red-first regressions** were committed on `remediation/audit` as `95a3374` (suite deliberately red:
+  183 tests, 7 failures, all in the two new files) before any fix, so each fix has a before/after record.
+- **Phase 0b** landed as `b0deb72`: a reusable `validate.yml` (Maven verify, CLI smoke tests on the shaded
+  jar, and an rsync matrix built from checksum-pinned tarballs of 3.1.3, 3.2.7, 3.3.0 and 3.4.0 - the four
+  are required, not requested), called by `ci.yml` for branches and by `release.yml` **for the exact commit
+  the tag names**, which also refuses when the tag does not resolve and when the jar's own version does not
+  match the tag. Third-party actions are pinned by commit SHA. No tag was pushed and no release made.
+- **Phase 1** landed, name fidelity: `RsyncNameCodec` (first separator splits, `%n` last, only octal
+  `\#ooo` decoded, bytes reassembled then decoded once, ordinary backslashes untouched) replaces the old
+  parser; the list handed to rsync is NUL-delimited (`--from0`) with every entry prefixed `./`, which
+  defeats the comment/option syntax of a file list; `normalize()` no longer trims, so `" a "` cannot become
+  `a`; engine mention lines are requested with `--out-format='%i|%n'`; names are escaped where they are
+  shown (log lines, CLI per-file lines, warning name lists, Results cells) and stay raw in exports; and the
+  CLI gained `--files-from`, `--files-from0`, `--exclude-from`, `--exclude-from0`, `--exclude-dest-from`
+  and `--exclude-dest-from0` with the delimiter fixed by the option name, no guessing, and undecodable
+  bytes refused by name rather than replacement-decoded.
+  The two policy tests that asserted refusal of newline/CR names were rewritten to the new contract, and
+  the old normalization test now asserts that syntax is rewritten while a name's own spaces are not.
+- **Part of Phase 4, brought forward** because `InterruptedOverwriteTest` gates 1.5.0: `TransferLedger`
+  records the destination before rsync starts and `transferFacts()` decides each announced file's
+  disposition per §2.5 rules 1-4; copy-only jobs emit one row per announced file named by that
+  disposition, a verifying job stopped before verification emits `PENDING` rows, and `FileOutcome` carries
+  transfer and verdict separately. The interrupted-overwrite fixture is green: the completed file is
+  `COPIED`, the interrupted same-size overwrite is `UNCERTAIN` with its bytes and inode unchanged, and an
+  unselected destination file is untouched. Its interruption trigger is the hidden temporary file appearing
+  in the destination - an observation of the destination, not of a parsed output line - so it does not
+  depend on the §2.5A A/B choice.
+- **Suite now:** 189 tests, 0 failures, 0 errors, 0 skipped; SpotBugs 0 findings; `mvn clean verify`
+  succeeds with `-Werror`. Nothing is still red.
 
 **Next, in order**
 
-1. Phase 0b (A11): reusable validation workflow; `release.yml` gated on a successful validation run of
-   the exact commit; matrix gains 3.3.0.
-2. Phase 1: the decoder and the NUL list (§2.1, §2.2, §2.9, §2.10) - turns the six parser/name failures
-   green.
-3. Phase 2: write-safety (A01, A11/§2.6, A04, §2.11), with the source-immutability assertion added to the
-   existing copy tests.
-4. Phase 3: selection authority (§2.3's identity/selection split) - then propose **1.5.0** (gate green,
-   your go-ahead per A10).
+1. Phase 2: write safety - A01 overlap refusal, §2.6 export protection, A04 containment across the whole
+   path, §2.11 collision acknowledgement - with the source-immutability assertion added to every copy test.
+2. Phase 3: selection authority (§2.3 identity/selection split, one immutable `JobRequest` at Run).
+3. Then propose **1.5.0** (gate green: `remediation/audit` merged to `main`, validate green on the exact
+   commit, your go-ahead per A10).
+4. Phase 4 remainder: per-job `AbortController`, shutdown-hook idempotence, bounded cancel latency during
+   a single large hash, channel workers that cannot block termination, and the §2.5A A/B decision - now
+   measured further: `--progress --out-format='%i|%b|%n'` prints the file name before that file's progress
+   on 3.1.3 and 3.4.0, so Option B keeps the in-flight name without watching temporary files; 3.2.7 and
+   3.3.0 remain to be confirmed by the matrix.
+5. Phase 5 onward as planned.
+
 5. Phase 4: lifecycle plus completion attribution; settle the §2.5A A/B choice by measuring the hidden
    temporary file as the in-flight signal; turns `InterruptedOverwriteTest` green.

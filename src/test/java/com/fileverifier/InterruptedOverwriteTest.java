@@ -37,6 +37,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 class InterruptedOverwriteTest {
 
+    /** The job's reporting is not what this test is about; the destination's state is. */
+    private static final ProgressListener SILENT = new ProgressListener() {
+        @Override
+        public void onCompletion(FileSyncEngine.JobResult completion) {
+        }
+    };
+
+
     private static final int SIZE = 6_000_000;
     private static final long THROTTLE_KBPS = 300L;
 
@@ -57,32 +65,42 @@ class InterruptedOverwriteTest {
         String overwrittenBefore = FileHasher.computeHash(dst.resolve("b-overwrite.bin"));
         String untouchedBefore = FileHasher.computeHash(dst.resolve("z-untouched.bin"));
 
+        // The interruption is triggered from what the destination shows, not from what this program
+        // parsed out of rsync's output. rsync writes each file as a hidden temporary in its destination
+        // folder and renames it when that transfer completes, so a temporary for b-overwrite.bin means
+        // that transfer is in flight. Tying the trigger to a per-file output line would make this test
+        // depend on which output format the engine happens to ask for.
         AtomicReference<FileSyncEngine> engineRef = new AtomicReference<>();
         AtomicBoolean sawInFlight = new AtomicBoolean();
-        ProgressListener cancelWhenOverwriteStarts = new ProgressListener() {
-            @Override
-            public void onFileProcessed(String relPath, String kind, String sourceHash,
-                                        String destHash) {
-                if ("b-overwrite.bin".equals(relPath)) {
+        Thread watcher = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + 60_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (hiddenTemporaryFor(dst, "b-overwrite.bin") != null) {
                     sawInFlight.set(true);
                     engineRef.get().cancel();
+                    return;
+                }
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
-
-            @Override
-            public void onCompletion(JobResult completion) {
-            }
-        };
+        }, "interrupt-the-overwrite");
+        watcher.setDaemon(true);
 
         Selection selected = TestSupport.selection("a-small.bin", "b-overwrite.bin");
         JobRequest request = TestSupport.request(src, dst, JobType.COPY_ONLY, selected,
             Selection.none());
 
-        FileSyncEngine engine = new FileSyncEngine();
-        engineRef.set(engine);
-        engine.setBandwidthLimitKbps(THROTTLE_KBPS);
-        JobResult result = engine.execute(request, cancelWhenOverwriteStarts);
-        engine.close();
+        JobResult result;
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engineRef.set(engine);
+            engine.setBandwidthLimitKbps(THROTTLE_KBPS);
+            watcher.start();
+            result = engine.execute(request, SILENT);
+        }
 
         // ---------------------------------------------------------------- what the disk says
         assertTrue(sawInFlight.get(), "the job never reached the file it was meant to interrupt: "
@@ -136,6 +154,63 @@ class InterruptedOverwriteTest {
         TestSupport.assertNoProcessesRunning("rsync", "after an interrupted overwrite");
     }
 
+    /**
+     * The same interruption in a job that would have verified. It was stopped before the comparison, so
+     * its rows have to carry a transfer answer and a verdict that says the check never ran: an empty
+     * Results tab under a "1 copied" summary is what the audit called A10.
+     */
+    @Test
+    void aVerifyingJobStoppedMidTransferReportsTheTransferAndASaidSoVerdict(@TempDir Path tmp)
+            throws Exception {
+        assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        fill(src.resolve("a-small.bin"), 'N', 8_000);
+        fill(src.resolve("b-overwrite.bin"), 'N', SIZE);
+        fill(dst.resolve("b-overwrite.bin"), 'O', SIZE);
+
+        AtomicReference<FileSyncEngine> engineRef = new AtomicReference<>();
+        AtomicBoolean sawInFlight = new AtomicBoolean();
+        Thread watcher = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + 60_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (hiddenTemporaryFor(dst, "b-overwrite.bin") != null) {
+                    sawInFlight.set(true);
+                    engineRef.get().cancel();
+                    return;
+                }
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "interrupt-the-verifying-copy");
+        watcher.setDaemon(true);
+
+        JobResult result;
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engineRef.set(engine);
+            engine.setBandwidthLimitKbps(THROTTLE_KBPS);
+            watcher.start();
+            result = engine.execute(TestSupport.request(src, dst, JobType.COPY_AND_VERIFY,
+                TestSupport.selection("a-small.bin", "b-overwrite.bin"), Selection.none()), SILENT);
+        }
+
+        assertTrue(sawInFlight.get(), "the job never reached the file it was meant to interrupt: "
+            + result.message());
+        assertEquals(JobStatus.FAILED, result.status(), result.message());
+        List<String> rows = kinds(result.outcomes());
+        assertTrue(rows.contains("PENDING:b-overwrite.bin"),
+            "the file whose transfer was interrupted is named, with a verdict that admits the check did"
+                + " not happen: " + rows);
+        assertTrue(result.outcomes().stream()
+                .anyMatch(o -> o.relPath().equals("b-overwrite.bin")
+                        && o.transfer() == FileSyncEngine.TransferDisposition.UNCERTAIN),
+            "and its transfer is called uncertain rather than copied: " + rows);
+    }
+
     private static void fill(Path file, char marker, int bytes) throws IOException {
         Files.createDirectories(file.getParent());
         try (var channel = java.nio.channels.FileChannel.open(file,
@@ -156,6 +231,27 @@ class InterruptedOverwriteTest {
                 written += Math.min(pattern.length, bytes - written);
             }
         }
+    }
+
+    /**
+     * The hidden temporary file rsync is writing for {@code name}, or null when there is none. Measured on
+     * rsync 3.1.3 and 3.4.0: the name is the destination name with a dot in front and a short random
+     * suffix behind it - {@code .big.bin.Ugp1sn}. It exists only while that transfer is in flight, and it
+     * disappears when the transfer completes or is killed, so it is a fact about the destination rather
+     * than about this program's reading of rsync's output.
+     */
+    private static String hiddenTemporaryFor(Path directory, String name) {
+        try (var entries = Files.newDirectoryStream(directory)) {
+            for (Path sibling : entries) {
+                String fileName = sibling.getFileName().toString();
+                if (fileName.startsWith("." + name + ".") && fileName.length() > name.length() + 2) {
+                    return fileName;
+                }
+            }
+        } catch (java.io.IOException problem) {
+            return null;
+        }
+        return null;
     }
 
     private static String firstCharacter(Path file) throws IOException, NoSuchAlgorithmException {

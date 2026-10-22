@@ -64,6 +64,20 @@ each unit of work.
 
 ## 4. rsync, and how its output is read
 
+**A file's name is its identity, and it has to survive the round trip.** The list handed to rsync is
+NUL-delimited (`--from0`) with every entry prefixed `./`. Both halves matter: a name containing a newline or
+a space needs the NUL delimiter, and in a file list an entry starting with `#` or `;` is a comment - which
+`--from0` does not change - so `#secret` would simply vanish from a job that reported success. Selection
+lists are not trimmed either: a POSIX filename may begin or end with a space, and a trimmed `" a "` is the
+identity of a different file, quite possibly the one the user unticked.
+
+Mention lines are requested as `--out-format='%i|%n'`: the name last, after a fixed separator, split at the
+first separator only. rsync escapes a byte it cannot print as octal `\#ooo`; decoding replaces only that
+form, reassembles the bytes and decodes them to text once, because a multi-byte character may arrive as a
+run of escapes. A backslash not followed by `#ooo` is part of the name - a filename containing `\134` is
+printed that way and must not be turned into a backslash. Names are escaped only where a person reads them
+(log line, table cell, CLI line); exports carry them raw, because an export is a record.
+
 One command, always, for a copy job:
 
 ```
@@ -143,7 +157,25 @@ checked = matched + mismatched + missing        (destination-only files counted 
 Progress is a percentage of the work set: copy phase 0–70%, verification 70–100%, with updates
 coalesced to whole percentage changes so a 100k-file job does not spam the UI or the log.
 
-### Interrupted transfers
+### Interrupted transfers: what may be called copied
+
+rsync announces a file when it **starts** the transfer, so an announcement proves intent, not completion.
+The two things that can prove completion are the job running to a clean end, and the destination compared
+against what it held before rsync started. So the engine records each work-set name's presence, kind, size
+and `(dev, ino)` identity before the copy, and afterwards calls a transfer:
+
+- `COPIED` — the job ended cleanly; or the name was absent before and is present afterwards at the expected
+  kind and size; or it was present and its identity changed (rsync writes a temporary and renames it, so a
+  completed replacement is a new inode).
+- `WOULD_COPY` — a dry run wrote nothing.
+- `UNCERTAIN` — rsync started the file and the destination cannot show what happened. The case this exists
+  for is an interrupted overwrite of a file that was already the same size as the source: the destination
+  then holds the old bytes, the old inode, the same size and matching permissions, and every "looks right"
+  check passes. Size, containment and object kind are supporting observations, never proof.
+
+Metadata tuples, mtimes and content samples are diagnostics: they may appear in a warning, and they can
+never turn an `UNCERTAIN` into a `COPIED`. The attribution assumes nothing else was writing to that
+destination — see the single-writer note in section 7.
 
 rsync writes a file into a hidden temporary name (`.big.bin.QafPvi`) and renames it into place only when
 the transfer completes. Measured on rsync 3.2.7: a gracefully SIGTERM'd rsync usually removes that file
@@ -333,7 +365,9 @@ warning says so. Same verdict, different story — and only where a before-and-a
 **Engine state belongs to the engine.** Which rsync a job runs was a process-wide static; now it is per engine,
 with the static kept as a default. Which destination is busy was not tracked at all; it is now, per program, so a
 second job on the same directory fails fast instead of interleaving. Cross-process concurrency remains unlocked
-on purpose: a lock file in someone's destination tree is a decision for the owner of that tree.
+on purpose: a lock file in someone's destination tree is a decision for the owner of that tree. That choice
+is also an assumption: the before/after attribution of a transfer ("this job replaced that file") holds only
+while nothing else writes to the destination.
 
 **A typed path is the program's own path parsing, and it is allowed to be wrong out loud.** The directory fields
 are editable: `~` is home, a relative path is resolved from the working directory, surrounding spaces are

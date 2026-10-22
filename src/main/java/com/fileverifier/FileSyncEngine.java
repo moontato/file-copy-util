@@ -236,7 +236,52 @@ public class FileSyncEngine implements AutoCloseable {
      * a result. COPIED appears only when verification is off, where the transfer is the only fact the
      * job knows, and it is deliberately not coloured like a passed check - nothing was checked.
      */
-    public record FileOutcome(String relPath, String kind, String sourceHash, String destHash) {
+    /**
+     * What one file is known to be, as one row.
+     *
+     * <p>Two separate questions are answered here and must not be collapsed: what happened to the
+     * bytes ({@link TransferDisposition}) and whether the two ends agree
+     * ({@link #kind()} for a verifying job - the verdict). A job that copied a file and then verified
+     * it has a row whose transfer says COPIED and whose verdict says MATCH; a job that was stopped
+     * over an overwrite knows neither, and its row says UNCERTAIN and PENDING rather than either a
+     * silence or a success.
+     */
+    public record FileOutcome(String relPath, String kind, String sourceHash, String destHash,
+                              TransferDisposition transfer) {
+        /** A row with no transfer question to answer: a verify-only job, or a bookkeeping row. */
+        public FileOutcome(String relPath, String kind, String sourceHash, String destHash) {
+            this(relPath, kind, sourceHash, destHash, null);
+        }
+    }
+
+    /**
+     * What a copy job did to one file.
+     *
+     * <p>{@link #UNCERTAIN} exists because rsync announces a file when it <b>starts</b> the transfer
+     * (measured on 3.1.3 and 3.4.0), so "announced" says nothing about completion, and because an
+     * interrupted overwrite cannot be told apart from an untouched one by looking at the destination
+     * alone: same name, same size, same digest, same inode on disk after a cancelled copy, and the
+     * bytes are the ones that were already there. Guessing COPIED there records a false event.
+     */
+    public enum TransferDisposition {
+        /** Nothing was written for this file in this job (verify-only, or never reached). */
+        NOT_COPIED,
+        /** A dry run: the file is named, nothing was written. */
+        WOULD_COPY,
+        /** The transfer is known to have completed - see the rules in DESIGN.md section 3.4. */
+        COPIED,
+        /** A transfer started; whether it finished cannot be shown from what is on disk. */
+        UNCERTAIN;
+
+        public String describe() {
+            switch (this) {
+                case NOT_COPIED: return "not copied";
+                case WOULD_COPY: return "would be copied (dry run)";
+                case COPIED: return "copied";
+                case UNCERTAIN: return "transfer uncertain";
+                default: return name();
+            }
+        }
     }
 
     public record JobResult(JobStatus status, String message,
@@ -720,10 +765,15 @@ public class FileSyncEngine implements AutoCloseable {
         // Where each selected file would land: used to recognise the hidden partial files a killed
         // rsync leaves behind (see interruptedTempFiles).
         List<Path> destinationTargets = new ArrayList<>();
-        // When verification is off, the names rsync announced are the job's whole record of what it
-        // wrote, and they become the COPIED rows. When it is on they are redundant - every file gets a
-        // verdict row - so nothing is retained.
-        List<String> copiedPaths = new ArrayList<>();
+        // The names rsync announced, in the order it announced them. Every one of them needs a row: a
+        // job with verification off has nothing else to report, and a job that was stopped mid-transfer
+        // has to say which of these files it is uncertain about.
+        List<String> announcedNames = new ArrayList<>();
+        // What the destination looked like before rsync ran. Only this comparison can tell a completed
+        // transfer from an interrupted one when the two files are the same size.
+        TransferLedger ledger = null;
+        // Per announced file, what the destination can prove about its transfer (A10, 2.5).
+        Map<String, TransferDisposition> transfers = Map.of();
 
         if (copies && verifies) {
             // Its own phase, because it is its own wait: hashing reads the whole source before rsync has
@@ -750,6 +800,9 @@ public class FileSyncEngine implements AutoCloseable {
 
             for (FileEntry entry : workSet) {
                 destinationTargets.add(destDir.resolve(entry.relPath()));
+            }
+            if (!dryRun) {
+                ledger = new TransferLedger(destDir, workSet, warnings);
             }
 
             Path filesFrom = writeFilesFrom(workSet, warnings);
@@ -782,10 +835,27 @@ public class FileSyncEngine implements AutoCloseable {
                 }
 
                 int copied = pumpRsyncOutput(process, sourceDir, progress, errors, warnings, listener, dryRun,
-                        verifies ? null : copiedPaths);
+                        announcedNames);
                 rsyncExitCode = process.waitFor();
                 sweepRsyncTree(process);
                 markActivity("rsync exit " + rsyncExitCode);
+
+                // What happened to each announced file, decided before any early return below, because a
+                // job that is about to be reported as cancelled or failed still owes the user a list of
+                // the files it did and did not finish.
+                boolean cleanCopy = !timeoutWasTriggered() && !cancelRequested.get()
+                        && isSuccessfulExit(rsyncExitCode);
+                transfers = transferFacts(ledger, sourceDir, announcedNames, cleanCopy, dryRun);
+                if (!cleanCopy) {
+                    // A job that is about to be reported as cancelled, timed out or failed still owes the
+                    // user a per-file answer. Without it the report is a count with no names, and a count
+                    // of "1 copied" over two announced files says nothing about which one.
+                    if (verifies) {
+                        recordPendingTransfers(outcomes, listener, transfers);
+                    } else {
+                        recordTransferRows(outcomes, listener, transfers, warnings);
+                    }
+                }
 
                 if (timeoutWasTriggered()) {
                     return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun,
@@ -815,12 +885,9 @@ public class FileSyncEngine implements AutoCloseable {
             // nothing happened when hundreds of files were in fact written.
             // A dry run wrote nothing, so its rows are named for what would have happened. An export that
             // says COPIED for a file that was never written would be a record of an event that did not occur.
-            String copyKind = dryRun ? "WOULD_COPY" : "COPIED";
-            for (String rel : copiedPaths) {
-                recordOutcome(outcomes, listener, rel, copyKind, null, null);
-            }
-            if (progress.copied() > copiedPaths.size()) {
-                warnings.add("Only the first " + copiedPaths.size() + " copied file(s) are listed; the copy"
+            recordTransferRows(outcomes, listener, transfers, warnings);
+            if (progress.copied() > announcedNames.size()) {
+                warnings.add("Only the first " + announcedNames.size() + " copied file(s) are listed; the copy"
                         + " reported " + progress.copied() + ". Raise the results limit (--max-results) if"
                         + " the export must name every file.");
             }
@@ -845,7 +912,7 @@ public class FileSyncEngine implements AutoCloseable {
             sourceHashes = Map.of();
         }
         verifyEntries(workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
-                warnings, !copies);
+                warnings, !copies, transfers);
         if (timeoutWasTriggered()) {
             return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
@@ -909,10 +976,16 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /** Records one verification outcome and the matching streaming-log callback (short hashes). */
+    /**
+     * The same, with what the job did to the file's bytes. A verifying job reports a verdict and a
+     * transfer: "copied=1, checked=1, matched=1" is one file, and collapsing the two questions into one
+     * word is what made a copied file look like it had never been touched.
+     */
     private void recordOutcome(List<FileOutcome> outcomes, ProgressListener listener, String rel,
-                               String kind, String sourceHash, String destHash) {
+                               String kind, String sourceHash, String destHash,
+                               TransferDisposition transfer) {
         if (outcomes.size() < resultLimit) {
-            outcomes.add(new FileOutcome(rel, kind, sourceHash, destHash));
+            outcomes.add(new FileOutcome(rel, kind, sourceHash, destHash, transfer));
         }
         listener.onFileProcessed(rel, kind,
                 sourceHash == null ? null : FileHasher.shortHash(sourceHash),
@@ -938,6 +1011,66 @@ public class FileSyncEngine implements AutoCloseable {
         return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
                 progress.mismatched(), progress.missing(), progress.extra(), completed, exitCode,
                 outcomes, errors, extended);
+    }
+
+    /**
+     * What the destination can prove about each file rsync announced.
+     *
+     * <p>An announcement arrives when rsync starts a transfer, so it is not evidence of completion. For a
+     * job that ran to the end cleanly the completion itself is the evidence. For a job that was stopped,
+     * only a before/after comparison of the destination can decide, and when the file already existed and
+     * still has the same identity, nothing can: the bytes on disk are the ones that were there already.
+     * Those files are reported as UNCERTAIN rather than counted as copied.
+     */
+    private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger, Path sourceDir,
+                                                                  List<String> announced, boolean cleanCopy,
+                                                                  boolean dryRun) {
+        if (announced.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, TransferDisposition> facts = new LinkedHashMap<>();
+        for (String rel : announced) {
+            long sourceSize = sizeOfSourceFile(sourceDir, rel);
+            facts.put(rel, ledger == null
+                    ? (dryRun ? TransferDisposition.WOULD_COPY : TransferDisposition.UNCERTAIN)
+                    : ledger.disposition(rel, sourceSize, cleanCopy, dryRun));
+        }
+        return facts;
+    }
+
+    /**
+     * One row per announced file, saying what the destination can prove about its transfer. A job that
+     * wrote files and compared nothing has no verdicts, so these rows are its only record; a job that was
+     * stopped mid-transfer has to distinguish the file it finished from the one it left half-written.
+     */
+    private void recordTransferRows(List<FileOutcome> outcomes, ProgressListener listener,
+                                    Map<String, TransferDisposition> transfers, List<String> warnings) {
+        List<String> unresolved = new ArrayList<>();
+        for (Map.Entry<String, TransferDisposition> fact : transfers.entrySet()) {
+            if (fact.getValue() == TransferDisposition.UNCERTAIN) {
+                unresolved.add(fact.getKey());
+            }
+            recordOutcome(outcomes, listener, fact.getKey(), fact.getValue().name(), null, null,
+                    fact.getValue());
+        }
+        if (!unresolved.isEmpty()) {
+            warnings.add(unresolved.size() + " file(s) had a transfer that cannot be confirmed: rsync"
+                    + " started them and the job stopped before it finished, and the destination cannot show"
+                    + " whether the bytes arrived - a file that was already there, of the same size, looks"
+                    + " exactly the same either way. Re-run the job with verification to check them: "
+                    + describeNames(unresolved) + ".");
+        }
+    }
+
+    /**
+     * Rows for a verifying job that was stopped before it could verify anything: the transfer question is
+     * answered as far as it can be, and the verdict says the check never ran.
+     */
+    private void recordPendingTransfers(List<FileOutcome> outcomes, ProgressListener listener,
+                                        Map<String, TransferDisposition> transfers) {
+        for (Map.Entry<String, TransferDisposition> fact : transfers.entrySet()) {
+            recordOutcome(outcomes, listener, fact.getKey(), "PENDING", null, null, fact.getValue());
+        }
     }
 
     private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
@@ -1127,7 +1260,8 @@ public class FileSyncEngine implements AutoCloseable {
     private void verifyEntries(List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
                                Map<String, String> knownSourceHashes, ProgressReporter progress,
                                List<FileOutcome> outcomes, ProgressListener listener,
-                               List<String> warnings, boolean verifyOnly)
+                               List<String> warnings, boolean verifyOnly,
+                               Map<String, TransferDisposition> transfers)
             throws NoSuchAlgorithmException, InterruptedException {
         int total = workSet.size() + extras.size();
         if (total == 0) {
@@ -1185,7 +1319,8 @@ public class FileSyncEngine implements AutoCloseable {
                 default -> progress.countExtra();
             }
             recordOutcome(outcomes, listener, verdict.relPath(), verdict.kind(),
-                    verdict.sourceHash(), verdict.destHash());
+                    verdict.sourceHash(), verdict.destHash(),
+                    transfers.getOrDefault(verdict.relPath(), TransferDisposition.NOT_COPIED));
             progress.verifiedFile(!verifyOnly, verdict.relPath());
         }
 
@@ -1371,29 +1506,47 @@ public class FileSyncEngine implements AutoCloseable {
      * Writes the rsync {@code --files-from} list, or returns null when no selected name is usable.
      * The file is UTF-8 and always deleted by the caller's finally block.
      */
+    /**
+     * Hands rsync the selected names, byte for byte.
+     *
+     * <p>Two properties of this list are load-bearing, and a program that gets either wrong quietly
+     * copies the wrong set of files:
+     *
+     * <ul>
+     *   <li><b>NUL-delimited, with {@code --from0}.</b> A line-delimited list cannot carry a name
+     *       containing a newline, and the reader cannot tell where such a name ended.</li>
+     *   <li><b>Every entry prefixed with {@code ./}.</b> In a file list, an entry starting with
+     *       {@code #} or {@code ;} is a comment - measured on rsync 3.1.3 and 3.4.0, and
+     *       {@code --from0} does not change that - so a file named {@code #secret} disappears from the
+     *       job while rsync reports success. The prefix defeats the comment syntax and a leading
+     *       {@code -} along with it, and says nothing about which file is meant.</li>
+     * </ul>
+     *
+     * <p>The prefix is also why no name is rewritten here: what was scanned is what is written, after
+     * the prefix. Only a NUL cannot be handed over, and a Java path cannot contain one anyway.
+     */
     private Path writeFilesFrom(List<FileEntry> workSet, List<String> warnings) throws IOException {
         List<String> relPaths = new ArrayList<>();
         for (FileEntry entry : workSet) {
             String rel = entry.relPath();
-            if (rel.indexOf('\n') >= 0 || rel.indexOf('\r') >= 0 || rel.indexOf('\0') >= 0) {
-                // --files-from is a line list: a newline, a carriage return or a NUL in a name cannot go
-                // into it without changing which file rsync is being asked for.
-                warnings.add("Skipped from copy: file name contains a newline, carriage return or NUL byte: "
-                        + rel);
+            if (rel.indexOf('\0') >= 0) {
+                // A NUL is the delimiter: a name containing one cannot be expressed in this format.
+                warnings.add("Skipped from copy: file name contains a NUL byte: "
+                        + RsyncNameCodec.forDisplay(rel));
                 continue;
             }
-            relPaths.add(rel);
+            relPaths.add("./" + rel);
         }
         if (relPaths.isEmpty()) {
             return null;
         }
-        Path listFile = Files.createTempFile("filecopy_list_", ".txt");
-        try (BufferedWriter writer = Files.newBufferedWriter(listFile, StandardCharsets.UTF_8)) {
-            for (String rel : relPaths) {
-                writer.write(rel);
-                writer.newLine();
-            }
+        Path listFile = Files.createTempFile("filecopy_list_", ".lst");
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream(relPaths.size() * 32);
+        for (String rel : relPaths) {
+            bytes.write(rel.getBytes(StandardCharsets.UTF_8));
+            bytes.write(0);
         }
+        Files.write(listFile, bytes.toByteArray());
         return listFile;
     }
 
@@ -1415,6 +1568,10 @@ public class FileSyncEngine implements AutoCloseable {
         if (options.symlinkPolicy() == ScanOptions.SymlinkPolicy.FOLLOW) {
             command.add("--copy-links");
         }
+        // The list is NUL-delimited (see writeFilesFrom), and the mention line puts the name last
+        // after a fixed separator, so a name containing spaces, a tab or a '|' cannot be misread.
+        command.add("--from0");
+        command.add("--out-format=%i|%n");
         command.add("--files-from=" + filesFrom);
         command.add(sourceDir.toString());
         command.add(destDir.toString());
@@ -1518,16 +1675,12 @@ public class FileSyncEngine implements AutoCloseable {
      * space rather than a hard-coded offset.
      */
     static String itemizePath(String line) {
-        String trimmed = line.trim();
-        if (!trimmed.startsWith(">") && !trimmed.startsWith("<")) {
+        if (classifyLine(line) != LineKind.COPY) {
+            // A directory line carries a trailing '/' and no file to count; a message line carries no
+            // name at all.
             return null;
         }
-        int space = trimmed.indexOf(' ');
-        if (space < 0) {
-            return null;
-        }
-        String path = trimmed.substring(space + 1).trim();
-        return path.isEmpty() ? null : path.replaceAll("/$", "");
+        return RsyncNameCodec.nameOf(line);
     }
 
     /** Percent from an rsync progress line, or -1 when the line is not one. */
@@ -1638,7 +1791,13 @@ public class FileSyncEngine implements AutoCloseable {
 
     static String describeNames(List<String> names) {
         int shown = Math.min(names.size(), 10);
-        String head = String.join(", ", names.subList(0, shown));
+        List<String> displayed = new ArrayList<>(shown);
+        for (String name : names.subList(0, shown)) {
+            // A name may contain a newline, and this text goes into a log line: an unescaped name would
+            // forge an extra line and could be read as a different message.
+            displayed.add(RsyncNameCodec.forDisplay(name));
+        }
+        String head = String.join(", ", displayed);
         return names.size() > shown ? head + " (+" + (names.size() - shown) + " more)" : head;
     }
 
@@ -1736,13 +1895,25 @@ public class FileSyncEngine implements AutoCloseable {
         return new WorkSetPlan(atSource, excluded, atSource - excluded, List.copyOf(names));
     }
 
+    /**
+     * Syntax only: separator translation, and a leading {@code /} or {@code ./} that a person types
+     * but a scanned relative path never has.
+     *
+     * <p>It deliberately does <b>not</b> trim. Whitespace at either end of a name is part of that
+     * name on POSIX filesystems, and a routine that trims a scanned name can produce the identity of
+     * a different, existing file: with {@code " a "} and {@code "a"} both present, a trimmed
+     * {@code " a "} selects {@code "a"} - including when {@code a} was the file the user excluded.
+     * Trimming stays where it belongs, in the CLI's comma-separated syntax
+     * ({@link Cli#splitList}), and the exact {@code --files-from0} channel exists for names it cannot
+     * express.
+     */
     static Set<String> normalize(Set<String> relPaths) {
         Set<String> normalized = new HashSet<>();
         for (String rel : relPaths) {
             if (rel == null) {
                 continue;
             }
-            String trimmed = rel.replace(java.io.File.separatorChar, '/').trim();
+            String trimmed = rel.replace(java.io.File.separatorChar, '/');
             while (trimmed.startsWith("/")) {
                 trimmed = trimmed.substring(1);
             }

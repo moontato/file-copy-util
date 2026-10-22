@@ -55,7 +55,8 @@ class RobustnessTest {
      * about the cause - and a copy that had already written files reported none as written.
      */
     @Test
-    void carriageReturnInANameIsRefusedBeforeRsync(@org.junit.jupiter.api.io.TempDir Path tmp) throws Exception {
+    void aNameContainingACarriageReturnIsCopiedAndNamedExactly(@org.junit.jupiter.api.io.TempDir Path tmp)
+            throws Exception {
         Path src = Files.createDirectory(tmp.resolve("src"));
         Path dst = Files.createDirectory(tmp.resolve("dst"));
         TestSupport.write(src.resolve("a\rb.txt"), "one");
@@ -65,14 +66,16 @@ class RobustnessTest {
             TestSupport.request(src, dst, FileSyncEngine.JobType.COPY_AND_VERIFY,
                 TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
 
+        // A carriage return used to be refused because the list handed to rsync was a line list and this
+        // character ends a line to no visible effect. The list is NUL-delimited now, so the name is a
+        // name like any other; what matters is that it survives the round trip.
         assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message());
-        assertEquals(1, result.filesCopied(), "the usable file was still copied");
-        assertEquals(1, result.filesMissing(), "the unusable name is reported as not transferred");
-        assertTrue(result.warnings().stream().anyMatch(w -> w.contains("carriage return")),
-            "the reason has to be stated: " + result.warnings());
-        assertTrue(result.outcomes().stream().anyMatch(o -> o.kind().equals("MISSING")),
-            "the refused file must appear in the results, not vanish");
-        assertFalse(Files.exists(dst.resolve("a\rb.txt")), "a mangled name must not be written to disk");
+        assertEquals(2, result.filesCopied(), result.message());
+        assertEquals(2, result.filesMatched(), result.message());
+        assertTrue(Files.isRegularFile(dst.resolve("a\rb.txt")),
+            "the file must arrive under the name it has in the source");
+        assertTrue(result.outcomes().stream().anyMatch(o -> o.relPath().equals("a\rb.txt")),
+            "and be named exactly there: " + result.outcomes());
     }
 
     /** A failed copy is a partial copy. The counts must say so. */

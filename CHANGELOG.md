@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — audit remediation, first phases
+
+### Fixed — the file you selected is the file that gets copied
+
+- **A name with leading or trailing spaces selected a different file.** Selection lists were trimmed, so
+  choosing `" a "` when `a` also existed chose `a` — including when `a` was the file you had excluded.
+  Syntax is still rewritten (path separators, a leading `/` or `./`); the whitespace that belongs to a name
+  is not touched.
+- **A file whose name starts with `#` or `;` was never copied, while the job reported success.** In the list
+  handed to rsync those entries are comment syntax, and asking for NUL-delimited names does not change
+  that. Entries are now NUL-delimited *and* prefixed with `./`, which defeats the comment and option
+  syntax of a file list.
+- **Names containing a newline or a carriage return were skipped silently.** With a NUL-delimited list they
+  are ordinary data: they reach the destination and are named exactly in the report. They are escaped only
+  where they are shown, so a name cannot forge an extra log line.
+- **Names in the report were mangled.** rsync's mention lines are requested with a fixed separator and the
+  name last, and its octal `\#ooo` byte escapes are decoded — bytes reassembled first, then decoded once,
+  so a character that arrives as several escapes survives. A backslash followed by digits inside a real
+  filename stays exactly that.
+
+### Added
+
+- `--files-from`, `--files-from0`, `--exclude-from`, `--exclude-from0`, `--exclude-dest-from`,
+  `--exclude-dest-from0`: names read from a file, delimiter fixed by the option name, no comma syntax, no
+  trimming. A list that is not valid UTF-8 is refused by name instead of being decoded into a name full of
+  replacement characters. The newline-delimited form cannot name a file whose own name contains a newline;
+  the `0` form can.
+
+### Fixed — an interrupted transfer says what it is
+
+- A copy job stopped part way names every file it started, and says which of them it can prove finished:
+  `COPIED`, `WOULD_COPY` (dry run) or `UNCERTAIN`. The case that motivates this is an overwrite interrupted
+  half way where the destination file was already the same size as the source: afterwards the destination
+  holds the old bytes, the old inode and the same size, so nothing on disk shows what happened, and the
+  report says so instead of counting it as copied.
+- A verifying job stopped before the comparison reports `PENDING` rows with the transfer answer, instead of
+  an empty Results tab under a "1 copied" summary.
+- A file's transfer and its verdict are recorded separately, so a copied-and-verified file is one file with
+  `copied=1, checked=1, matched=1`.
+
+### CI and releases
+
+- One reusable validation workflow - tests, CLI smoke tests, and an rsync matrix built from checksum-pinned
+  tarballs of 3.1.3, 3.2.7, 3.3.0 and 3.4.0. Branch CI and the release workflow call the same one; a release
+  validates the exact commit its tag names before publishing anything, and refuses when the tag does not
+  resolve or when the jar's own version does not match the tag. Third-party actions are pinned by commit SHA.
+
 ## 1.4.0 — verification is a switch, not a mode
 
 - **The mode control is now `Copy | Verify only`, with a `Verify after copying` checkbox beside it**

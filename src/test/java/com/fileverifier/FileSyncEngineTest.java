@@ -689,8 +689,13 @@ class FileSyncEngineTest {
 
     // ---------------------------------------------------------------- B9
 
+    /**
+     * A newline in a file name used to be refused, because the list handed to rsync was a line list.
+     * It is a NUL-delimited list now, so the name is transferred like any other, and what the job has
+     * to get right is not losing it on the way in or out.
+     */
     @Test
-    void newlineInFileNameIsReportedInsteadOfCorruptingTheFileList() throws Exception {
+    void aNameContainingANewlineIsCopiedAndNamedExactly() throws Exception {
         assumeRsync();
         TestSupport.write(source.resolve("good.txt"), "good\n");
         TestSupport.write(source.resolve("bad\nname.txt"), "bad\n");
@@ -699,14 +704,13 @@ class FileSyncEngineTest {
                 TestSupport.selection("good.txt", "bad\nname.txt"), TestSupport.none());
 
         assertTrue(result.isSuccess(), result.message());
-        assertTrue(result.warnings().stream().anyMatch(w -> w.contains("newline")), result.warnings().toString());
-        assertEquals(2, result.filesChecked());
-        assertEquals(1, result.filesCopied(), "the unsafe name must not be handed to rsync");
-        assertEquals(1, result.filesMissing());
-        assertTrue(Files.isRegularFile(dest.resolve("good.txt")));
-        try (var entries = Files.list(dest)) {
-            assertEquals(1, entries.count(), "only the safe file may reach the destination");
-        }
+        assertEquals(2, result.filesChecked(), result.message());
+        assertEquals(2, result.filesMatched(), result.message());
+        assertEquals(2, result.filesCopied(), result.message());
+        assertTrue(Files.isRegularFile(dest.resolve("bad\nname.txt")),
+                "the file must arrive under the name it has in the source");
+        assertTrue(result.outcomes().stream().anyMatch(o -> o.relPath().equals("bad\nname.txt")),
+                "the row must name the file with its newline intact: " + result.outcomes());
     }
 
     // ---------------------------------------------------------------- B6
@@ -824,13 +828,16 @@ class FileSyncEngineTest {
     void selectionIsNormalizedToRelativeForwardSlashPaths() {
         Set<String> input = new java.util.LinkedHashSet<>();
         input.add("");
-        input.add(" /abs/path.txt ");
+        input.add("/abs/path.txt");
         input.add("sub/file.txt");
         input.add(null);
         input.add("//double/leading.txt");
+        input.add("./dotted.txt");
+        input.add(" spaced ");
 
         Set<String> normalized = FileSyncEngine.normalize(input);
-        assertEquals(Set.of("abs/path.txt", "sub/file.txt", "double/leading.txt"), normalized);
+        assertEquals(Set.of("abs/path.txt", "sub/file.txt", "double/leading.txt", "dotted.txt", " spaced "),
+                normalized, "syntax is rewritten; the whitespace that belongs to a name is not");
     }
 
     // ---------------------------------------------------------------- scale limits (5.4)
