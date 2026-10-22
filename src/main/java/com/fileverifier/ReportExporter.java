@@ -1,6 +1,7 @@
 package com.fileverifier;
 
 import java.io.IOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -80,6 +81,49 @@ public final class ReportExporter {
      */
     public static Path writeReport(Path target, FileSyncEngine.JobResult result, Format format,
             Path sourceDir, Path destDir, boolean allowInsideDataTrees) throws IOException {
+        ReportTarget where = validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
+        String content = format == Format.CSV ? toCsv(result) : toJson(result);
+        publish(temporarilyOwnedReport(where.parent(), content), where.absolute(), format, () -> { });
+        return where.absolute();
+    }
+
+    /**
+     * The same rules and the same publication, with a hook that runs after every check and immediately
+     * before the report is published. It exists so the race the publication has to survive can be created on
+     * purpose in a test; production calls pass nothing.
+     */
+    static Path writeReportForTesting(Path target, FileSyncEngine.JobResult result, Format format,
+            Path sourceDir, Path destDir, boolean allowInsideDataTrees, Runnable justBeforePublishing)
+            throws IOException {
+        ReportTarget where = validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
+        String content = format == Format.CSV ? toCsv(result) : toJson(result);
+        publish(temporarilyOwnedReport(where.parent(), content), where.absolute(), format,
+            justBeforePublishing);
+        return where.absolute();
+    }
+
+    /**
+     * The reason this report path would be refused, or {@code null} if nothing is wrong with it yet.
+     *
+     * <p>For a caller that has to know before it starts a job - the CLI refusing {@code --csv} and
+     * {@code --json} that name the same file, for instance, before one of them has been written. It answers
+     * the predictable part only: publication re-checks, because a file can still appear in between.
+     */
+    public static String checkReportTarget(Path target, Path sourceDir, Path destDir,
+            boolean allowInsideDataTrees) {
+        try {
+            validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
+            return null;
+        } catch (ReportRefusal refusal) {
+            return refusal.getMessage();
+        } catch (IOException other) {
+            return other.getMessage();
+        }
+    }
+
+    /** Every check that can be answered before a byte is written. */
+    private static ReportTarget validatedReportPath(Path target, Path sourceDir, Path destDir,
+            boolean allowInsideDataTrees) throws IOException {
         Path absolute = target.toAbsolutePath();
         Path parent = absolute.getParent();
         if (parent == null) {
@@ -110,29 +154,115 @@ public final class ReportExporter {
                     + " you meant it (--allow-report-in-tree, or confirm in the window). Either way an"
                     + " existing file there is never overwritten.");
         }
+        return new ReportTarget(absolute, parent);
+    }
 
-        String content = format == Format.CSV ? toCsv(result) : toJson(result);
-        Path temp = parent.resolve(".fcu-report-" + System.nanoTime()
-                + "-" + Integer.toHexString(ThreadLocalRandom.current().nextInt(1 << 20)) + ".tmp");
+    /** The report path and the directory it will be written in, together, so neither is re-derived. */
+    private record ReportTarget(Path absolute, Path parent) {
+    }
+
+    /**
+     * The report content, written to a temporary file this call created and owns.
+     *
+     * <p>{@link Files#createTempFile} rather than a name built from the clock: it opens with O_EXCL, so two
+     * runs in the same directory cannot end up sharing - or deleting each other's - temporary file.
+     */
+    private static PreparedReport temporarilyOwnedReport(Path parent, String content) throws IOException {
+        Path temp = Files.createTempFile(parent, ".fcu-report-", ".tmp");
         try {
-            Files.createFile(temp);
             Files.writeString(temp, content, java.nio.charset.StandardCharsets.UTF_8);
-            Files.move(temp, absolute, StandardCopyOption.ATOMIC_MOVE);
-            return absolute;
+            return new PreparedReport(temp, true);
         } catch (IOException failure) {
-            try {
-                Files.deleteIfExists(temp);
-            } catch (IOException cleanupFailed) {
-                // Worth saying out loud: the refusal is the failure the user needs, the leftover is ours.
-                System.err.println("could not remove the temporary report file " + temp + ": "
-                        + cleanupFailed.getMessage());
-            }
-            if (!Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
-                throw new IOException("Could not write the " + format + " report to " + absolute + ": "
-                        + failure.getMessage(), failure);
-            }
-            throw new IOException("The report path appeared while this program was writing to it: " + absolute
-                    + ". Nothing was overwritten.", failure);
+            // Ours, created a moment ago: safe to remove, and only this call's.
+            deleteQuietly(temp);
+            throw failure;
+        }
+    }
+
+    private record PreparedReport(Path temp, boolean owned) {
+    }
+
+    /**
+     * Publish the prepared report without replacing anything.
+     *
+     * <p>Omitting {@code REPLACE_EXISTING} from a move is not the guarantee it looks like: Java documents an
+     * atomic move's behaviour when the target exists as implementation-dependent, and OpenJDK on Unix reaches
+     * the syscall directly, where a rename replaces an existing target. So the guarantee is taken from
+     * something that actually provides it - link creation, which fails with {@code FileAlreadyExistsException}
+     * if the name is taken:
+     *
+     * <ol>
+     *   <li>link the prepared file to the report name, then unlink the temporary. The published report is
+     *       the fully written file, and a name that was taken in the meantime is refused rather than
+     *       replaced.</li>
+     *   <li>where hard links do not exist (FAT and exFAT volumes among them), create the report name with
+     *       {@link Files#createFile}, which is exclusive for the same reason, copy the content into the file
+     *       this call just created, and delete only what this call created.</li>
+     * </ol>
+     *
+     * <p>If neither is available the report is refused. A program that cannot promise not to replace a file
+     * should not write one over a possible file.
+     */
+    private static void publish(PreparedReport prepared, Path absolute, Format format,
+            Runnable justBeforePublishing) throws IOException {
+        justBeforePublishing.run();
+        Path temp = prepared.temp();
+        try {
+            Files.createLink(absolute, temp);
+        } catch (FileAlreadyExistsException taken) {
+            deleteQuietly(temp);
+            throw new ReportRefusal("A file appeared at the report path while the report was being prepared:"
+                    + " " + absolute + ". It was left exactly as it was and the report was not written."
+                    + " Choose a path that is not in use.");
+        } catch (UnsupportedOperationException | IOException hardLinkImpossible) {
+            publishWithoutHardLinks(prepared, absolute, format, hardLinkImpossible);
+            return;
+        }
+        try {
+            Files.delete(temp);
+        } catch (IOException leftover) {
+            // The report is published; the temporary file is ours to remove and this is the honest thing to
+            // say when we could not.
+            System.err.println("the report was written to " + absolute + " but this program could not remove"
+                    + " its temporary file " + temp + ": " + leftover.getMessage());
+        }
+    }
+
+    private static void publishWithoutHardLinks(PreparedReport prepared, Path absolute, Format format,
+            Exception why) throws IOException {
+        Path temp = prepared.temp();
+        Path created = null;
+        try {
+            created = Files.createFile(absolute);
+        } catch (FileAlreadyExistsException taken) {
+            deleteQuietly(temp);
+            throw new ReportRefusal("A file appeared at the report path while the report was being prepared:"
+                    + " " + absolute + ". It was left exactly as it was and the report was not written."
+                    + " Choose a path that is not in use.");
+        } catch (IOException cannotCreate) {
+            deleteQuietly(temp);
+            throw new IOException("Could not write the " + format + " report to " + absolute + ": "
+                    + cannotCreate.getMessage() + " (hard links unavailable: " + why.getMessage() + ")",
+                    cannotCreate);
+        }
+        try {
+            Files.copy(temp, created, StandardCopyOption.REPLACE_EXISTING);
+            deleteQuietly(temp);
+        } catch (IOException failure) {
+            // Only the file this call created a moment ago, never whatever else might have been there.
+            deleteQuietly(created);
+            deleteQuietly(temp);
+            throw new IOException("Could not write the " + format + " report to " + absolute + ": "
+                    + failure.getMessage(), failure);
+        }
+    }
+
+    private static void deleteQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException couldNot) {
+            System.err.println("could not remove " + path + " after a failed report write: "
+                    + couldNot.getMessage());
         }
     }
 

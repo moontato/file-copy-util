@@ -46,7 +46,7 @@ class CollisionAndRaceTest {
 
         FileSyncEngine.JobResult result;
         try (FileSyncEngine accepted = new FileSyncEngine()) {
-            accepted.acknowledgeCollisions(true);
+            accepted.acceptAnyCollisions();   // the CLI route: this run accepts whatever it finds
             result = accepted.execute(TestSupport.request(src, dst, FileSyncEngine.JobType.COPY_AND_VERIFY,
                 TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
         }

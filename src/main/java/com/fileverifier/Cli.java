@@ -569,6 +569,17 @@ public final class Cli {
                     + "selection. Use --verify-only to leave files out of the comparison.");
         }
 
+        // The report destinations are checkable now, before a byte is copied. Finding out afterwards that
+        // --csv and --json named the same file - or that one of them names a file that exists - means the
+        // transfer ran, one report was written, and only then was the other refused: a half-recorded job.
+        List<String> reportProblems = validateReportTargets(options);
+        if (!reportProblems.isEmpty()) {
+            for (String problem : reportProblems) {
+                err.println("Refused before starting: " + problem);
+            }
+            return EXIT_USAGE;
+        }
+
         FileSyncEngine engine = new FileSyncEngine();
         engine.setJobTimeoutMillis(options.timeoutMillis());
         engine.setBandwidthLimitKbps(options.bandwidthLimitKbps());
@@ -576,7 +587,11 @@ public final class Cli {
         // Colliding names are refused before a copy unless the caller said they meant it: on a
         // case-insensitive destination the two names are one file, and the copy overwrites one with the
         // other. Verify Only reports them either way, because it writes nothing.
-        engine.acknowledgeCollisions(options.allowCollisionNames());
+        if (options.allowCollisionNames()) {
+            // The flag was typed for this run, so it covers whatever this run finds. The window does the
+            // opposite: it accepts one named collision set, and a different set has to be asked about again.
+            engine.acceptAnyCollisions();
+        }
         ProgressReporter reporter = new ProgressReporter(out, options.quiet(), options.request().jobType());
         JobResult result;
         try {
@@ -617,6 +632,45 @@ public final class Cli {
             return EXIT_JOB_FAILED;
         }
         return result.filesMismatched() + result.filesMissing() > 0 ? EXIT_VERIFICATION_PROBLEMS : EXIT_OK;
+    }
+
+    /**
+     * The report failures that can be known before the job runs, resolved to the paths they will actually
+     * be written to: an existing target, a missing parent directory, a target inside the job's own trees
+     * without the flag that says so, and two formats naming the same file.
+     *
+     * <p>This is not a substitute for the checks at publication. A file can still appear in the interval -
+     * a copy job can create the very name a report was pointed at - and those are refused then, with exit 4.
+     */
+    static List<String> validateReportTargets(Options options) {
+        List<String> problems = new ArrayList<>();
+        JobRequest request = options.request();
+        Path csv = options.csvPath();
+        Path json = options.jsonPath();
+        List<Path> targets = new ArrayList<>();
+        if (csv != null) {
+            targets.add(csv);
+        }
+        if (json != null) {
+            targets.add(json);
+        }
+        for (Path target : targets) {
+            if (target == null) {
+                continue;
+            }
+            String reason = ReportExporter.checkReportTarget(target, request.sourceDir(), request.destDir(),
+                options.allowReportInTree());
+            if (reason != null) {
+                problems.add(reason);
+            }
+        }
+        if (csv != null && json != null
+                && csv.toAbsolutePath().normalize().equals(json.toAbsolutePath().normalize())) {
+            problems.add("--csv and --json name the same file: " + csv.toAbsolutePath().normalize()
+                    + ". The first report would be written and the second refused because the first created"
+                    + " it. Give them different paths.");
+        }
+        return problems;
     }
 
     /** @return true when every requested report was written */

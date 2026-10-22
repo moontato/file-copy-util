@@ -101,8 +101,6 @@ public final class FileVerifierView extends JPanel {
 
     /** One engine per window: it owns at most one job at a time. */
     private final FileSyncEngine engine = new FileSyncEngine();
-    /** §2.11: asked once per window; accepting it is this window's answer. */
-    private boolean collisionRiskAccepted;
 
     /** Kept so the Results tab can be re-filtered or exported after the job ends. */
     private FileSyncEngine.JobResult lastJobResult;
@@ -1038,6 +1036,43 @@ public final class FileVerifierView extends JPanel {
         return line.toString();
     }
 
+    /**
+     * The window's answer to a collision question (&#167;2.11). A seam rather than a direct dialog call so the
+     * <i>lifetime</i> of an answer is testable without a display: the rule being enforced is that an answer
+     * belongs to one collision set, not to the window.
+     */
+    interface CollisionConfirmation {
+        boolean accept(String question);
+    }
+
+    private CollisionConfirmation collisionConfirmation = question ->
+        JOptionPane.showConfirmDialog(this, question + "\n\nCopy them anyway?", "Colliding Names",
+            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION;
+
+    void setCollisionConfirmation(CollisionConfirmation confirmation) {
+        this.collisionConfirmation = confirmation;
+    }
+
+    /**
+     * Ask about one specific collision set, and accept exactly that set.
+     *
+     * <p>Nothing here is remembered as "the user is fine with collisions". The acceptance is handed to the
+     * engine as the names it was granted for; a different pair in a different directory is a different
+     * question and gets asked again.
+     */
+    boolean askAboutCollisions(List<String> collisions, String question) {
+        if (!collisionConfirmation.accept(question)) {
+            return false;
+        }
+        engine.acknowledgeCollisions(collisions);
+        return true;
+    }
+
+    /** Test window into the engine this panel owns. */
+    FileSyncEngine engineInUse() {
+        return engine;
+    }
+
     private void finishJob(FileSyncEngine.JobResult result) {
         livenessTimer.stop();
         setJobControlsEnabled(true);
@@ -1046,14 +1081,10 @@ public final class FileVerifierView extends JPanel {
         // §2.11: the engine refused rather than overwrite one selected file with another. That refusal is
         // the user's decision to make, once: accepting re-runs the same job with the risk acknowledged.
         if (result.status() == FileSyncEngine.JobStatus.FAILED
-                && result.message().contains("colliding name(s)")
-                && !collisionRiskAccepted) {
-            int answer = JOptionPane.showConfirmDialog(this, result.message() + "\n\nCopy them anyway?",
-                "Colliding Names", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-            if (answer == JOptionPane.YES_OPTION) {
-                collisionRiskAccepted = true;
-                engine.acknowledgeCollisions(true);
-                log("Collision risk accepted by the user - starting the same job again.");
+                && result.message().contains("colliding name(s)")) {
+            List<String> detected = engine.collisionsDetectedByLastJob();
+            if (askAboutCollisions(detected, result.message())) {
+                log("Collision risk accepted for these names - starting the same job again.");
                 runJob();
                 return;
             }

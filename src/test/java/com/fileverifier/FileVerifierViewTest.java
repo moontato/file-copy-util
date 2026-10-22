@@ -394,6 +394,36 @@ class FileVerifierViewTest {
         assertTrue(condition.getAsBoolean(), message);
     }
 
+    /**
+     * The window's "Copy them anyway?" is about a named pair of names, not about the window. An answer given
+     * for one pair must not carry into a different pair in a later job - otherwise the dialog is a one-time
+     * inconvenience and the rule it enforces is a formality.
+     *
+     * <p>No dialog is shown to test this: the confirmation is a seam, which is exactly why it is one.
+     */
+    @Test
+    void acceptingOneCollisionSetDoesNotWaiveTheNextOne() throws Exception {
+        FileVerifierView view = build();
+        List<String> asked = new java.util.ArrayList<>();
+        view.setCollisionConfirmation(question -> {
+            asked.add(question);
+            return asked.size() == 1;      // yes the first time, no afterwards
+        });
+
+        assertTrue(view.askAboutCollisions(List.of("A.txt / a.txt"), "the first pair"),
+            "the first answer is accepted");
+        assertTrue(view.engineInUse().collisionAcceptanceCovers(List.of("A.txt / a.txt")),
+            "and it covers exactly those names");
+        assertFalse(view.engineInUse().collisionAcceptanceCovers(List.of("B.txt / b.txt")),
+            "same window, same engine, a different pair: the earlier yes must not reach this far");
+
+        assertFalse(view.askAboutCollisions(List.of("B.txt / b.txt"), "the second pair"),
+            "the second pair is asked about again, and this time the answer is no");
+        assertFalse(view.engineInUse().collisionAcceptanceCovers(List.of("B.txt / b.txt")));
+        assertEquals(List.of("the first pair", "the second pair"), asked,
+            "two questions asked, not one question and a saved answer");
+    }
+
     private static FileVerifierView build() throws Exception {
         FileVerifierView[] holder = new FileVerifierView[1];
         SwingUtilities.invokeAndWait(() -> holder[0] = new FileVerifierView());

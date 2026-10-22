@@ -72,34 +72,57 @@
 
 ### Added — the job cannot write where it has no business writing
 
-- **A job whose source and destination overlap is refused before anything is written.** In both
-  directions, and against the directory a path *lands on* rather than the path as spelled: a destination
-  inside the source, a source inside the destination (the audit's overwrite fixture), a destination that is
-  a symbolic link to the source, and a source reached through a link inside the destination. Each refusal
-  names the relationship and what to do instead; a refused job has changed no file.
-- **Selected paths are contained in both trees, ancestors included** (A04). A name carrying `..` is
-  refused, and so is a name that looks contained but reaches outside through a linked directory: containment
-  resolves the deepest existing ancestor before judging it. Applies to Verify Only too - a comparison
-  against a file outside the destination is not a destination verdict. Documented limit: the check happens
-  before the copy, not atomically at each write, and no cross-process lock is held.
+- **A copy whose source and destination overlap is refused before anything is written.** In both directions,
+  and against the directory a path *lands on* rather than the path as spelled: a destination inside the source,
+  a source inside the destination (the audit's overwrite fixture), a destination that is a symbolic link to the
+  source, and a source reached through a link inside the destination. Each refusal names the relationship and
+  what to do instead; a refused job has changed no file. Verify Only is **not** refused for overlap — it writes
+  nothing, and refusing a read-only comparison of a directory with itself would be this program inventing a
+  danger.
+- **Selected paths are contained in both trees, ancestors included** (A04). A name carrying `..` is refused,
+  and so is a name that looks contained but leaves through a linked directory: containment resolves the deepest
+  existing ancestor before judging it. **Verify Only is held to the same rule**, which is where the audit's
+  escape actually was - a comparison that read `dst/sub/a.txt` through `dst/sub -> /tmp/outside` reported an
+  outside file's digest as the backup copy's. A read can fabricate a verdict as well as a write can damage a
+  file. The **final component is never resolved**, measured rather than assumed: a copy replaces a symbolic link
+  sitting at a destination path and leaves the link's target alone, so resolving the leaf would refuse lawful
+  jobs - a source link copied as a link because its target lives elsewhere, or a second copy into a destination
+  link the first copy had created. Documented limit: the check happens before the job, not atomically at each
+  write, and no cross-process lock is held.
 - **A report can no longer displace the files it describes** (A11). A report path that already exists is
   refused - this program cannot tell a report it wrote earlier from a file the job protects, so it does not
-  guess; the same for a directory or a symbolic link. Writing a *new* report inside the source or
-  destination tree is a separate decision and needs `--allow-report-in-tree` (CLI) or a confirmation in the
-  window, and even then it never overwrites. Reports are written to a unique temporary file and moved, so a
-  failed export leaves no half-written report and no `.fcu-report-*.tmp`. `--csv`/`--json` no longer create
-  a missing directory: a path that does not exist is a mistake to report.
-- **New exit code 4**: the job did what it was asked to do and a report could not be written.
+  guess; the same for a directory or a symbolic link. Writing a *new* report inside the source or destination
+  tree is a separate decision and needs `--allow-report-in-tree` (CLI) or a confirmation in the window, and even
+  then it never overwrites. Content goes to a `Files.createTempFile` temporary that only this call deletes, and
+  is published with `Files.createLink` - creating a link cannot replace an existing target, so a path taken in
+  the interval is refused rather than overwritten; where hard links are unavailable the fallback creates the file
+  and writes only into the file just created. `ATOMIC_MOVE` was the first attempt and is gone: an atomic rename
+  is still `rename(2)`, which is permitted to replace an existing target, so it was never the guarantee it was
+  taken for. `--csv`/`--json` no longer create a missing directory: a path that does not exist is a mistake to
+  report.
+- **Report paths are checked before the job starts.** An existing or forbidden target, a missing parent
+  directory, `--csv` and `--json` naming the same file, or an in-tree report that has not been allowed is a
+  usage error (exit 2) and nothing is copied. The old order - start the copy, write one report, then refuse the
+  second - is what let `--csv x.csv --json x.csv` copy everything and record half of it. A report path that only
+  becomes taken *during* the run (a copied file that happens to be called `report.csv`) is caught at publication:
+  the copies stay as they are, no report appears, and the run exits 4.
+- **New exit code 4**: the job did what it was asked to do and a report could not be published. A report problem
+  knowable in advance is a usage error (2) and the job never runs.
 - **Colliding names now need an answer before a copy runs** (A6). Two names differing only by case or by
   how an accent is composed are one file on a case-insensitive or normalising destination, so copying both
   overwrites one with the other: the job refuses, writes nothing, and says how to accept it
-  (`--allow-collision-names`, or confirming in the window). Verify Only still just warns, because it writes
-  nothing, and a dry run still shows what the collision would do.
+  (`--allow-collision-names`, or confirming in the window). The window's answer is bound to **the names it was
+  shown**: a later job that finds a different pair is refused and asked again instead of riding on the earlier
+  yes, so one dialog is not a licence for the rest of the session; the CLI flag is openly wider, since it was
+  typed for that run. Verify Only still just warns, because it writes nothing, and a dry run still shows what the
+  collision would do.
 - GUI: the same two decisions are dialogs, not silent defaults - a report placed among the copied files is
   confirmed, and a collision refusal is followed by "Copy them anyway?" that re-runs the job with the risk
   accepted.
 - Tests: every engine and CLI copy fixture now asserts the source tree is byte-for-byte unchanged after the
-  run; a fixture that means to change the source says so by name. 217 tests, 0 failures.
+  run; a fixture that means to change the source says so by name. `WriteSafetyTest` (26 fixtures) covers the
+  refusals, the report rules, the acceptance lifetime, and the case where a report path is taken mid-run. 227
+  tests, 0 failures.
 
 ### CI and releases
 

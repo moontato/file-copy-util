@@ -631,9 +631,18 @@ class FileSyncEngineTest {
         TestSupport.write(source.resolve("one.txt"), "1\n");
 
         List<String> sameDir = FileSyncEngine.validate(
-                TestSupport.request(source, source, FileSyncEngine.JobType.VERIFY_ONLY,
+                TestSupport.request(source, source, FileSyncEngine.JobType.COPY_AND_VERIFY,
                         TestSupport.selection("one.txt"), TestSupport.none()));
         assertTrue(sameDir.stream().anyMatch(p -> p.contains("same directory")), sameDir.toString());
+
+        // Overlap is a write hazard. A read-only comparison of a directory against itself is pointless, but
+        // it overwrites nothing, and refusing it here would be this program inventing a danger.
+        assertTrue(FileSyncEngine.validate(TestSupport.request(source, source,
+                FileSyncEngine.JobType.VERIFY_ONLY, TestSupport.selection("one.txt"),
+                TestSupport.none())).isEmpty(),
+                "Verify Only is not refused for overlap: " + FileSyncEngine.validate(
+                    TestSupport.request(source, source, FileSyncEngine.JobType.VERIFY_ONLY,
+                        TestSupport.selection("one.txt"), FileSyncEngine.Selection.none())));
 
         Path nested = source.resolve("inside/dest");
         Files.createDirectories(nested);

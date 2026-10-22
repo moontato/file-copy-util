@@ -202,6 +202,282 @@ class WriteSafetyTest {
         assertEquals("someone-elses-business", Files.readString(outside.resolve("a.txt")));
     }
 
+    @Test
+    void aVerifyOnlyComparisonReachedThroughALinkedDestinationDirectoryIsRefused() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src/sub"));
+        Path dest = Files.createDirectories(root.resolve("data/dest"));
+        Path outside = Files.createDirectories(root.resolve("data/outside"));
+        TestSupport.write(src.resolve("sub/a"), "payload");
+        TestSupport.write(outside.resolve("a"), "payload");
+        Files.createSymbolicLink(dest.resolve("sub"), outside);
+        Map<String, String> before = digests(outside);
+
+        // The audit's A04 exactly as it was found, in the mode nobody thought about because it writes
+        // nothing. The name is an ordinary relative name; the escape is in the destination's own ancestry.
+        // Nothing here destroys a file - it reports somebody else's file as a verified backup copy, which is
+        // worse than a crash because it looks like a pass.
+        JobResult result = run(JobType.VERIFY_ONLY, src, dest, TestSupport.selection("sub/a"));
+
+        assertEquals(JobStatus.FAILED, result.status(),
+            "a comparison reached through a linked destination directory is not a verdict about the"
+                + " destination: " + result.message());
+        assertTrue(result.message().contains("sub/a"), result.message());
+        assertEquals(0, result.filesChecked(),
+            "the outside file may not appear in the counts as matched: " + result.message());
+        assertTrue(outcomesOf(result).isEmpty(), "no verdict row may be recorded for it: " + result.message());
+        assertUnchanged(outside, before);
+    }
+
+    @Test
+    void aVerifyOnlyJobIsNotRefusedMerelyBecauseItsTreesOverlap() throws Exception {
+        Path src = Files.createDirectories(root.resolve("data"));
+        TestSupport.write(src.resolve("a.txt"), "same");
+        TestSupport.write(src.resolve("backup/a.txt"), "same");
+
+        // Overlap is a write hazard, and the refusals for it are scoped to jobs that write. A comparison of
+        // a directory against part of itself is pointless but harmless, and refusing it would be this
+        // program inventing a danger it is not protecting against.
+        JobResult result = run(JobType.VERIFY_ONLY, src, src.resolve("backup"),
+            TestSupport.selection("a.txt"));
+
+        assertEquals(JobStatus.COMPLETED, result.status(), result.message());
+        assertEquals(1, result.filesChecked(), result.message());
+    }
+
+    @Test
+    void aLinkCopiedAsALinkIsNotRefusedBecauseItsTargetPointsElsewhere() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        Path elsewhere = Files.createDirectories(root.resolve("elsewhere"));
+        TestSupport.write(elsewhere.resolve("target.bin"), "target");
+        Files.createSymbolicLink(src.resolve("link.bin"), elsewhere.resolve("target.bin").toAbsolutePath());
+        ScanOptions linkPolicy = ScanOptions.DEFAULTS.withSymlinkPolicy(ScanOptions.SymlinkPolicy.LINK);
+
+        // This is a legal job, and the containment helper must not make it illegal: under copy-as-link the
+        // link is the object being copied. Its target is the link's business, not this program's.
+        JobResult first;
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            first = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("link.bin"), Selection.none(), linkPolicy, false), rec);
+        }
+        assertEquals(JobStatus.COMPLETED, first.status(),
+            "a source link whose target is outside the source is still a link inside the source: "
+                + first.message());
+        assertTrue(Files.isSymbolicLink(dest.resolve("link.bin")), "copied as a link, as asked");
+        assertEquals(elsewhere.resolve("target.bin").toAbsolutePath().toString(),
+            Files.readSymbolicLink(dest.resolve("link.bin")).toString(), "the link text is what travelled");
+
+        // The interesting half: the destination now holds a link pointing outside itself, and a second copy
+        // must not refuse the very object the first copy created.
+        JobResult second;
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            second = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("link.bin"), Selection.none(), linkPolicy, false), rec);
+        }
+        assertEquals(JobStatus.COMPLETED, second.status(),
+            "containment refused a destination link that a previous copy of the same link made: "
+                + second.message());
+        assertTrue(Files.isSymbolicLink(dest.resolve("link.bin")), second.message());
+    }
+
+    @Test
+    void aSymlinkAtTheEndOfASelectedPathIsAnObjectNotARoute() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("data/dest"));
+        Path outside = Files.createDirectories(root.resolve("data/outside"));
+        TestSupport.write(src.resolve("a.txt"), "payload");
+        TestSupport.write(outside.resolve("a.txt"), "innocent-data");
+        Files.createSymbolicLink(dest.resolve("a.txt"), outside.resolve("a.txt"));
+        Map<String, String> before = digests(outside);
+
+        // Measured against rsync, not reasoned about: a copy replaces a link sitting at the destination path
+        // and leaves the link's target alone. Refusing this job - which resolving the leaf would do - is a
+        // program inventing a hazard, and it would also refuse the legitimate link cases above.
+        JobResult result = run(JobType.COPY_ONLY, src, dest, TestSupport.selection("a.txt"));
+
+        assertTrue(result.isSuccess(), result.message());
+        assertFalse(Files.isSymbolicLink(dest.resolve("a.txt")), "the link was replaced by the copied file");
+        assertEquals("payload", Files.readString(dest.resolve("a.txt")));
+        assertEquals("innocent-data", Files.readString(outside.resolve("a.txt")),
+            "the target of the link is what must not be touched, and it was not");
+        assertUnchanged(outside, before);
+    }
+
+    @Test
+    void aBrandNewFileIsNotCreatedThroughALinkedDestinationDirectory() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src/sub"));
+        Path dest = Files.createDirectories(root.resolve("data/dest"));
+        Path outside = Files.createDirectories(root.resolve("data/outside"));
+        TestSupport.write(src.resolve("sub/brand-new.txt"), "payload");
+        Files.createSymbolicLink(dest.resolve("sub"), outside);
+
+        // The name does not exist at the destination yet, so there is no leaf to resolve and no file whose
+        // identity could change: the escape is only visible in the directories above it. This is the case a
+        // leaf-only containment check passes and rsync then acts on.
+        JobResult result = run(JobType.COPY_ONLY, src, dest, TestSupport.selection("sub/brand-new.txt"));
+
+        assertEquals(JobStatus.FAILED, result.status(), result.message());
+        assertTrue(result.message().contains("sub/brand-new.txt"), result.message());
+        assertFalse(Files.exists(outside.resolve("brand-new.txt")),
+            "the whole point: rsync would have created the file at the far end of the link");
+        assertFalse(Files.exists(dest.resolve("sub/brand-new.txt")), result.message());
+        assertTrue(Files.isSymbolicLink(dest.resolve("sub")), "the link itself is not the thing being fixed");
+    }
+
+    @Test
+    void aReportPathTakenBySomeoneElseBetweenCheckAndPublicationIsLeftAlone() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        Path reports = Files.createDirectories(root.resolve("reports"));
+        Path target = reports.resolve("report.csv");
+        TestSupport.write(src.resolve("a.txt"), "1");
+        FileSyncEngine.JobResult job = runWithOneFile();
+
+        // The existence check and the publication are not one operation. Something can take the name in
+        // between, and "we checked first" is not a promise. Publication has to fail on its own terms.
+        ReportExporter.ReportRefusal refusal = org.junit.jupiter.api.Assertions.assertThrows(
+            ReportExporter.ReportRefusal.class,
+            () -> ReportExporter.writeReportForTesting(target, job, ReportExporter.Format.CSV, src, dest,
+                false, () -> {
+                    try {
+                        Files.writeString(target, "another process wrote this first");
+                    } catch (java.io.IOException couldNot) {
+                        throw new IllegalStateException(couldNot);
+                    }
+                }));
+
+        assertTrue(refusal.getMessage().contains("appeared at the report path"), refusal.getMessage());
+        assertEquals("another process wrote this first", Files.readString(target),
+            "the claim is that it was left as it was - that has to be what the file says");
+        List<String> left;
+        try (var files = Files.list(reports)) {
+            left = files.map(f -> f.getFileName().toString()).sorted().toList();
+        }
+        assertEquals(List.of("report.csv"), left, "no temporary report file left behind by the failed attempt");
+    }
+
+    @Test
+    void aReportPathTakenBySomeoneElseIsLeftAloneEvenWithoutHardLinks() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src2"));
+        Path dest = Files.createDirectories(root.resolve("dest2"));
+        Path reports = Files.createDirectories(root.resolve("reports2"));
+        Path target = reports.resolve("report.json");
+        TestSupport.write(src2File(src), "1");
+        FileSyncEngine.JobResult job = runWithOneFile();
+
+        // Same race, and the fallback publication has to answer it the same way. (This filesystem has hard
+        // links, so the fallback is exercised by the code path it takes when they are unavailable only in
+        // CI on such a volume; what is proven here is that the exclusive-create path is reached and refuses.)
+        ReportExporter.ReportRefusal refusal = org.junit.jupiter.api.Assertions.assertThrows(
+            ReportExporter.ReportRefusal.class,
+            () -> ReportExporter.writeReportForTesting(target, job, ReportExporter.Format.JSON, src, dest,
+                false, () -> {
+                    try {
+                        Files.writeString(target, "{}");
+                    } catch (java.io.IOException couldNot) {
+                        throw new IllegalStateException(couldNot);
+                    }
+                }));
+        assertEquals("{}", Files.readString(target));
+        assertTrue(refusal.getMessage().contains("appeared at the report path"), refusal.getMessage());
+    }
+
+    private static Path src2File(Path src) throws Exception {
+        TestSupport.write(src.resolve("a.txt"), "1");
+        return src.resolve("a.txt");
+    }
+
+    @Test
+    void anAcceptedCollisionSetCoversThatSetAndNoOther() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        TestSupport.write(src.resolve("Report.txt"), "upper");
+        TestSupport.write(src.resolve("report.txt"), "lower");
+        TestSupport.write(src.resolve("Note.txt"), "note");
+        TestSupport.write(src.resolve("note.txt"), "note too");
+
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            // The real window's flow: the job refuses, the engine reports the set it found, the user accepts
+            // those names, and the same job then runs.
+            JobResult refused = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("Report.txt", "report.txt"), Selection.none()), rec);
+            assertEquals(JobStatus.FAILED, refused.status(), refused.message());
+            List<String> detected = engine.collisionsDetectedByLastJob();
+            assertEquals(1, detected.size(), "one pair named, not one per file: " + detected);
+
+            engine.acknowledgeCollisions(detected);
+            JobResult accepted = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("Report.txt", "report.txt"), Selection.none()), rec);
+            assertEquals(JobStatus.COMPLETED, accepted.status(), accepted.message());
+
+            // The answer was for those two names. A different pair in the same directory is a different
+            // question and must not be covered by it.
+            JobResult otherPair = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("Note.txt", "note.txt"), Selection.none()), rec);
+            assertEquals(JobStatus.FAILED, otherPair.status(),
+                "accepting Report.txt/report.txt cannot silently accept Note.txt/note.txt: "
+                    + otherPair.message());
+            assertTrue(engine.collisionsDetectedByLastJob().stream().anyMatch(g -> g.contains("Note.txt")),
+                "and it still says which pair it is asking about: "
+                    + engine.collisionsDetectedByLastJob());
+        }
+    }
+
+    @Test
+    void aReportPathTheJobItselfTakesDuringTheRunIsRefusedAfterwardsAndExitsFour() throws Exception {
+        PrintCapture out = new PrintCapture();
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        TestSupport.write(src.resolve("report.csv"), "a file that happens to be called report.csv");
+        Path target = dest.resolve("report.csv");
+
+        // Nothing was wrong with the report path when the job started. The copy then created it. Publication
+        // has to notice, refuse, and leave the copied file alone - and the run has to say that the record of
+        // it did not arrive.
+        int exit = Cli.run(List.of("--cli", "--quiet", "--source", src.toString(), "--dest", dest.toString(),
+            "--files", "a.txt,report.csv", "--no-verify", "--allow-report-in-tree", "--csv",
+            target.toString()).toArray(String[]::new), out.outStream, out.errStream);
+
+        assertEquals(Cli.EXIT_REPORT_FAILED, exit,
+            "a job that succeeded and could not write its report is not a clean run: " + out.err());
+        assertTrue(out.err().contains("A file is already there")
+                || out.err().contains("appeared at the report path"), out.err());
+        assertEquals("a file that happens to be called report.csv", Files.readString(target),
+            "the copy's own file is what is there, and it stays exactly as the copy left it");
+        assertEquals(List.of("a.txt", "report.csv"), namesIn(dest),
+            "no temporary report file left behind: " + namesIn(dest));
+    }
+
+    @Test
+    void twoFormatsNamingOnePathAreRefusedBeforeTheTransferRuns() throws Exception {
+        PrintCapture out = new PrintCapture();
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        Path shared = root.resolve("reports.csv");
+
+        int exit = Cli.run(List.of("--cli", "--quiet", "--source", src.toString(), "--dest", dest.toString(),
+            "--files", "a.txt", "--no-verify", "--csv", shared.toString(), "--json", shared.toString())
+            .toArray(String[]::new), out.outStream, out.errStream);
+
+        assertEquals(Cli.EXIT_USAGE, exit, out.err());
+        assertTrue(out.err().contains("the same file"), out.err());
+        assertFalse(Files.exists(shared), "the old behaviour copied everything, wrote one report, then"
+            + " refused the second: a job half recorded");
+        assertEquals(List.of(), namesIn(dest), "the transfer never started, so the destination is untouched");
+    }
+
+    private static List<String> namesIn(Path directory) throws Exception {
+        try (var files = Files.list(directory)) {
+            return files.map(f -> f.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    private static List<String> outcomesOf(JobResult result) {
+        return result.outcomes().stream().map(o -> o.kind() + ":" + o.relPath()).toList();
+    }
+
     // ---------------------------------------------------------------- §2.11 collisions
 
     @Test
@@ -226,7 +502,7 @@ class WriteSafetyTest {
             assertUnchanged(dest, before);
 
             // Ask, accept, run: the same job, the same files, with the risk taken on purpose.
-            engine.acknowledgeCollisions(true);
+            engine.acknowledgeCollisions(engine.collisionsDetectedByLastJob());
             JobResult accepted = engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
                 TestSupport.selection("Report.txt", "report.txt"), Selection.none()), rec);
 
@@ -291,15 +567,15 @@ class WriteSafetyTest {
             "--files", "notes.txt", "--no-verify", "--csv", src.resolve("notes.txt").toString())
             .toArray(String[]::new), out.outStream, out.errStream);
 
-        assertEquals(Cli.EXIT_REPORT_FAILED, exit,
-            "the copies happened and the record did not arrive: that is not a clean run. " + out.err()
-                + out.out());
+        assertEquals(Cli.EXIT_USAGE, exit,
+            "a report path that names an existing file is known before the job runs, so it is refused"
+                + " before anything is copied: " + out.err() + out.out());
         assertEquals(original, Files.readString(src.resolve("notes.txt")),
             "the file the report was pointed at is the file the job was reading - it must be intact");
+        assertTrue(out.err().contains("Refused before starting"), out.err());
         assertTrue(out.err().contains("A file is already there"), out.err());
-        try (var files = Files.list(src)) {
-            assertEquals(1, files.count(), "a refused export leaves no temporary file behind");
-        }
+        assertEquals(List.of("notes.txt"), namesIn(src),
+            "a refused run is a run that never started: nothing was copied either");
     }
 
     @Test
@@ -313,7 +589,8 @@ class WriteSafetyTest {
             dest.toString(), "--files", "a.txt", "--no-verify", "--csv",
             dest.resolve("report.csv").toString()).toArray(String[]::new), out.outStream, out.errStream);
 
-        assertEquals(Cli.EXIT_REPORT_FAILED, refused, out.err());
+        assertEquals(Cli.EXIT_USAGE, refused,
+            "this one is knowable before the job, so the job never runs: " + out.err());
         assertTrue(out.err().contains("the destination tree"), out.err());
         assertFalse(Files.exists(dest.resolve("report.csv")), "refused means nothing was written");
         assertTrue(out.err().contains("the destination tree") && out.err().contains("Choose a path outside"),
@@ -345,8 +622,9 @@ class WriteSafetyTest {
             "--files", "a.txt", "--no-verify", "--allow-report-in-tree", "--csv",
             dest.resolve("existing.txt").toString()).toArray(String[]::new), out.outStream, out.errStream);
 
-        assertEquals(Cli.EXIT_REPORT_FAILED, exit,
-            "the permission to put a report inside the trees is not permission to replace a file in them");
+        assertEquals(Cli.EXIT_USAGE, exit,
+            "the permission to put a report inside the trees is not permission to replace a file in them: "
+                + out.err());
         assertEquals("destination data", Files.readString(dest.resolve("existing.txt")));
         assertTrue(out.err().contains("A file is already there"), out.err());
     }
@@ -363,7 +641,8 @@ class WriteSafetyTest {
             "--files", "a.txt", "--no-verify", "--json", missing.toString())
             .toArray(String[]::new), out.outStream, out.errStream);
 
-        assertEquals(Cli.EXIT_REPORT_FAILED, exit, out.err());
+        assertEquals(Cli.EXIT_USAGE, exit, out.err());
+        assertTrue(out.err().contains("does not exist"), out.err());
         assertFalse(Files.exists(missing.getParent()),
             "a report path that does not exist is a mistake to report, not a directory tree to create");
         assertFalse(Files.exists(dest.resolve("a.txt.bak")));
@@ -374,9 +653,9 @@ class WriteSafetyTest {
             "--files", "a.txt", "--no-verify",
             "--csv", src.resolve("a.txt").toString(),
             "--json", src.resolve("a.txt").toString()).toArray(String[]::new), both.outStream, both.errStream);
-        assertEquals(Cli.EXIT_REPORT_FAILED, exit2, both.err());
-        assertTrue(both.err().contains("CSV") && both.err().contains("JSON"),
-            "one format silently succeeding while the other is refused would hide half of this: " + both.err());
+        assertEquals(Cli.EXIT_USAGE, exit2, both.err());
+        assertTrue(both.err().contains("the same file"), both.err());
+        assertFalse(Files.exists(src.resolve("a.txt.bak")));
         assertEquals("1", Files.readString(src.resolve("a.txt")));
     }
 

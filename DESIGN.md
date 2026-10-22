@@ -438,22 +438,33 @@ than guessing.
 A verifier that damages the thing it is checking is worse than one that fails, so the write side is treated
 as a set of prohibitions rather than a set of options. Each one below is enforced before anything is written.
 
-**Source and destination may not overlap - in either direction, and judged against resolved paths.** Three
-cases, all refused in preflight: the destination inside the source, the source inside the destination, and
+**A copy may not overlap what it is copying - in either direction, and judged against resolved paths.** Three
+cases, all refused in preflight for any job that writes: the destination inside the source, the source inside the destination, and
 the two being the same directory. Resolution matters: a destination that is a symbolic link to the source, or
 a source given as `backup/mirror` where `mirror` links to the data, look like two directories and are one.
 Containment is therefore judged against the directory a path *lands on* and against the path as given, and
 the refusal names which relationship was found. Why it is refused rather than warned: the destination ends up
 holding a copy of the source, so the job cannot say which copy is the original, and a run stopped half way
 leaves the source half overwritten by its own copy. There is no override - "copy a directory into itself" is
-not a thing this program does.
+not a thing this program does. Verify Only is <i>not</i> refused for overlap: it writes nothing, and refusing a
+read-only comparison of a directory with itself would be this program policing a shape that harms nothing.
 
 **Selected paths stay inside their tree, ancestors included.** A name carrying `..` is refused; so is a name
 that spells itself as contained and walks out through a linked directory (`dest/sub` being a link is enough).
 Containment resolves the deepest existing ancestor and re-attaches the rest, because a destination file the
-copy has not created yet must still be judged. It applies to Verify Only too: reading a file outside the
-destination and reporting its digest as a comparison is a false verdict, not a harmless read. The limit is
-part of the rule: this is a check made before the copy, not a lock held across each write, and no
+copy has not created yet must still be judged. It applies to Verify Only too, and that is not a technicality:
+the audit's escape was a Verify Only job comparing `dst/sub/a.txt` where `dst/sub` linked outside, and the
+digest it offered as "the backup copy" belonged to a file outside the backup. A read fabricates a verdict just
+as surely as a write damages a file.
+
+**The final component of a name is never resolved - measured, not convenient.** A symbolic link at the end of a
+selected path is an object, and the job treats it as one: rsync replaces a destination link with the file it is
+copying (measured - the link's target kept its content), and this program reports a link it finds at a
+destination rather than opening it. Resolving the leaf would refuse lawful jobs: a source link copied as a link
+whose target lives elsewhere, and a second copy into a destination link that the first copy of that same link
+created. Under `--links` such a link is compared by its target text, never traversed.
+
+The limit is part of the rule: this is a check made before the copy, not a lock held across each write, and no
 cross-process lock is taken - a directory re-pointed by another process in between is a race this program
 does not close.
 
@@ -469,15 +480,31 @@ does not close.
   or a confirmation in the window permits it, and permits nothing else: an existing file there is still
   refused.
 
-The write itself is a unique temporary file in the target's directory followed by a move without replacement,
-so a failed export leaves neither a half-written report nor a stray `.fcu-report-*.tmp`, and a target that
-appears in the interval is refused rather than replaced. A missing parent directory is reported, not created.
-A job that succeeded while its report failed exits **4**: the copies happened, the record of them did not.
+**How a report is written, and why it is not a rename.** The content goes to a temporary file made by
+`Files.createTempFile` in the system's own temp directory, and only a file this call created is ever deleted - a
+concurrent writer's temporary file is never this program's to clean up. Publication is `Files.createLink(target,
+temp)`: creating a link cannot replace an existing target, so a path that appeared after validation is refused
+instead of overwritten, and the bytes published are the bytes that were validated. Where a filesystem cannot
+hard link, the fallback is `Files.createFile(target)` - which fails if anything is already there - and only then
+copying the content into the file just created, never into a file that was already there.
+
+`ATOMIC_MOVE` was the first implementation and is deliberately gone. An atomic rename is still `rename(2)`, and
+`rename` is permitted to *replace* an existing target; building "never overwrites" on it was an assumption about
+the platform rather than a guarantee from it.
+
+**When a report problem shows up decides the exit code.** Report paths are validated before the job starts, so
+an existing target, a missing parent directory, `--csv` and `--json` naming one path, or an in-tree report that
+was not allowed are usage errors (**2**) and nothing is copied - the old order let a job run, write one report,
+then refuse the other, which is a transfer with half its record. A target that only becomes taken *during* the
+run is caught at publication, and that run exits **4**: the copies happened and the record of them did not. A
+missing parent directory is reported, not created.
 
 **Colliding names need an answer before a copy.** Two selected names that differ only by case, or only by how
 an accent is composed, are two files here and one file on a case-insensitive or normalising destination -
 copying both means one overwrites the other. Verification writes nothing, so it warns and carries on; a copy
 refuses, writes nothing, and says how to accept it (`--allow-collision-names`, or *Copy them anyway?* in the
-window). Accepting is the caller saying they know and accept the overwrite; it is not a claim that the copy
-is safe, and the warning stays. A dry run reports the pairs without refusing, because a dry run writes
+window). The window's answer is recorded as *those names*: a later job that finds a different pair is refused
+and asked again, so one dialog is not a licence for the rest of the session; the command line's flag is openly
+wider, because it was typed for this run. Accepting is the caller saying they know and accept the overwrite; it
+is not a claim that the copy is safe, and the warning stays. A dry run reports the pairs without refusing, because a dry run writes
 nothing to overwrite.

@@ -320,7 +320,13 @@ public class FileSyncEngine implements AutoCloseable {
     private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
     private volatile boolean closed;
     /** §2.11: whether the caller has accepted the collision risk. A copy without it is refused. */
-    private volatile boolean collisionsAcknowledged;
+    /** &#167;2.11: the collision set somebody has accepted, as a signature. A different set is a different
+     * question and needs a fresh answer. */
+    private volatile String acceptedCollisionSet;
+    /** The CLI convenience: {@code --allow-collision-names} was typed for this run, so it covers this run. */
+    private volatile boolean acceptAnyCollisions;
+    /** What the last job actually found, so the front end can ask about <i>that</i> set and not a guess. */
+    private volatile List<String> lastDetectedCollisions = List.of();
     private final AtomicReference<Process> liveProcess = new AtomicReference<>();
     /**
      * Every process the live rsync had spawned, snapshotted while the parent was still alive. A local
@@ -584,28 +590,28 @@ public class FileSyncEngine implements AutoCloseable {
             Path destKey = canonical(dest);
             Path sourceGiven = source.toAbsolutePath().normalize();
             Path destGiven = dest.toAbsolutePath().normalize();
-            if (sourceKey.equals(destKey)) {
+            if (sourceKey.equals(destKey) && copies) {
                 problems.add("Source and destination are the same directory: " + source
                         + (sourceKey.equals(source.toAbsolutePath().normalize()) ? ""
                             : " (this path reaches it through a link, as " + sourceKey + ")")
                         + ". Choose a destination outside the source tree.");
-            } else if (destKey.startsWith(sourceKey)) {
+            } else if (copies && destKey.startsWith(sourceKey)) {
                 problems.add("Destination is inside the source directory: " + dest + " is inside " + sourceKey
                         + ". The job would write into the tree it is reading - and the destination holds a copy"
                         + " of the source, so the job cannot say which copy is the original. Choose a"
                         + " destination outside the source tree.");
-            } else if (sourceKey.startsWith(destKey)) {
+            } else if (copies && sourceKey.startsWith(destKey)) {
                 problems.add("Source is inside the destination directory: " + sourceKey + " is inside " + dest
                         + ". Copying would write over the files being read, and a run stopped half way leaves"
                         + " the source half overwritten by its own copy. Choose a destination outside the"
                         + " source tree.");
-            } else if (sourceGiven.startsWith(destKey)) {
+            } else if (copies && sourceGiven.startsWith(destKey)) {
                 problems.add("Source is reached through the destination directory: " + source
                         + " leads to " + sourceKey + " by way of " + dest + ". The job reads its own"
                         + " destination, so copying writes over the files it is reading - through a link,"
                         + " which is why it looks like two directories. Choose a source that is not reached"
                         + " through the destination.");
-            } else if (destGiven.startsWith(sourceKey)) {
+            } else if (copies && destGiven.startsWith(sourceKey)) {
                 problems.add("Destination is reached through the source directory: " + dest + " leads to "
                         + destKey + " by way of " + source + ". The job would write into the tree it is"
                         + " reading. Choose a destination that is not reached through the source.");
@@ -679,12 +685,41 @@ public class FileSyncEngine implements AutoCloseable {
      * <p>Accepting is not a guarantee of safety. It says the caller knows two of these names can be one
      * file on the destination volume and accepts that one overwrites the other.
      */
-    public void acknowledgeCollisions(boolean acknowledged) {
-        collisionsAcknowledged = acknowledged;
+    public void acknowledgeCollisions(List<String> collisions) {
+        acceptedCollisionSet = collisionSignature(collisions);
+    }
+
+    /** Accept whatever the job turns out to find. Only the CLI uses this; the window names the set. */
+    public void acceptAnyCollisions() {
+        acceptAnyCollisions = true;
     }
 
     public boolean collisionsAcknowledged() {
-        return collisionsAcknowledged;
+        return acceptAnyCollisions || acceptedCollisionSet != null;
+    }
+
+    /**
+     * The accepted answer, matched against the set this job found. Two names in two different directories,
+     * and the same two names in a different pair, are different questions: an acceptance granted for one
+     * cannot answer the other.
+     */
+    private boolean collisionsAcceptedFor(List<String> collisions) {
+        return acceptAnyCollisions || (acceptedCollisionSet != null
+                && acceptedCollisionSet.equals(collisionSignature(collisions)));
+    }
+
+    private static String collisionSignature(List<String> collisions) {
+        return String.join("\u0000", collisions);
+    }
+
+    /** The colliding names the last job found. The window asks about these, and accepts these. */
+    public List<String> collisionsDetectedByLastJob() {
+        return List.copyOf(lastDetectedCollisions);
+    }
+
+    /** Test window into the rule: does the acceptance on record cover this set? */
+    boolean collisionAcceptanceCovers(List<String> collisions) {
+        return collisionsAcceptedFor(collisions);
     }
 
     public String rsyncBinaryInUse() {
@@ -709,7 +744,21 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
-    /** Paths whose resolved target falls outside the tree it is supposed to stay inside. */
+    /**
+     * Names whose path leaves the tree it is supposed to stay inside.
+     *
+     * <p>The directories above the final component are resolved, whatever the symlink policy: a linked
+     * directory is the directory a write or a read through it would land in, and that is the escape the audit
+     * found - including the case where the destination's own ancestry contains the link, and the case where
+     * the file at the end has not been created yet and so has nothing to resolve.
+     *
+     * <p>The final component is <b>not</b> resolved, and that is a measured decision, not a shortcut. A
+     * symbolic link sitting at the end of a selected path is an object, not a route: rsync replaces a
+     * destination link with the file it is copying (measured - the link's target was left untouched), and this
+     * program reports a link it finds at the destination instead of reading it. Resolving the leaf would
+     * refuse a legal job: it would reject a source link copied as a link because its target lives elsewhere,
+     * and it would reject a destination link that a previous copy of the same link had created.
+     */
     private static List<String> escapingPaths(Path root, Collection<String> relPaths) {
         Path inside;
         try {
@@ -719,13 +768,9 @@ public class FileSyncEngine implements AutoCloseable {
         }
         List<String> escaping = new ArrayList<>();
         for (String rel : relPaths) {
-            Path target;
-            try {
-                target = root.resolve(rel).toRealPath();
-            } catch (IOException notCreatedYet) {
-                target = resolveAsFarAsPossible(root.resolve(rel));
-            }
-            if (!target.startsWith(inside)) {
+            Path full = root.resolve(rel);
+            Path parent = full.getParent();
+            if (parent == null || !resolveAsFarAsPossible(parent).startsWith(inside)) {
                 escaping.add(rel);
             }
         }
@@ -842,11 +887,15 @@ public class FileSyncEngine implements AutoCloseable {
         sourceRels = null;
         String notFoundText = describeNames(notFound);
 
-        // §2.2: containment in both trees, before anything is written. A name carrying ".." escapes on its
-        // own; a name that looks contained escapes through a linked directory on the way. Both are judged
-        // against the resolved tree, and a refusal here has changed nothing on disk.
+        // §2.2: containment in both trees, before anything is written or read. A name carrying ".." escapes
+        // on its own; a name that looks contained escapes through a linked directory on the way. Both are
+        // judged against the resolved tree, and a refusal here has changed nothing on disk.
         //
-        // What this is not: a lock. It is checked before the copy, not atomically at each write, so a
+        // Verify Only is held to the destination rule as well: comparing a file reached through a linked
+        // destination directory reports some other directory's file as a verified backup copy, which is the
+        // audit's original A04 finding and the more dangerous of the two, because it looks like a pass.
+        //
+        // What this is not: a lock. It is checked before the job acts, not atomically at each write, so a
         // directory re-pointed by another process in between is a race this program does not close - by
         // design, since it takes no cross-process lock.
         // Every name the job was asked to handle, not only the ones the source happened to have: a name that
@@ -858,15 +907,14 @@ public class FileSyncEngine implements AutoCloseable {
         askedFor.addAll(request.sourceSelection().selected());
         askedFor.addAll(request.destinationSelection().selected());
         List<String> escaping = new ArrayList<>(escapingPaths(sourceDir, askedFor));
-        if (request.jobType().copies()) {
-            escaping.addAll(escapingPaths(destDir, askedFor));
-        }
+        escaping.addAll(escapingPaths(destDir, askedFor));
         if (!escaping.isEmpty()) {
             String problem = "Refused: " + escaping.size() + " selected path(s) point outside the directory"
                     + " they belong to: " + describeNames(escaping) + ". A path that climbs out with"
                     + " \"..\","
-                    + " or that reaches outside through a linked directory, names a file this job has no"
-                    + " business writing. Nothing was copied.";
+                    + " or that reaches outside through a linked directory, names a file outside the tree this"
+                    + " job is allowed to read or write - and a comparison of it would be reported as a"
+                    + " verdict about the destination. Nothing was copied and nothing was compared.";
             return failure(problem, List.of(problem), List.of(), 0);
         }
 
@@ -895,11 +943,12 @@ public class FileSyncEngine implements AutoCloseable {
         // refusing the job. What it must not do is overwrite one file with the other and then report a
         // mismatch as if the copy had been honest.
         List<String> collisions = collidingNames(workSet);
+        lastDetectedCollisions = List.copyOf(collisions);
         if (!collisions.isEmpty()) {
             // §2.11. Two of these names are one file on a case-insensitive or normalising destination, and
             // the later transfer overwrites the earlier one: a copy is a write, so it needs the caller to
             // have accepted that. Verification changes nothing, so it keeps warning without refusing.
-            if (request.jobType().copies() && !request.dryRun() && !collisionsAcknowledged) {
+            if (request.jobType().copies() && !request.dryRun() && !collisionsAcceptedFor(collisions)) {
                 String problem = "Refused: " + collisions.size() + " colliding name(s) in the work set: "
                         + describeNames(collisions) + ". On a case-insensitive or normalising destination"
                         + " these are the same file, and copying one over the other is what the job would do."

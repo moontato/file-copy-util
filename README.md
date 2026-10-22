@@ -89,7 +89,7 @@ files are used exactly as written; a file that is not valid UTF-8 is refused rat
 |---|---|
 | 0 | job completed, nothing mismatched or missing |
 | 1 | the job failed: preflight problem, rsync error, cancellation |
-| 2 | bad command line |
+| 2 | bad command line — **including a report path that is already taken, in a directory that does not exist, named by both `--csv` and `--json`, or inside the copied files without `--allow-report-in-tree`**. Report paths are checked before the job starts, so these runs copy nothing |
 | 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
 | 4 | the job succeeded, but a report could not be written (refused, or the write failed) — the copies happened, the record of them did not |
 
@@ -99,8 +99,10 @@ other and using both is a usage error), `--dry-run`, `--exclude a.txt,...` (with
 (adds to the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
 `--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--max-results N`, `--quiet`,
 `--allow-report-in-tree` (permit a *new* report file inside the source or destination tree; never permits
-overwriting anything), `--allow-collision-names` (accept colliding names and copy them; without it a copy
-that finds collisions refuses and writes nothing).
+overwriting anything, and a report path that is no good is refused **before the copy starts**),
+`--allow-collision-names` (accept colliding names and copy them; without it a copy that finds collisions refuses
+and writes nothing — in the window, accepting covers the names you were shown, so a different pair in a later job
+is asked about again).
 
 ### Workflow
 
@@ -201,8 +203,11 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-217 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
-name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, the CLI
+228 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
+safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
+Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
+the names it was given), the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
 checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
@@ -297,21 +302,40 @@ which copy is the original — and a run stopped half way leaves the source half
 These are refused before `rsync` starts, so nothing on disk has changed. The same applies when the two
 directories only *look* separate: a destination that is a symbolic link to the source, or a source reached
 through a link inside the destination, is the same directory as far as the filesystem is concerned. Put the
-destination outside the source tree.
+destination outside the source tree. A **Verify Only** job is not refused for overlap: it reads and compares and
+overwrites nothing.
 
 ### "Refused: N selected path(s) point outside the directory they belong to"
 
 A selected name reaches a file outside the tree the job is working on — either it carries `..`, or it looks
-contained and walks out through a linked directory on the way (`dest/sub` being a link is enough). The job
-refuses and writes nothing. Fix the name, or remove that link from the destination.
+contained and leaves through a linked directory on the way (`dest/sub` being a link is enough). The job refuses
+and writes nothing. Fix the name, or remove that link from the destination.
+
+Containment judges the **directories** a name would land in: a linked directory counts as where the write or read
+actually goes, and a name for a file that does not exist yet is judged by the directories above it. **Verify Only
+is held to the same rule** although it never writes, because comparing a file outside the destination and
+reporting its digest as the backup's is a false verdict. What is *not* followed is the final component of a path:
+a symbolic link there is an object, not a route, so a source link whose target lives elsewhere is copied as a
+link, and a destination link left behind by an earlier copy is replaced by the copy.
 
 ### "Refused the CSV report: A file is already there"
 
 A report is never written over something that exists: this program cannot tell a report it wrote earlier from
 a file the job is protecting, and guessing is what put data in danger. Choose a path that does not exist yet.
-If the path you wanted is *inside* the source or destination tree, that is a separate question — a new file
-there is allowed with `--allow-report-in-tree` (or a confirmation in the window), but an existing file there
-is never replaced. A failed or refused export exits **4** and leaves no temporary file behind.
+This is noticed **before the copy starts**, so the run that hit it copied nothing and exits **2**. If the path you
+wanted is *inside* the source or destination tree, that is a separate question — a new file there is allowed with
+`--allow-report-in-tree` (or a confirmation in the window), but an existing file there is never replaced.
+
+### "Refused the CSV report: Something appeared at the report path"
+
+The path was free when the job started and was taken during it — usually by a copied file that happens to have
+the report's name. The copies stay exactly as they are, no report appears, and the run exits **4**: a transfer
+that happened without its record is not a finished job. Point `--csv`/`--json` somewhere else.
+
+### "Refused before starting: --csv and --json name the same file"
+
+Two formats, one path — one of them would have had to overwrite the other. Give them different paths. A missing
+parent directory is reported the same way: the program does not create directories for a report.
 
 ### "changed in the source while the job ran"
 
