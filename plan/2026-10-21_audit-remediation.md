@@ -347,8 +347,35 @@ Rules: capture source digests and sizes before and assert unchanged after; where
 
 ---
 
-## 6. Next actions
+## 6. Status and next actions
 
-1. Your sign-off on this revision, and explicit approvals for A1–A11 (A1 blocks the checkpoint commit only).
-2. Red tests first for the two blockers: the decoder round-trip suite, and the interrupted-overwrite regression (`UNCERTAIN`, never `COPIED`) — plus A01, A02, A04, A11 fixtures.
-3. Phase 0b, then phases 1 → 3, reporting the before/after reproduction evidence at each step; **1.5.0** cut only on your go-ahead.
+**Done**
+
+- **A1 checkpoint:** `0069285 Checkpoint the audited 1.4.0 tree (approved as A1)` - the audited source,
+  tests and documentation, no tag, no push. Fresh validation for that commit: 176 tests, 0 failures,
+  0 errors, 0 skipped; SpotBugs 0 findings; `BUILD SUCCESS`.
+- **Red-first regressions committed** (suite is deliberately red until the matching phase lands:
+  183 tests, 7 failures, all 7 in the two files below):
+  - `AuditNameFidelityTest` - 6 failures. A02 (selecting `" a "` copies the excluded `a` instead);
+    A05 (`#secret` and `;semi` never reach the destination while `exit 0` and `copied=2` - note `-dash`
+    already survives, so the leading-dash worry is not a defect); a newline-named file is silently left
+    out; and the parser losing leading/trailing spaces, `|` in names, `cL` link rows, and every
+    `\#ooo` escape.
+  - `InterruptedOverwriteTest` - 1 failure. Every disk-level property already holds (the interrupted
+    file keeps its old content and size, the unrelated file is untouched, the completed file holds the
+    new data, the copied count does not overcount). What fails is the report: a cancelled copy job emits
+    **no per-file rows at all**, so the file it did finish is unnamed and the interrupted one is neither
+    named nor marked uncertain (A10's "positive count, empty report").
+
+**Next, in order**
+
+1. Phase 0b (A11): reusable validation workflow; `release.yml` gated on a successful validation run of
+   the exact commit; matrix gains 3.3.0.
+2. Phase 1: the decoder and the NUL list (§2.1, §2.2, §2.9, §2.10) - turns the six parser/name failures
+   green.
+3. Phase 2: write-safety (A01, A11/§2.6, A04, §2.11), with the source-immutability assertion added to the
+   existing copy tests.
+4. Phase 3: selection authority (§2.3's identity/selection split) - then propose **1.5.0** (gate green,
+   your go-ahead per A10).
+5. Phase 4: lifecycle plus completion attribution; settle the §2.5A A/B choice by measuring the hidden
+   temporary file as the in-flight signal; turns `InterruptedOverwriteTest` green.
