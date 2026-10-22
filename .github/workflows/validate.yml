@@ -1,0 +1,123 @@
+# Reusable validation. ci.yml calls it for branches and pull requests; release.yml calls it for the
+# exact commit it is about to publish, and its publish job refuses to run unless this one succeeded.
+#
+# Everything that the checks are supposed to cover is built here explicitly: the rsync versions are
+# compiled from source with pinned digests, because the runner's packaged rsync is whatever the image
+# happens to ship and is not a version this project chose.
+
+name: validate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to check out and validate. Defaults to the commit this workflow was called from."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: compile, tests, static analysis, packaged jar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # The engine drives real rsync: without it the rsync-dependent tests skip themselves, which
+      # would silently turn the build into a partial check. This one is the distro package; the
+      # deliberately chosen versions are built in the rsync-matrix job.
+      - name: Install rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+          rsync --version | head -1
+
+      - name: Build and run tests
+        run: mvn -B -ntp verify
+
+      # The tests are headless; this proves the packaged jar itself starts and can copy/verify.
+      - name: CLI smoke test against the packaged jar
+        run: |
+          set -euo pipefail
+          jar=$(ls target/file-copy-util-*.jar | head -1)
+          java -jar "$jar" --cli --help > /dev/null
+          mkdir -p /tmp/smoke/src/sub /tmp/smoke/dst
+          echo alpha > /tmp/smoke/src/a.txt
+          echo beta > /tmp/smoke/src/sub/b.txt
+          java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --csv /tmp/smoke/report.csv
+          test -f /tmp/smoke/dst/a.txt && test -f /tmp/smoke/dst/sub/b.txt
+          test -s /tmp/smoke/report.csv
+          # A dry run must write nothing, and must still report what would be missing (exit 3).
+          rm -rf /tmp/smoke/dry && mkdir -p /tmp/smoke/dry
+          if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dry --all --dry-run; then
+            echo "expected a dry run with missing files to exit non-zero" >&2
+            exit 1
+          fi
+          test -z "$(ls -A /tmp/smoke/dry)" || { echo "a dry run wrote something" >&2; exit 1; }
+          java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only
+          echo "alpha changed" > /tmp/smoke/dst/a.txt
+          if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only; then
+            echo "expected a mismatch to exit non-zero" >&2
+            exit 1
+          fi
+
+  rsync-matrix:
+    name: rsync 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # The engine reads rsync's itemize lines, its progress stats and its xfr# completed-transfer
+      # count. Those are output formats, so the behaviour is checked against specific rsync releases
+      # built here - the tarball digests are pinned, so a changed archive fails the build rather than
+      # silently testing something else.
+      - name: Build the supported rsync versions from pinned source tarballs
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/rsync-matrix"
+          mkdir -p "$work"
+          check() {
+            printf '%s  %s\n' "$1" "$work/rsync-$2.tar.gz" | sha256sum --check --status \
+              || { echo "digest mismatch for rsync-$2.tar.gz" >&2; exit 1; }
+          }
+          for version in 3.1.3 3.2.7 3.3.0 3.4.0; do
+            curl -fsSLo "$work/rsync-$version.tar.gz" \
+              "https://download.samba.org/pub/rsync/src/rsync-$version.tar.gz"
+            case "$version" in
+              3.1.3) check 55cc554efec5fdaad70de921cd5a5eeb6c29a95524c715f3bbf849235b0800c0 "$version" ;;
+              3.2.7) check 4e7d9d3f6ed10878c58c5fb724a67dacf4b6aac7340b13e488fb2dc41346f2bb "$version" ;;
+              3.3.0) check 7399e9a6708c32d678a72a63219e96f23be0be2336e50fd1348498d07041df90 "$version" ;;
+              3.4.0) check 8e942f95a44226a012fe822faffa6c7fc38c34047add3a0c941e9bc8b8b93aa4 "$version" ;;
+            esac
+            tar xzf "$work/rsync-$version.tar.gz" -C "$work"
+            (cd "$work/rsync-$version"
+              ./configure --disable-openssl --disable-xxhash --disable-zstd --disable-lz4 > /dev/null
+              make -j"$(nproc)" > /dev/null)
+            "$work/rsync-$version/rsync" --version | head -1
+          done
+          binaries=$(ls "$work"/rsync-*/rsync | paste -sd,)
+          echo "count=$(ls "$work"/rsync-*/rsync | wc -l)"
+          test "$(ls "$work"/rsync-*/rsync | wc -l)" -eq 4
+          echo "FCU_RSYNC_BINARIES=$binaries" >> "$GITHUB_ENV"
+
+      - name: Run the matrix against every built rsync
+        run: mvn -B -ntp test -Dtest=RsyncVersionMatrixTest

@@ -1,65 +1,101 @@
 name: release
 
-# Triggered by a version tag (v1.1.0, v1.2.0, ...). Builds the jar, runs the test suite, and attaches
-# the runnable jar to a GitHub Release for that tag.
+# Triggered by a version tag (v1.1.0, v1.2.0, ...). The publish job depends on a validation run of the
+# *exact commit the tag points at*, so a tag cannot be published on the strength of some other commit
+# having passed. Both jobs check out that commit, not the branch this file lives on.
 
 on:
   push:
     tags:
       - "v*"
-  # A manual run for any existing tag. It exists because a tag push can fail to trigger this file
+  # A manual run for an existing tag. It exists because a tag push can fail to trigger this file
   # (a tag trigger loads workflows from the default branch, and a tag created before this file landed
   # on that branch has nothing to run), and because it is the only way to see the failure log of a
-  # release that never happened. It also lets a release be (re)created without re-tagging.
+  # release that never happened.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release, e.g. v1.1.0"
+        description: "Existing tag to release, e.g. v1.2.0"
         required: true
-        default: "v1.1.0"
+
+# One release at a time per tag, and never cancelled midway: a half-published release is worse than a
+# failed one.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  resolve:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       # The ref of a manual run is the branch it was dispatched from, not the tag being released, so
-      # the tag has to be resolved once and used for checkout, the version check and the release.
+      # the tag has to be resolved once and used for checkout, validation and the release.
       - name: Resolve the tag this run releases
         id: tag
         env:
           DISPATCHED_TAG: ${{ inputs.tag }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          PUSHED_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          tag="${DISPATCHED_TAG:-$GITHUB_REF_NAME}"
+          tag="${DISPATCHED_TAG:-$PUSHED_TAG}"
           case "$tag" in
             v[0-9]*) ;;
             *) echo "not a version tag: $tag" >&2; exit 1 ;;
           esac
+          # A tag push already carries its commit; a manual run has to look the tag up, and the API
+          # dereferences annotated tags to the commit they point at.
+          if [ -z "${DISPATCHED_TAG:-}" ]; then
+            commit="$PUSHED_SHA"
+          else
+            commit=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$tag" | jq -r '.sha // empty')
+          fi
+          if [ -z "$commit" ]; then
+            echo "tag $tag does not resolve to a commit on $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
           echo "name=$tag" >> "$GITHUB_OUTPUT"
-          echo "releasing $tag"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag at $commit"
 
-      - uses: actions/checkout@v4
+  # Validation of that exact commit. If this fails, nothing below runs and no release appears.
+  validate:
+    needs: resolve
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  publish:
+    needs: [resolve, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ steps.tag.outputs.name }}
+          ref: ${{ needs.resolve.outputs.commit }}
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
 
-      - name: Install rsync
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rsync
-
-      - name: Build, test and package
-        run: mvn -B -ntp verify
+      - name: Package the jar (validation already passed on this commit)
+        run: mvn -B -ntp -DskipTests package
 
       - name: Check the jar matches the tag and runs headless
         env:
-          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -eu
           tag="${RELEASE_TAG}"
@@ -89,9 +125,9 @@ jobs:
           java -jar "$jar" --cli --quiet --source /tmp/rel/src --dest /tmp/rel/dst --all --verify-only
 
       - name: Create the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
           files: target/file-copy-util-*.jar
           fail_on_unmatched_files: true
           generate_release_notes: true

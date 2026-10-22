@@ -2,78 +2,23 @@ name: build
 
 on:
   push:
-    # Tag pushes are handled by release.yml; running both would build the same commit twice.
+    # Tag pushes are handled by release.yml, which runs the same validation through the reusable
+    # workflow; running both would build the same commit twice.
     tags-ignore:
       - "v*"
   pull_request:
   workflow_dispatch:
 
+# A newer push to the same branch replaces an in-flight run instead of queueing behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-
-      # The engine drives real rsync: without it the rsync-dependent tests skip themselves, which
-      # would silently turn the build into a partial check.
-      - name: Install rsync
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rsync
-          rsync --version | head -1
-
-      - name: Build and run tests
-        run: mvn -B -ntp verify
-
-      # 5.5: the engine reads rsync's itemize lines, its --info=progress2 percentage and its xfr#
-      # completed-transfer count. Those are output formats, so the behaviour is checked against several
-      # rsync releases built here, not only against the one this runner's package manager provides.
-      - name: rsync version matrix
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y build-essential
-          work="$RUNNER_TEMP/rsync-matrix"
-          mkdir -p "$work"
-          for version in 3.1.3 3.3.0 3.4.0; do
-            curl -fsSLo "$work/rsync-$version.tar.gz" \
-              "https://download.samba.org/pub/rsync/src/rsync-$version.tar.gz"
-            tar xzf "$work/rsync-$version.tar.gz" -C "$work"
-            (cd "$work/rsync-$version"
-              ./configure --disable-openssl --disable-xxhash --disable-zstd --disable-lz4 > /dev/null
-              make -j"$(nproc)" > /dev/null)
-            "$work/rsync-$version/rsync" --version | head -1
-          done
-          binaries=$(ls "$work"/rsync-*/rsync | paste -sd,)
-          FCU_RSYNC_BINARIES="$binaries" mvn -B -ntp test -Dtest=RsyncVersionMatrixTest
-
-      # The tests are headless; this proves the packaged jar itself starts and can copy/verify.
-      - name: CLI smoke test against the packaged jar
-        run: |
-          set -euo pipefail
-          jar=$(ls target/file-copy-util-*.jar | head -1)
-          java -jar "$jar" --cli --help > /dev/null
-          mkdir -p /tmp/smoke/src/sub /tmp/smoke/dst
-          echo alpha > /tmp/smoke/src/a.txt
-          echo beta > /tmp/smoke/src/sub/b.txt
-          java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --csv /tmp/smoke/report.csv
-          test -f /tmp/smoke/dst/a.txt && test -f /tmp/smoke/dst/sub/b.txt
-          test -s /tmp/smoke/report.csv
-          # A dry run must write nothing, and must still report what would be missing (exit 3).
-          rm -rf /tmp/smoke/dry && mkdir -p /tmp/smoke/dry
-          if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dry --all --dry-run; then
-            echo "expected a dry run with missing files to exit non-zero" >&2
-            exit 1
-          fi
-          test -z "$(ls -A /tmp/smoke/dry)"
-          java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only
-          echo "alpha changed" > /tmp/smoke/dst/a.txt
-          if java -jar "$jar" --cli --quiet --source /tmp/smoke/src --dest /tmp/smoke/dst --all --verify-only; then
-            echo "expected a mismatch to exit non-zero" >&2
-            exit 1
-          fi
+  # The whole check lives in one reusable workflow so that a release cannot pass a different set of
+  # checks than a branch did. The called file is the copy at this commit, not the default branch's.
+  validate:
+    uses: ./.github/workflows/validate.yml
