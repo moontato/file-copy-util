@@ -1032,7 +1032,8 @@ class FileSyncEngineTest {
                     FileSyncEngine.JobType.COPY_AND_VERIFY,
                     TestSupport.selection("big.bin"), TestSupport.none()), new TestSupport.Recorder());
 
-            assertEquals(0, result.filesCopied(), result.message());
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status(), "a cancelled job did not complete");
+        assertEquals(0, result.filesCopied(), result.message());
             assertTrue(result.message().contains("completed none of them"), result.message());
             assertFalse(Files.exists(dest.resolve("big.bin")), "the hidden partial file is not the finished one");
         } finally {
@@ -1060,7 +1061,8 @@ class FileSyncEngineTest {
                     TestSupport.selection("a.bin", "b.bin"), TestSupport.none(),
                     ScanOptions.DEFAULTS, false, true), new TestSupport.Recorder());
 
-            assertEquals(2, result.filesCopied(), result.message());
+            assertEquals(FileSyncEngine.JobStatus.FAILED, result.status(), "a cancelled dry run did not complete");
+        assertEquals(2, result.filesCopied(), result.message());
             assertTrue(result.message().contains("would have been copied"), result.message());
         } finally {
             FileSyncEngine.setRsyncBinary("rsync");

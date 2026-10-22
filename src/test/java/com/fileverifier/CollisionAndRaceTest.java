@@ -86,6 +86,8 @@ class CollisionAndRaceTest {
                 TestSupport.request(src, dst, FileSyncEngine.JobType.COPY_AND_VERIFY,
                     TestSupport.selection("moving.txt"), FileSyncEngine.Selection.none()), SILENT);
 
+            // The job ran; the comparison is what found something. Say which one happened.
+            assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message());
             assertEquals(1, result.filesMismatched());
             String warning = result.warnings().stream()
                 .filter(w -> w.contains("changed in the source while the job ran"))
@@ -112,7 +114,9 @@ class CollisionAndRaceTest {
             TestSupport.request(src, dst, FileSyncEngine.JobType.VERIFY_ONLY,
                 TestSupport.selection("a.txt"), FileSyncEngine.Selection.none()), SILENT);
 
-        assertEquals(1, result.filesMismatched());
+        // A verify-only job that finds a difference still completed its work.
+            assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message());
+            assertEquals(1, result.filesMismatched());
         assertTrue(result.warnings().stream().noneMatch(w -> w.contains("changed in the source")),
             "nothing was copied, so nothing has a before-and-after to compare: " + result.warnings());
     }

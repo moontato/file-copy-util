@@ -126,6 +126,9 @@ class RobustnessTest {
             TestSupport.request(src, dst, FileSyncEngine.JobType.VERIFY_ONLY,
                 TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
 
+        // The job itself ran fine; it is the comparison that found a problem, and the report has to keep
+        // those two facts apart.
+        assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message());
         assertEquals(1, result.filesMismatched());
         FileSyncEngine.FileOutcome outcome = result.outcomes().get(0);
         assertEquals("MISMATCH", outcome.kind());
