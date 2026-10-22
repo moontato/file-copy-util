@@ -665,12 +665,29 @@ public final class Cli {
             }
         }
         if (csv != null && json != null
-                && csv.toAbsolutePath().normalize().equals(json.toAbsolutePath().normalize())) {
-            problems.add("--csv and --json name the same file: " + csv.toAbsolutePath().normalize()
+                && sameReportTarget(csv, json)) {
+            problems.add("--csv and --json name the same file: " + ReportExporter.publicationName(csv)
                     + ". The first report would be written and the second refused because the first created"
                     + " it. Give them different paths.");
         }
         return problems;
+    }
+
+    /**
+     * Do these two spellings mean one file? Comparing the strings is not enough: with {@code reports/alias} a
+     * link to {@code reports/real}, {@code --csv reports/real/result} and {@code --json reports/alias/result}
+     * are two spellings of one report path, each of which passes the "does it already exist" check on its own -
+     * and then the transfer runs, one report is created, and the other is refused afterwards.
+     */
+    private static boolean sameReportTarget(Path a, Path b) {
+        if (ReportExporter.publicationName(a).equals(ReportExporter.publicationName(b))) {
+            return true;
+        }
+        try {
+            return Files.isSameFile(a, b);
+        } catch (IOException notBothThere) {
+            return false;
+        }
     }
 
     /** @return true when every requested report was written */

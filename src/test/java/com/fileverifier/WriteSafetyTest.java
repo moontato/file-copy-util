@@ -12,6 +12,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -331,7 +332,7 @@ class WriteSafetyTest {
         Path reports = Files.createDirectories(root.resolve("reports"));
         Path target = reports.resolve("report.csv");
         TestSupport.write(src.resolve("a.txt"), "1");
-        FileSyncEngine.JobResult job = runWithOneFile();
+        FileSyncEngine.JobResult job = runWithOneFile(src, dest);
 
         // The existence check and the publication are not one operation. Something can take the name in
         // between, and "we checked first" is not a promise. Publication has to fail on its own terms.
@@ -357,37 +358,108 @@ class WriteSafetyTest {
     }
 
     @Test
-    void aReportPathTakenBySomeoneElseIsLeftAloneEvenWithoutHardLinks() throws Exception {
+    void aFilesystemThatCannotHardLinkIsRefusedRatherThanGivenAWeakerPromise() throws Exception {
         Path src = Files.createDirectories(root.resolve("src2"));
         Path dest = Files.createDirectories(root.resolve("dest2"));
         Path reports = Files.createDirectories(root.resolve("reports2"));
         Path target = reports.resolve("report.json");
-        TestSupport.write(src2File(src), "1");
-        FileSyncEngine.JobResult job = runWithOneFile();
+        TestSupport.write(src.resolve("a.txt"), "1");
+        FileSyncEngine.JobResult job = runWithOneFile(src, dest);
 
-        // Same race, and the fallback publication has to answer it the same way. (This filesystem has hard
-        // links, so the fallback is exercised by the code path it takes when they are unavailable only in
-        // CI on such a volume; what is proven here is that the exclusive-create path is reached and refuses.)
+        // FAT, exFAT and some network and FUSE mounts have no hard links. The fallback that was here first
+        // created the report name and then copied into it, which left a window in which another writer's file
+        // could be replaced through that name, and a moment in which the report existed half-written. Both are
+        // gone: the program refuses, writes nothing, and cleans up only the temporary it created.
         ReportExporter.ReportRefusal refusal = org.junit.jupiter.api.Assertions.assertThrows(
             ReportExporter.ReportRefusal.class,
             () -> ReportExporter.writeReportForTesting(target, job, ReportExporter.Format.JSON, src, dest,
-                false, () -> {
-                    try {
-                        Files.writeString(target, "{}");
-                    } catch (java.io.IOException couldNot) {
-                        throw new IllegalStateException(couldNot);
-                    }
+                false, () -> { }, (prepared, reportPath) -> {
+                    throw new UnsupportedOperationException("links not supported by this filesystem");
                 }));
-        assertEquals("{}", Files.readString(target));
-        assertTrue(refusal.getMessage().contains("appeared at the report path"), refusal.getMessage());
-    }
 
-    private static Path src2File(Path src) throws Exception {
-        TestSupport.write(src.resolve("a.txt"), "1");
-        return src.resolve("a.txt");
+        assertTrue(refusal.getMessage().contains("cannot publish a report"), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("was not written"), refusal.getMessage());
+        assertFalse(Files.exists(target), "refused means the name was never created");
+        try (var files = Files.list(reports)) {
+            assertEquals(List.of(), files.map(f -> f.getFileName().toString()).toList(),
+                "and no temporary file of ours is left in the report directory");
+        }
     }
 
     @Test
+    void aReportNameAppearsAlreadyHoldingTheWholeReport() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src3"));
+        Path dest = Files.createDirectories(root.resolve("dest3"));
+        Path reports = Files.createDirectories(root.resolve("reports3"));
+        Path target = reports.resolve("report.csv");
+        TestSupport.write(src.resolve("a.txt"), "1");
+        FileSyncEngine.JobResult job = runWithOneFile(src, dest);
+
+        // The moment the name exists, the bytes are the whole report: nothing is published incrementally,
+        // because the name is a link to a file that was finished before it was linked.
+        List<String> seenAtPublication = new ArrayList<>();
+        ReportExporter.writeReportForTesting(target, job, ReportExporter.Format.CSV, src, dest, false,
+            () -> { }, () -> {
+                try {
+                    seenAtPublication.add(Files.readString(target));
+                    try (var files = Files.list(reports)) {
+                        seenAtPublication.add(files.map(f -> f.getFileName().toString()).sorted()
+                            .reduce("", (a, b) -> a + "," + b));
+                    }
+                } catch (java.io.IOException couldNot) {
+                    throw new IllegalStateException(couldNot);
+                }
+            });
+
+        assertEquals(Files.readString(target), seenAtPublication.get(0),
+            "the report was complete the instant its name appeared");
+        assertTrue(seenAtPublication.get(1).contains("report.csv")
+                && seenAtPublication.get(1).contains(".fcu-report-"),
+            "the published name and our own staged temporary, and nothing else: " + seenAtPublication.get(1));
+
+        try (var files = Files.list(reports)) {
+            assertEquals(List.of("report.csv"), files.map(f -> f.getFileName().toString()).toList(),
+                "the temporary is ours and is removed");
+        }
+    }
+
+    @Test
+    void aReportReplacedAfterPublicationIsLeftAloneBecauseOnlyOurOwnTemporaryIsRemoved() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src4"));
+        Path dest = Files.createDirectories(root.resolve("dest4"));
+        Path reports = Files.createDirectories(root.resolve("reports4"));
+        Path target = reports.resolve("report.csv");
+        TestSupport.write(src.resolve("a.txt"), "1");
+        FileSyncEngine.JobResult job = runWithOneFile(src, dest);
+
+        // Somebody else wins the name right after we publish it. Everything this call does afterwards is
+        // cleanup of a file it created itself - the staged temporary - so the other file stays where it is.
+        ReportExporter.writeReportForTesting(target, job, ReportExporter.Format.CSV, src, dest, false,
+            () -> { }, () -> {
+                try {
+                    Files.delete(target);
+                    Files.writeString(target, "someone else's file, in the same name");
+                } catch (java.io.IOException couldNot) {
+                    throw new IllegalStateException(couldNot);
+                }
+            });
+
+        assertEquals("someone else's file, in the same name", Files.readString(target),
+            "this program does not write to a report path again after publishing it");
+        try (var files = Files.list(reports)) {
+            assertEquals(List.of("report.csv"), files.map(f -> f.getFileName().toString()).toList());
+        }
+    }
+
+    private FileSyncEngine.JobResult runWithOneFile(Path src, Path dest) throws Exception {
+        TestSupport.write(src.resolve("a.txt"), "1");
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            return engine.execute(TestSupport.request(src, dest, JobType.COPY_ONLY,
+                TestSupport.selection("a.txt"), Selection.none()), rec);
+        }
+    }
+
+        @Test
     void anAcceptedCollisionSetCoversThatSetAndNoOther() throws Exception {
         Path src = Files.createDirectories(root.resolve("src"));
         Path dest = Files.createDirectories(root.resolve("dest"));
@@ -479,6 +551,58 @@ class WriteSafetyTest {
     }
 
     // ---------------------------------------------------------------- §2.11 collisions
+
+    @Test
+    void twoSpellingsOfOneReportPathThroughALinkedDirectoryAreRefusedBeforeTheCopy() throws Exception {
+        PrintCapture out = new PrintCapture();
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        Path real = Files.createDirectories(root.resolve("reports/real"));
+        Files.createSymbolicLink(root.resolve("reports/alias"), real);
+        TestSupport.write(src.resolve("a.txt"), "1");
+
+        // Each spelling passes the "does this path already exist" check on its own while the target is absent,
+        // and comparing the strings says they differ. Only the resolved directory says they are one file: the
+        // first report would be written and the second refused because the first created it - after the
+        // transfer had already run.
+        int exit = Cli.run(List.of("--cli", "--quiet", "--source", src.toString(), "--dest", dest.toString(),
+            "--files", "a.txt", "--no-verify", "--csv", root.resolve("reports/real/result").toString(),
+            "--json", root.resolve("reports/alias/result").toString()).toArray(String[]::new),
+            out.outStream, out.errStream);
+
+        assertEquals(Cli.EXIT_USAGE, exit, out.err());
+        assertTrue(out.err().contains("the same file"), out.err());
+        assertTrue(out.err().contains("reports/real/result"),
+            "the message has to name the file they both mean, not one of the spellings: " + out.err());
+        assertEquals(List.of(), namesIn(dest), "refused means the transfer never started");
+        try (var files = Files.list(real)) {
+            assertEquals(List.of(), files.map(f -> f.getFileName().toString()).toList(),
+                "and no report was written under either name");
+        }
+    }
+
+    @Test
+    void aReportPathInsideALinkedDirectoryIsJudgedByWhereItActuallyLands() throws Exception {
+        Path src = Files.createDirectories(root.resolve("src"));
+        Path dest = Files.createDirectories(root.resolve("dest"));
+        Path outside = Files.createDirectories(root.resolve("data/outside"));
+        Files.createSymbolicLink(dest.resolve("linkout"), outside);
+        TestSupport.write(src.resolve("a.txt"), "1");
+
+        // dest/linkout is a link to a directory outside the destination, so a report "inside the destination
+        // tree" spelled through it is not inside the destination at all: it lands in the outside directory,
+        // which neither tree check would catch. The resolution has to be done before the in-tree decision.
+        PrintCapture out = new PrintCapture();
+        int exit = Cli.run(List.of("--cli", "--quiet", "--source", src.toString(), "--dest", dest.toString(),
+            "--files", "a.txt", "--no-verify", "--csv",
+            dest.resolve("linkout/report.csv").toString()).toArray(String[]::new), out.outStream,
+            out.errStream);
+
+        assertEquals(Cli.EXIT_OK, exit, out.err() + out.out());
+        assertTrue(Files.exists(outside.resolve("report.csv")),
+            "the report went where the link says, which is outside both trees, so no permission was needed");
+        assertFalse(Files.exists(dest.resolve("linkout/report.csv.tmp")));
+    }
 
     @Test
     void aCopyThatFindsCollidingNamesRefusesUntilSomebodyAcceptsIt() throws Exception {

@@ -71,20 +71,19 @@ public final class ReportExporter {
      *       permits it, with a warning naming what it means. It never permits an overwrite.</li>
      * </ul>
      *
-     * <p>The write itself is a unique temporary file in the target's directory, then a move without
-     * replacement. A failed write leaves no half-written report and no temporary file behind. The window
-     * between the check and the move is closed for this program's own writes and open to another process -
-     * the same limit as everywhere else here, since no cross-process lock is held.
+     * <p>The write itself is staged in the report's own directory and published by a hard link, which cannot
+     * replace an existing name - see {@link #publish}. A failed write leaves no half-written report and no
+     * temporary file of ours behind. The window between the check and the publication is closed for this
+     * program's own writes and open to another process, which is why publication re-checks by failing rather
+     * than by overwriting; the same limit as everywhere else here, since no cross-process lock is held.
      *
      * @throws ReportRefusal the target was refused, with the reason
      * @throws IOException  the write failed; nothing partial is left behind
      */
     public static Path writeReport(Path target, FileSyncEngine.JobResult result, Format format,
             Path sourceDir, Path destDir, boolean allowInsideDataTrees) throws IOException {
-        ReportTarget where = validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
-        String content = format == Format.CSV ? toCsv(result) : toJson(result);
-        publish(temporarilyOwnedReport(where.parent(), content), where.absolute(), format, () -> { });
-        return where.absolute();
+        return writeReportForTesting(target, result, format, sourceDir, destDir, allowInsideDataTrees,
+            () -> { }, HARD_LINK_PUBLICATION);
     }
 
     /**
@@ -95,10 +94,37 @@ public final class ReportExporter {
     static Path writeReportForTesting(Path target, FileSyncEngine.JobResult result, Format format,
             Path sourceDir, Path destDir, boolean allowInsideDataTrees, Runnable justBeforePublishing)
             throws IOException {
+        return writeReportForTesting(target, result, format, sourceDir, destDir, allowInsideDataTrees,
+            justBeforePublishing, HARD_LINK_PUBLICATION);
+    }
+
+    /** As above, with the publication itself replaced, to cover a filesystem this machine cannot mount. */
+    static Path writeReportForTesting(Path target, FileSyncEngine.JobResult result, Format format,
+            Path sourceDir, Path destDir, boolean allowInsideDataTrees, Runnable justBeforePublishing,
+            Publication publication) throws IOException {
         ReportTarget where = validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
         String content = format == Format.CSV ? toCsv(result) : toJson(result);
         publish(temporarilyOwnedReport(where.parent(), content), where.absolute(), format,
-            justBeforePublishing);
+            justBeforePublishing, () -> { }, publication);
+        return where.absolute();
+    }
+
+    /** As above, with the moment-of-publication seam, over this filesystem's real hard link. */
+    static Path writeReportForTesting(Path target, FileSyncEngine.JobResult result, Format format,
+            Path sourceDir, Path destDir, boolean allowInsideDataTrees, Runnable justBeforePublishing,
+            Runnable justAfterPublication) throws IOException {
+        return writeReportForTesting(target, result, format, sourceDir, destDir, allowInsideDataTrees,
+            justBeforePublishing, justAfterPublication, HARD_LINK_PUBLICATION);
+    }
+
+    /** As above, and with a seam that runs the moment the report name exists. */
+    static Path writeReportForTesting(Path target, FileSyncEngine.JobResult result, Format format,
+            Path sourceDir, Path destDir, boolean allowInsideDataTrees, Runnable justBeforePublishing,
+            Runnable justAfterPublication, Publication publication) throws IOException {
+        ReportTarget where = validatedReportPath(target, sourceDir, destDir, allowInsideDataTrees);
+        String content = format == Format.CSV ? toCsv(result) : toJson(result);
+        publish(temporarilyOwnedReport(where.parent(), content), where.absolute(), format,
+            justBeforePublishing, justAfterPublication, publication);
         return where.absolute();
     }
 
@@ -183,41 +209,77 @@ public final class ReportExporter {
     }
 
     /**
+     * How the prepared file becomes the report. The default is a hard link; the seam exists so the case a
+     * test cannot produce on its own filesystem - one without hard links - can still be tested.
+     */
+    interface Publication {
+        void publish(Path prepared, Path reportPath) throws IOException;
+    }
+
+    private static final Publication HARD_LINK_PUBLICATION = (prepared, reportPath) ->
+        Files.createLink(reportPath, prepared);
+
+    /**
      * Publish the prepared report without replacing anything.
      *
-     * <p>Omitting {@code REPLACE_EXISTING} from a move is not the guarantee it looks like: Java documents an
-     * atomic move's behaviour when the target exists as implementation-dependent, and OpenJDK on Unix reaches
-     * the syscall directly, where a rename replaces an existing target. So the guarantee is taken from
-     * something that actually provides it - link creation, which fails with {@code FileAlreadyExistsException}
-     * if the name is taken:
+     * <p>Omitting {@code REPLACE_EXISTING} from a move is not the guarantee it looks like. Java documents an
+     * atomic move's behaviour when the target exists as implementation-dependent, and it was measured here:
+     * OpenJDK 17's {@code UnixCopyFile.move} takes its atomic branch first (line 406 {@code if
+     * (flags.atomicMove)}, line 408 {@code rename(source, target)}, then {@code return}), so the
+     * no-replacement check further down is never reached - and {@code Files.move(temp, existing, ATOMIC_MOVE)}
+     * against an existing file succeeded, leaving the target holding the temporary file's bytes.
      *
-     * <ol>
-     *   <li>link the prepared file to the report name, then unlink the temporary. The published report is
-     *       the fully written file, and a name that was taken in the meantime is refused rather than
-     *       replaced.</li>
-     *   <li>where hard links do not exist (FAT and exFAT volumes among them), create the report name with
-     *       {@link Files#createFile}, which is exclusive for the same reason, copy the content into the file
-     *       this call just created, and delete only what this call created.</li>
-     * </ol>
+     * <p>So the guarantee is taken from something that cannot provide anything else: {@code link(2)}. It fails
+     * with {@link FileAlreadyExistsException} when the name is taken, and the name it creates points at a file
+     * that is already complete - the report is never visible half-written. The temporary file is staged in the
+     * report's <i>own</i> directory, because a hard link cannot cross a filesystem; it is made by
+     * {@link Files#createTempFile} (open with {@code O_EXCL}), so it is exclusively ours and only ours is ever
+     * deleted. If this process is killed between staging and publishing, one
+     * {@code .fcu-report-*.tmp} is left in that directory; that is the visible cost of this choice, and it is
+     * smaller than the alternative of replacing a file.
      *
-     * <p>If neither is available the report is refused. A program that cannot promise not to replace a file
-     * should not write one over a possible file.
+     * <p>When hard links are unavailable - FAT, exFAT, and some network and FUSE mounts - the report is
+     * <b>refused</b>. The fallback that was here first (create the name exclusively, then copy the content into
+     * it) is gone: {@code Files.copy} with {@code REPLACE_EXISTING} deletes and replaces whatever the name
+     * points at by then, so a writer that moved in between those two calls would have had its file overwritten
+     * through a path we had just created; and the name would have existed, empty or half-written, while the
+     * copy ran. This program's rule is to refuse when it cannot provide the guarantee rather than to provide a
+     * weaker one quietly.
+     *
+     * @param justBeforePublishing      runs after staging and before the name is created (test seam for the
+     *                                  interval in which another writer can move in)
+     * @param justAfterPublication      runs the moment the report name exists, while the temporary is still
+     *                                  ours to remove (test seam proving the name appears holding the whole
+     *                                  report)
      */
     private static void publish(PreparedReport prepared, Path absolute, Format format,
-            Runnable justBeforePublishing) throws IOException {
+            Runnable justBeforePublishing, Runnable justAfterPublication, Publication publication)
+            throws IOException {
         justBeforePublishing.run();
         Path temp = prepared.temp();
+        boolean published = false;
         try {
-            Files.createLink(absolute, temp);
+            publication.publish(temp, absolute);
+            published = true;
         } catch (FileAlreadyExistsException taken) {
-            deleteQuietly(temp);
             throw new ReportRefusal("A file appeared at the report path while the report was being prepared:"
                     + " " + absolute + ". It was left exactly as it was and the report was not written."
                     + " Choose a path that is not in use.");
-        } catch (UnsupportedOperationException | IOException hardLinkImpossible) {
-            publishWithoutHardLinks(prepared, absolute, format, hardLinkImpossible);
-            return;
+        } catch (UnsupportedOperationException | IOException noLinks) {
+            throw new ReportRefusal("This filesystem cannot publish a report without the possibility of"
+                    + " replacing a file that is already there (" + noLinks.getClass().getSimpleName() + ": "
+                    + noLinks.getMessage() + "). The report was not written. FAT, exFAT and some network or"
+                    + " FUSE mounts are like this; choose a path on a filesystem that supports hard links, or"
+                    + " run the job without a report.");
+        } finally {
+            if (!published) {
+                // Staged by this call a moment ago under an exclusive name: ours to remove, and only ours.
+                deleteQuietly(temp);
+            }
         }
+
+        justAfterPublication.run();
+
         try {
             Files.delete(temp);
         } catch (IOException leftover) {
@@ -228,33 +290,20 @@ public final class ReportExporter {
         }
     }
 
-    private static void publishWithoutHardLinks(PreparedReport prepared, Path absolute, Format format,
-            Exception why) throws IOException {
-        Path temp = prepared.temp();
-        Path created = null;
-        try {
-            created = Files.createFile(absolute);
-        } catch (FileAlreadyExistsException taken) {
-            deleteQuietly(temp);
-            throw new ReportRefusal("A file appeared at the report path while the report was being prepared:"
-                    + " " + absolute + ". It was left exactly as it was and the report was not written."
-                    + " Choose a path that is not in use.");
-        } catch (IOException cannotCreate) {
-            deleteQuietly(temp);
-            throw new IOException("Could not write the " + format + " report to " + absolute + ": "
-                    + cannotCreate.getMessage() + " (hard links unavailable: " + why.getMessage() + ")",
-                    cannotCreate);
+    /**
+     * Where this path would actually be written: the directory it sits in, resolved through any linked
+     * directory, plus the name itself. Two spellings that mean one file - {@code reports/real/result} and
+     * {@code reports/alias/result} with {@code alias} a link to {@code real} - have one answer here, and each
+     * spelling on its own passes the "does this path already exist" check while the target is absent.
+     */
+    static Path publicationName(Path target) {
+        Path absolute = target.toAbsolutePath().normalize();
+        Path parent = absolute.getParent();
+        Path name = absolute.getFileName();
+        if (parent == null || name == null) {
+            return absolute;
         }
-        try {
-            Files.copy(temp, created, StandardCopyOption.REPLACE_EXISTING);
-            deleteQuietly(temp);
-        } catch (IOException failure) {
-            // Only the file this call created a moment ago, never whatever else might have been there.
-            deleteQuietly(created);
-            deleteQuietly(temp);
-            throw new IOException("Could not write the " + format + " report to " + absolute + ": "
-                    + failure.getMessage(), failure);
-        }
+        return FileSyncEngine.resolveAsFarAsPossible(parent).resolve(name);
     }
 
     private static void deleteQuietly(Path path) {

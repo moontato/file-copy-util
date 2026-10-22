@@ -93,10 +93,13 @@
   refused - this program cannot tell a report it wrote earlier from a file the job protects, so it does not
   guess; the same for a directory or a symbolic link. Writing a *new* report inside the source or destination
   tree is a separate decision and needs `--allow-report-in-tree` (CLI) or a confirmation in the window, and even
-  then it never overwrites. Content goes to a `Files.createTempFile` temporary that only this call deletes, and
-  is published with `Files.createLink` - creating a link cannot replace an existing target, so a path taken in
-  the interval is refused rather than overwritten; where hard links are unavailable the fallback creates the file
-  and writes only into the file just created. `ATOMIC_MOVE` was the first attempt and is gone: an atomic rename
+  then it never overwrites. Content is staged by `Files.createTempFile` in the report's **own** directory (a hard
+  link cannot cross a filesystem) and published with `Files.createLink` - creating a link cannot replace an
+  existing name, and the name it creates already holds the complete report, so a half-written report is never
+  visible. On a filesystem without hard links (FAT, exFAT, some network and FUSE mounts) **the report is
+  refused**. The fallback written first - create the name exclusively, then copy into it - was removed: by the
+  time the copy ran that name could belong to another writer, and a copy with replacement would overwrite their
+  file through a path this program had just created, while the report name sat there half-written. `ATOMIC_MOVE` was the first attempt and is gone: an atomic rename
   is still `rename(2)`, which is permitted to replace an existing target, so it was never the guarantee it was
   taken for - measured here: on OpenJDK 17.0.20.1+1 (`sun.nio.fs.LinuxFileSystemProvider`),
   `Files.move(temp, existing, ATOMIC_MOVE)` against an existing target succeeded and the target took the temporary
@@ -105,8 +108,11 @@
   exist is a mistake to report.
 - **Report paths are checked before the job starts.** An existing or forbidden target, a missing parent
   directory, `--csv` and `--json` naming the same file, or an in-tree report that has not been allowed is a
-  usage error (exit 2) and nothing is copied. The old order - start the copy, write one report, then refuse the
-  second - is what let `--csv x.csv --json x.csv` copy everything and record half of it. A report path that only
+  usage error (exit 2) and nothing is copied. The two-format check compares the directory each path resolves
+  into plus the name, not the two strings: with `reports/alias` a link to `reports/real`,
+  `--csv reports/real/result` and `--json reports/alias/result` are one target and are caught together. The old
+  order - start the copy, write one report, then refuse the second - is what let `--csv x.csv --json x.csv` copy
+  everything and record half of it. A report path that only
   becomes taken *during* the run (a copied file that happens to be called `report.csv`) is caught at publication:
   the copies stay as they are, no report appears, and the run exits 4.
 - **New exit code 4**: the job did what it was asked to do and a report could not be published. A report problem
@@ -123,7 +129,7 @@
   confirmed, and a collision refusal is followed by "Copy them anyway?" that re-runs the job with the risk
   accepted.
 - Tests: every engine and CLI copy fixture now asserts the source tree is byte-for-byte unchanged after the
-  run; a fixture that means to change the source says so by name. `WriteSafetyTest` (26 fixtures) covers the
+  run; a fixture that means to change the source says so by name. `WriteSafetyTest` (30 fixtures) covers the
   refusals, the report rules, the acceptance lifetime, and the case where a report path is taken mid-run. 227
   tests, 0 failures.
 

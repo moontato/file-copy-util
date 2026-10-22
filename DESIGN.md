@@ -480,13 +480,20 @@ does not close.
   or a confirmation in the window permits it, and permits nothing else: an existing file there is still
   refused.
 
-**How a report is written, and why it is not a rename.** The content goes to a temporary file made by
-`Files.createTempFile` in the system's own temp directory, and only a file this call created is ever deleted - a
-concurrent writer's temporary file is never this program's to clean up. Publication is `Files.createLink(target,
-temp)`: creating a link cannot replace an existing target, so a path that appeared after validation is refused
-instead of overwritten, and the bytes published are the bytes that were validated. Where a filesystem cannot
-hard link, the fallback is `Files.createFile(target)` - which fails if anything is already there - and only then
-copying the content into the file just created, never into a file that was already there.
+**How a report is written, and why it is not a rename.** The content is staged by `Files.createTempFile` in
+**the report's own directory** - a hard link cannot cross a filesystem, so staging it anywhere else would break
+the publication - and only a file this call created is ever deleted: another writer's temporary file is never
+this program's to clean up. Publication is `Files.createLink(report, staged)`. Creating a link cannot replace an
+existing name (it fails with `FileAlreadyExistsException`), and the name it does create points at a file that is
+already complete, so the report is never visible half-written.
+
+Two costs of that choice are accepted out loud. If the process is killed between staging and publishing, one
+`.fcu-report-*.tmp` is left in that directory. And on a filesystem with no hard links - FAT, exFAT, some network
+and FUSE mounts - **the report is refused**: the guarantee cannot be provided there, and the rule of this program
+is to say so rather than quietly substitute a weaker one. The fallback that was written first (create the name
+exclusively, then copy the content into it) was removed for two reasons: by the time the copy ran, the name could
+belong to somebody else, and a copy with replacement would overwrite their file through a path this program had
+just created; and the report name existed, empty or half-written, while the copy was in progress.
 
 `ATOMIC_MOVE` was the first implementation and is deliberately gone, because it was measured rather than assumed.
 OpenJDK 17's `UnixCopyFile.move` (java.base/sun/nio/fs/UnixCopyFile.java) takes the atomic branch first - line
@@ -496,6 +503,13 @@ machine (OpenJDK 17.0.20.1+1, `sun.nio.fs.LinuxFileSystemProvider`): `Files.move
 against an existing target **succeeded** and the target held the temporary file's bytes. A no-clobber guarantee
 cannot be built on a rename; it has to be built on an operation that cannot replace, which is what link-and-create
 does.
+
+**Two spellings of one report path are one target.** The pre-flight check for `--csv` and `--json` naming the
+same file cannot compare strings. With `reports/alias` a link to `reports/real`, the paths
+`reports/real/result` and `reports/alias/result` are two spellings of one file, and each passes the "does this
+name exist yet" test on its own while the target is absent - so the transfer runs, one report is written, and the
+second is refused afterwards. The comparison is made on the resolved directory plus the name, which is also
+where the report will actually be written.
 
 **When a report problem shows up decides the exit code.** Report paths are validated before the job starts, so
 an existing target, a missing parent directory, `--csv` and `--json` naming one path, or an in-tree report that

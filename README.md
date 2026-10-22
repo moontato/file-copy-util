@@ -334,8 +334,16 @@ that happened without its record is not a finished job. Point `--csv`/`--json` s
 
 ### "Refused before starting: --csv and --json name the same file"
 
-Two formats, one path — one of them would have had to overwrite the other. Give them different paths. A missing
-parent directory is reported the same way: the program does not create directories for a report.
+Two formats, one path — one of them would have had to overwrite the other. Give them different paths. That
+includes two **spellings** of one path: if `reports/alias` is a link to `reports/real`, then `--csv
+reports/real/result` and `--json reports/alias/result` name the same file, and that is caught before the copy
+starts. A missing parent directory is reported the same way: the program does not create directories for a
+report.
+
+### "This filesystem cannot publish a report without the possibility of replacing a file"
+The report path is on a filesystem with no hard links — FAT, exFAT, and some network or FUSE mounts. Publishing a
+report there cannot be guaranteed not to replace an existing file, so nothing was written. Choose a path on a
+normal Linux/Unix filesystem, or run without `--csv`/`--json`.
 
 ### "changed in the source while the job ran"
 
