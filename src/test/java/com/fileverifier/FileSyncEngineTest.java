@@ -14,6 +14,7 @@ import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -46,14 +47,42 @@ class FileSyncEngineTest {
     }
 
     private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel,
-                                         FileSyncEngine.Selection dstSel) {
-        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel), rec);
+                                         FileSyncEngine.Selection dstSel) throws Exception {
+        return runExpectingUntouchedSource(type, srcSel, dstSel, ScanOptions.DEFAULTS, false, false);
     }
 
     private FileSyncEngine.JobResult run(FileSyncEngine.JobType type, FileSyncEngine.Selection srcSel,
-                                         FileSyncEngine.Selection dstSel, boolean detectExtraFiles) {
-        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel,
-                ScanOptions.DEFAULTS, detectExtraFiles), rec);
+                                         FileSyncEngine.Selection dstSel, boolean detectExtraFiles)
+            throws Exception {
+        return runExpectingUntouchedSource(type, srcSel, dstSel, ScanOptions.DEFAULTS, detectExtraFiles,
+                false);
+    }
+
+    /**
+     * Every copy fixture in this suite runs through here, and every one of them asserts the same thing
+     * afterwards: <b>the source is the file-for-file tree it was before the job</b>. A copy tool that
+     * damages what it reads is the worst failure it can have, and it is the one a test that only looks at
+     * the destination would never see.
+     *
+     * <p>A test that means to change the source mid-job (a race fixture, a fake rsync that edits the
+     * source) says so by calling {@link #runChangingSource} instead - the exception is named, not implied.
+     */
+    private FileSyncEngine.JobResult runExpectingUntouchedSource(FileSyncEngine.JobType type,
+            FileSyncEngine.Selection srcSel, FileSyncEngine.Selection dstSel, ScanOptions options,
+            boolean detectExtraFiles, boolean dryRun) throws Exception {
+        Map<String, String> sourceBefore = TestSupport.digests(source);
+        FileSyncEngine.JobResult result = FileSyncEngine.runOnce(TestSupport.request(source, dest, type,
+            srcSel, dstSel, options, detectExtraFiles, dryRun), rec);
+        TestSupport.assertUnchanged(source, sourceBefore);
+        return result;
+    }
+
+    /** A fixture that intends the source to change; the source-immutability check is not applied. */
+    private FileSyncEngine.JobResult runChangingSource(FileSyncEngine.JobType type,
+            FileSyncEngine.Selection srcSel, FileSyncEngine.Selection dstSel, ScanOptions options,
+            boolean detectExtraFiles, boolean dryRun) {
+        return FileSyncEngine.runOnce(TestSupport.request(source, dest, type, srcSel, dstSel, options,
+            detectExtraFiles, dryRun), rec);
     }
 
     private static void assumeRsync() {

@@ -14,6 +14,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,8 +60,12 @@ class VerificationOptionalTest {
         Files.createDirectories(src.resolve("sub"));
         TestSupport.write(src.resolve("sub/c.txt"), "c");
 
+        // A copy is a read of the source as well as a write to the destination: the tree it reads has to
+        // be the tree it leaves.
+        Map<String, String> sourceBefore = TestSupport.digests(src);
         JobResult result = FileSyncEngine.runOnce(TestSupport.request(src, dst, JobType.COPY_ONLY,
             TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
+        TestSupport.assertUnchanged(src, sourceBefore);
 
         assertTrue(result.isSuccess(), result.message());
         assertEquals(3, result.filesCopied(), result.message());

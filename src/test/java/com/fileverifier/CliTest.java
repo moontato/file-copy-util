@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,6 +30,14 @@ class CliTest {
     @TempDir
     Path dest;
 
+    /**
+     * Reports go here, not inside the two trees: a report written among the files a job copies and verifies
+     * is refused unless the caller says they meant it, so the ordinary end-to-end cases need a place of
+     * their own. That refusal is tested in WriteSafetyTest.
+     */
+    @TempDir
+    Path reports;
+
     private static class Output {
         final ByteArrayOutputStream out = new ByteArrayOutputStream();
         final ByteArrayOutputStream err = new ByteArrayOutputStream();
@@ -44,8 +53,42 @@ class CliTest {
         }
     }
 
-    private int run(Output o, String... args) {
-        return Cli.run(args, o.outStream, o.errStream);
+    /**
+     * Every CLI fixture runs through here, and every one of them checks the same thing afterwards: the
+     * source tree is byte-for-byte what it was before the run. A copy tool that damages what it reads is
+     * the worst failure it can have, and a test that only looks at the destination and the exit code would
+     * never see it.
+     */
+    private int run(Output o, String... args) throws Exception {
+        Map<String, String> sourceBefore = TestSupport.digests(source);
+        Map<String, String> destBefore = TestSupport.digests(dest);
+        int exit = Cli.run(args, o.outStream, o.errStream);
+        TestSupport.assertUnchanged(source, sourceBefore);
+        if (!mentionsCopying(args)) {
+            TestSupport.assertUnchanged(dest, destBefore);
+        }
+        return exit;
+    }
+
+    /** Fixtures that ask for a copy are allowed to change the destination; nothing may change the source. */
+    private static boolean mentionsCopying(String... args) {
+        for (String arg : args) {
+            if ("--csv".equals(arg) || "--json".equals(arg)) {
+                return true;   // a report is written into the destination directory by some fixtures
+            }
+        }
+        return !containsAny(args, "--verify-only", "--dry-run");
+    }
+
+    private static boolean containsAny(String[] args, String... wanted) {
+        for (String arg : args) {
+            for (String w : wanted) {
+                if (w.equals(arg)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static void assumeRsync() {
@@ -53,7 +96,7 @@ class CliTest {
     }
 
     @Test
-    void nothingSelectedIsAUsageErrorNotAnImplicitEverything() {
+    void nothingSelectedIsAUsageErrorNotAnImplicitEverything()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString()));
         assertTrue(o.err().contains("Nothing was selected"), o.err());
@@ -61,7 +104,7 @@ class CliTest {
     }
 
     @Test
-    void sourceAndDestAndSelectionFormAreRequired() {
+    void sourceAndDestAndSelectionFormAreRequired()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--dest", dest.toString(), "--all"));
         assertTrue(o.err().contains("--source is required"), o.err());
@@ -77,7 +120,7 @@ class CliTest {
     }
 
     @Test
-    void unknownOptionsAndMissingValuesAreRefused() {
+    void unknownOptionsAndMissingValuesAreRefused()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
                 "--all", "--delete-everything"));
@@ -167,7 +210,7 @@ class CliTest {
     }
 
     @Test
-    void excludeCannotBeUsedToSubtractFromAnExplicitFileList() {
+    void excludeCannotBeUsedToSubtractFromAnExplicitFileList()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
                 "--files", "a.txt,b.txt", "--exclude", "b.txt"));
@@ -249,8 +292,8 @@ class CliTest {
         assumeRsync();
         TestSupport.write(source.resolve("a.txt"), "alpha\n");
         TestSupport.write(source.resolve("sub/b.txt"), "beta\n");
-        Path csv = dest.resolve("report.csv");
-        Path json = dest.resolve("report.json");
+        Path csv = reports.resolve("report.csv");
+        Path json = reports.resolve("report.json");
 
         Output o = new Output();
         int exit = run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
@@ -320,7 +363,7 @@ class CliTest {
     }
 
     @Test
-    void helpIsNotAnError() {
+    void helpIsNotAnError()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_OK, run(o, "--help"));
         assertTrue(o.out().contains("--verify-only"), o.out());
@@ -375,7 +418,7 @@ class CliTest {
     }
 
     @Test
-    void bwlimitMustBeANumber() {
+    void bwlimitMustBeANumber()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
                 "--all", "--bwlimit", "fast"));
@@ -408,7 +451,7 @@ class CliTest {
             TestSupport.write(source.resolve("f" + i + ".txt"), "c" + i + "\n");
             TestSupport.write(dest.resolve("f" + i + ".txt"), "c" + i + "\n");
         }
-        Path csv = source.resolve("report.csv");
+        Path csv = reports.resolve("report.csv");
 
         Output o = new Output();
         int exit = run(o, "--cli", "--quiet", "--source", source.toString(), "--dest", dest.toString(),
@@ -422,7 +465,7 @@ class CliTest {
     }
 
     @Test
-    void maxResultsMustBeAPositiveWholeNumber() {
+    void maxResultsMustBeAPositiveWholeNumber()throws Exception {
         Output o = new Output();
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
                 "--all", "--max-results", "0"));

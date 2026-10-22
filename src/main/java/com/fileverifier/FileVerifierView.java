@@ -11,7 +11,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -102,6 +101,8 @@ public final class FileVerifierView extends JPanel {
 
     /** One engine per window: it owns at most one job at a time. */
     private final FileSyncEngine engine = new FileSyncEngine();
+    /** §2.11: asked once per window; accepting it is this window's answer. */
+    private boolean collisionRiskAccepted;
 
     /** Kept so the Results tab can be re-filtered or exported after the job ends. */
     private FileSyncEngine.JobResult lastJobResult;
@@ -1042,6 +1043,22 @@ public final class FileVerifierView extends JPanel {
         setJobControlsEnabled(true);
         lastJobResult = result;
 
+        // §2.11: the engine refused rather than overwrite one selected file with another. That refusal is
+        // the user's decision to make, once: accepting re-runs the same job with the risk acknowledged.
+        if (result.status() == FileSyncEngine.JobStatus.FAILED
+                && result.message().contains("colliding name(s)")
+                && !collisionRiskAccepted) {
+            int answer = JOptionPane.showConfirmDialog(this, result.message() + "\n\nCopy them anyway?",
+                "Colliding Names", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (answer == JOptionPane.YES_OPTION) {
+                collisionRiskAccepted = true;
+                engine.acknowledgeCollisions(true);
+                log("Collision risk accepted by the user - starting the same job again.");
+                runJob();
+                return;
+            }
+        }
+
         if (result.isSuccess()) {
             progressBar.setString("Complete");
             progressBar.setValue(100);
@@ -1144,17 +1161,41 @@ public final class FileVerifierView extends JPanel {
         if (!name.toString().contains(".")) {
             target = target.resolveSibling(name + "." + format);
         }
-        try {
-            String content = "json".equals(format)
-                ? ReportExporter.toJson(lastJobResult)
-                : ReportExporter.toCsv(lastJobResult);
-            Files.writeString(target, content, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            log("Report written: " + target);
-            statusLabel.setText("Report written: " + target);
-        } catch (IOException e) {
-            JOptionPane.showMessageDialog(this, "Could not write report: " + e.getMessage(),
-                "Export Failed", JOptionPane.ERROR_MESSAGE);
+        // The engine's rules, not a separate GUI policy: a report never replaces a file, and a report
+        // placed among the files the job copies is the user's decision to make - knowingly.
+        boolean allowInsideDataTrees = false;
+        while (true) {
+            try {
+                Path written = ReportExporter.writeReport(target, lastJobResult,
+                    "json".equals(format) ? ReportExporter.Format.JSON : ReportExporter.Format.CSV,
+                    userPath(sourcePathField.getText().trim()),
+                    userPath(destPathField.getText().trim()), allowInsideDataTrees);
+                log("Report written: " + written);
+                statusLabel.setText("Report written: " + written);
+                return;
+            } catch (ReportExporter.ReportRefusal refusal) {
+                String why = refusal.getMessage();
+                if (!allowInsideDataTrees && why.startsWith("The report would be written inside")) {
+                    int answer = JOptionPane.showConfirmDialog(this,
+                        why + "\n\nThe report would sit among the files this job copies and verifies, so the"
+                            + " next scan would see it as an extra. Nothing that already exists would be"
+                            + " overwritten.\n\nWrite it there anyway?",
+                        "Report Inside the Copied Files", JOptionPane.YES_NO_OPTION,
+                        JOptionPane.WARNING_MESSAGE);
+                    if (answer == JOptionPane.YES_OPTION) {
+                        allowInsideDataTrees = true;
+                        continue;
+                    }
+                }
+                log("Export refused: " + why);
+                JOptionPane.showMessageDialog(this, why, "Export Refused", JOptionPane.WARNING_MESSAGE);
+                return;
+            } catch (IOException e) {
+                log("Export failed: " + e.getMessage());
+                JOptionPane.showMessageDialog(this, "Could not write report: " + e.getMessage(),
+                    "Export Failed", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
         }
     }
 

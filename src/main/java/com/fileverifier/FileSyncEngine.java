@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.security.NoSuchAlgorithmException;
@@ -318,6 +319,8 @@ public class FileSyncEngine implements AutoCloseable {
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
     private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
     private volatile boolean closed;
+    /** §2.11: whether the caller has accepted the collision risk. A copy without it is refused. */
+    private volatile boolean collisionsAcknowledged;
     private final AtomicReference<Process> liveProcess = new AtomicReference<>();
     /**
      * Every process the live rsync had spawned, snapshotted while the parent was still alive. A local
@@ -573,13 +576,39 @@ public class FileSyncEngine implements AutoCloseable {
             problems.add("Destination directory is not readable: " + dest);
         }
         if (source != null && dest != null) {
+            // Two spellings of each root matter. A source given as "dest/mirror", where mirror is a link to
+            // the data, resolves to a directory that looks nowhere near the destination - but the job still
+            // reads through the destination and writes into it. Containment is judged against the directory
+            // a path lands on *and* the path as given.
             Path sourceKey = canonical(source);
             Path destKey = canonical(dest);
+            Path sourceGiven = source.toAbsolutePath().normalize();
+            Path destGiven = dest.toAbsolutePath().normalize();
             if (sourceKey.equals(destKey)) {
-                problems.add("Source and destination are the same directory: " + source);
+                problems.add("Source and destination are the same directory: " + source
+                        + (sourceKey.equals(source.toAbsolutePath().normalize()) ? ""
+                            : " (this path reaches it through a link, as " + sourceKey + ")")
+                        + ". Choose a destination outside the source tree.");
             } else if (destKey.startsWith(sourceKey)) {
-                problems.add("Destination is inside the source directory, so the job would copy files into "
-                        + "the tree it is reading: " + dest);
+                problems.add("Destination is inside the source directory: " + dest + " is inside " + sourceKey
+                        + ". The job would write into the tree it is reading - and the destination holds a copy"
+                        + " of the source, so the job cannot say which copy is the original. Choose a"
+                        + " destination outside the source tree.");
+            } else if (sourceKey.startsWith(destKey)) {
+                problems.add("Source is inside the destination directory: " + sourceKey + " is inside " + dest
+                        + ". Copying would write over the files being read, and a run stopped half way leaves"
+                        + " the source half overwritten by its own copy. Choose a destination outside the"
+                        + " source tree.");
+            } else if (sourceGiven.startsWith(destKey)) {
+                problems.add("Source is reached through the destination directory: " + source
+                        + " leads to " + sourceKey + " by way of " + dest + ". The job reads its own"
+                        + " destination, so copying writes over the files it is reading - through a link,"
+                        + " which is why it looks like two directories. Choose a source that is not reached"
+                        + " through the destination.");
+            } else if (destGiven.startsWith(sourceKey)) {
+                problems.add("Destination is reached through the source directory: " + dest + " leads to "
+                        + destKey + " by way of " + source + ". The job would write into the tree it is"
+                        + " reading. Choose a destination that is not reached through the source.");
             }
         }
         if (copies && !isRsyncAvailable(rsyncBinary)) {
@@ -642,19 +671,95 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /** The rsync this engine runs: its own override if it has one, otherwise the process default. */
+    /**
+     * Accept the name-collision risk for this engine's copies (&#167;2.11). Without it, a job that finds
+     * colliding names refuses before writing anything. Verify Only is unaffected either way: it reports the
+     * same names and writes nothing.
+     *
+     * <p>Accepting is not a guarantee of safety. It says the caller knows two of these names can be one
+     * file on the destination volume and accepts that one overwrites the other.
+     */
+    public void acknowledgeCollisions(boolean acknowledged) {
+        collisionsAcknowledged = acknowledged;
+    }
+
+    public boolean collisionsAcknowledged() {
+        return collisionsAcknowledged;
+    }
+
     public String rsyncBinaryInUse() {
         String override = rsyncOverride;
         return override != null ? override : rsyncBinary();
     }
 
+    /**
+     * The directory or file this path actually lands on: links resolved, {@code ..} collapsed.
+     *
+     * <p>Containment has to be judged against this. Two paths that name different directories on paper but
+     * reach the same one - a destination that is a symbolic link to the source, a {@code ..} that walks out
+     * of the destination through a linked directory - are the same directory as far as the filesystem is
+     * concerned, and a copy between them overwrites the files it is reading.
+     */
     private static Path canonical(Path path) {
         try {
-            Path absolute = path.toAbsolutePath();
-            Path real = absolute.toRealPath();
-            return real.startsWith(absolute) ? absolute : real;
+            return path.toRealPath();
         } catch (IOException e) {
+            // Not on disk yet: the best available answer, and a job that has to create it will say so.
             return path.toAbsolutePath().normalize();
         }
+    }
+
+    /** Paths whose resolved target falls outside the tree it is supposed to stay inside. */
+    private static List<String> escapingPaths(Path root, Collection<String> relPaths) {
+        Path inside;
+        try {
+            inside = root.toRealPath();
+        } catch (IOException e) {
+            return List.of();
+        }
+        List<String> escaping = new ArrayList<>();
+        for (String rel : relPaths) {
+            Path target;
+            try {
+                target = root.resolve(rel).toRealPath();
+            } catch (IOException notCreatedYet) {
+                target = resolveAsFarAsPossible(root.resolve(rel));
+            }
+            if (!target.startsWith(inside)) {
+                escaping.add(rel);
+            }
+        }
+        return escaping;
+    }
+
+    /**
+     * Resolve the part of a path that exists and re-attach the rest, so a name whose destination has not
+     * been created yet is still judged against the resolved tree. A linked directory on the way is followed,
+     * because that is the directory its write would land in.
+     */
+    static Path resolveAsFarAsPossible(Path path) {
+        List<String> missing = new ArrayList<>();
+        Path cursor = path;
+        while (!Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)) {
+            Path parent = cursor.getParent();
+            Path name = cursor.getFileName();
+            if (parent == null || name == null) {
+                // A root has no parent and no file name: nothing further to resolve, so judge the path as
+                // spelled rather than guess at a partial one.
+                return path.toAbsolutePath().normalize();
+            }
+            missing.add(name.toString());
+            cursor = parent;
+        }
+        try {
+            cursor = cursor.toRealPath();
+        } catch (IOException e) {
+            cursor = cursor.toAbsolutePath().normalize();
+        }
+        for (int i = missing.size() - 1; i >= 0; i--) {
+            cursor = cursor.resolve(missing.get(i));
+        }
+        return cursor;
     }
 
     // ---------------------------------------------------------------- job body
@@ -737,6 +842,34 @@ public class FileSyncEngine implements AutoCloseable {
         sourceRels = null;
         String notFoundText = describeNames(notFound);
 
+        // §2.2: containment in both trees, before anything is written. A name carrying ".." escapes on its
+        // own; a name that looks contained escapes through a linked directory on the way. Both are judged
+        // against the resolved tree, and a refusal here has changed nothing on disk.
+        //
+        // What this is not: a lock. It is checked before the copy, not atomically at each write, so a
+        // directory re-pointed by another process in between is a race this program does not close - by
+        // design, since it takes no cross-process lock.
+        // Every name the job was asked to handle, not only the ones the source happened to have: a name that
+        // climbs out is refused for the reason that matters, not for the incidental one.
+        Set<String> askedFor = new java.util.LinkedHashSet<>();
+        for (FileEntry entry : workSet) {
+            askedFor.add(entry.relPath());
+        }
+        askedFor.addAll(request.sourceSelection().selected());
+        askedFor.addAll(request.destinationSelection().selected());
+        List<String> escaping = new ArrayList<>(escapingPaths(sourceDir, askedFor));
+        if (request.jobType().copies()) {
+            escaping.addAll(escapingPaths(destDir, askedFor));
+        }
+        if (!escaping.isEmpty()) {
+            String problem = "Refused: " + escaping.size() + " selected path(s) point outside the directory"
+                    + " they belong to: " + describeNames(escaping) + ". A path that climbs out with"
+                    + " \"..\","
+                    + " or that reaches outside through a linked directory, names a file this job has no"
+                    + " business writing. Nothing was copied.";
+            return failure(problem, List.of(problem), List.of(), 0);
+        }
+
         if (workTotal == 0) {
             String suffix = notFound.isEmpty() ? "" : " Selected but not found in the source: " + notFoundText + ".";
             return failure("Empty work set: 0 selected source files and 0 destination-only files survived "
@@ -763,6 +896,17 @@ public class FileSyncEngine implements AutoCloseable {
         // mismatch as if the copy had been honest.
         List<String> collisions = collidingNames(workSet);
         if (!collisions.isEmpty()) {
+            // §2.11. Two of these names are one file on a case-insensitive or normalising destination, and
+            // the later transfer overwrites the earlier one: a copy is a write, so it needs the caller to
+            // have accepted that. Verification changes nothing, so it keeps warning without refusing.
+            if (request.jobType().copies() && !request.dryRun() && !collisionsAcknowledged) {
+                String problem = "Refused: " + collisions.size() + " colliding name(s) in the work set: "
+                        + describeNames(collisions) + ". On a case-insensitive or normalising destination"
+                        + " these are the same file, and copying one over the other is what the job would do."
+                        + " Nothing was copied. Acknowledge it with --allow-collision-names, or confirm in"
+                        + " the window; Verify Only reports the same names without writing anything.";
+                return failure(problem, List.of(problem), List.of(), 0);
+            }
             warnings.add(collisions.size() + " name collision(s) in the work set: "
                     + describeNames(collisions) + ". These names differ only by case or by how an accent is"
                     + " composed. On a case-insensitive or normalising destination they are the same file,"

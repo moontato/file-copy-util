@@ -432,3 +432,52 @@ announcements - measured on rsync 3.1.3 and 3.4.0, an itemize line arrives when 
 the `xfr#` count is what says a file *finished*. Where the program cannot know something it says less, not
 more: a stats line this rsync variant formats differently moves the bar and drops the per-file figures rather
 than guessing.
+
+## 14. Where a job may write, and where it may not
+
+A verifier that damages the thing it is checking is worse than one that fails, so the write side is treated
+as a set of prohibitions rather than a set of options. Each one below is enforced before anything is written.
+
+**Source and destination may not overlap - in either direction, and judged against resolved paths.** Three
+cases, all refused in preflight: the destination inside the source, the source inside the destination, and
+the two being the same directory. Resolution matters: a destination that is a symbolic link to the source, or
+a source given as `backup/mirror` where `mirror` links to the data, look like two directories and are one.
+Containment is therefore judged against the directory a path *lands on* and against the path as given, and
+the refusal names which relationship was found. Why it is refused rather than warned: the destination ends up
+holding a copy of the source, so the job cannot say which copy is the original, and a run stopped half way
+leaves the source half overwritten by its own copy. There is no override - "copy a directory into itself" is
+not a thing this program does.
+
+**Selected paths stay inside their tree, ancestors included.** A name carrying `..` is refused; so is a name
+that spells itself as contained and walks out through a linked directory (`dest/sub` being a link is enough).
+Containment resolves the deepest existing ancestor and re-attaches the rest, because a destination file the
+copy has not created yet must still be judged. It applies to Verify Only too: reading a file outside the
+destination and reporting its digest as a comparison is a false verdict, not a harmless read. The limit is
+part of the rule: this is a check made before the copy, not a lock held across each write, and no
+cross-process lock is taken - a directory re-pointed by another process in between is a race this program
+does not close.
+
+**A report may not displace the files it describes.** Two decisions, kept apart:
+
+- *Protected data is never overwritten, and no option waives that.* A report path that already exists is
+  refused - whether it is a source file, a destination file, a directory or a symbolic link. The program
+  cannot tell a report it wrote earlier from a file the job protects, so it does not guess; a report path has
+  to be a path that does not exist yet. The old behaviour (write anyway, truncating whatever was there) is
+  the bug, not the convenience.
+- *A report inside the job's own trees is the user's call.* A new file there displaces nothing, but it lands
+  among the files being copied and verified, so the next scan reports it as an extra. `--allow-report-in-tree`
+  or a confirmation in the window permits it, and permits nothing else: an existing file there is still
+  refused.
+
+The write itself is a unique temporary file in the target's directory followed by a move without replacement,
+so a failed export leaves neither a half-written report nor a stray `.fcu-report-*.tmp`, and a target that
+appears in the interval is refused rather than replaced. A missing parent directory is reported, not created.
+A job that succeeded while its report failed exits **4**: the copies happened, the record of them did not.
+
+**Colliding names need an answer before a copy.** Two selected names that differ only by case, or only by how
+an accent is composed, are two files here and one file on a case-insensitive or normalising destination -
+copying both means one overwrites the other. Verification writes nothing, so it warns and carries on; a copy
+refuses, writes nothing, and says how to accept it (`--allow-collision-names`, or *Copy them anyway?* in the
+window). Accepting is the caller saying they know and accept the overwrite; it is not a claim that the copy
+is safe, and the warning stays. A dry run reports the pairs without refusing, because a dry run writes
+nothing to overwrite.

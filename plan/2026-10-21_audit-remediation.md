@@ -2,10 +2,12 @@
 
 **Date:** 2026-10-21, status updated 2026-10-22
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way. Phase 0a, Phase 0b and Phase 1 are implemented and green; the two
-Phase 4 items that gate 1.5.0 (per-file transfer records for interrupted copy jobs) were brought forward
-into Phase 1 and are recorded under Phase 4. Next: Phase 2 (write safety). Branch `remediation/audit`;
-`main` is held at the approved baseline commit.
+**Status:** approved and under way, revision 5. Phase 0a, Phase 0b, Phase 1 and **Phase 2 (write safety)**
+are implemented and green on this machine, along with the part of Phase 4 that gates 1.5.0 (per-file transfer
+records for interrupted copy jobs) and the matrix-isolation follow-up. Phase 0b's workflows are written and
+reviewed but **have not been run on GitHub**, so its gate is specified rather than demonstrated. Next:
+Phase 3 (selection authority). Branch `remediation/audit`; `main` is held at the approved baseline commit
+`0069285`, `pom.xml` is still 1.4.0, and no tag, push or release is authorised.
 
 ## Revision log (v4, from your second review)
 
@@ -325,9 +327,9 @@ Nonzero exit when: an explicitly requested path was absent; a selected name was 
 | Phase | Content | Gate |
 | --- | --- | --- |
 | **0a baseline** *(A1)* | commit the verified 1.4.0 tree; no tag | suite green (176 tests, SpotBugs 0, lint clean) |
-| **0b validation parity** *(A11)* — **done** | reusable validation workflow (matrix 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0, SpotBugs, lint, CLI smoke); `release.yml` depends on a successful validation run **for the same commit**; actions SHA-pinned; rsync tarballs checksum-verified; per-tag concurrency | a tag cannot be published unless that commit passed validation; the matrix runs four versions |
+| **0b validation parity** *(A11)* — **implemented; GitHub-side execution not yet verified** (no authorised run yet) | reusable validation workflow (matrix 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0, SpotBugs, lint, CLI smoke); `release.yml` depends on a successful validation run **for the same commit**; actions SHA-pinned; rsync tarballs checksum-verified; per-tag concurrency | a tag cannot be published unless that commit passed validation; the matrix runs four versions |
 | **1. names exact** — **done** | §2.1, §2.2, §2.3 *observations*, §2.9, §2.10 | decoder round-trip tests green on all four rsyncs, both locales; A02/A05 fixtures fail-before/pass-after; no selected name can vanish without a warning and a nonzero exit; **no completion claims are made or required at this phase** |
-| **2. write-safety** | §2.6 (split rules), A01 overlap refusal, A04 containment across the path, §2.11 collisions | A01/A11 fixtures fail-before/pass-after; source digests unchanged asserted in every copy test; successful-job + failed-report exits 4 with the job half proven successful; ancestor-link case gives `MISMATCH` + warning + nonzero; no `.part` left behind |
+| **2. write-safety** — **done** | §2.6 (split rules), A01 overlap refusal, A04 containment across the path, §2.11 collisions | A01/A11 fixtures fail-before/pass-after; source digests unchanged asserted in every copy test; successful-job + failed-report exits 4 with the job half proven successful; ancestor-link case gives `MISMATCH` + warning + nonzero; no `.part` left behind |
 | **3. selection authority** | scan identity + live selection state, one immutable `JobRequest` captured at Run, single stale-options policy (refuse) | the audit's race refuses instead of running; checkbox, Select All/Deselect All, and destination-exclusion edits after scanning are honoured; out-of-order scans cannot install |
 | **4. lifecycle + completion attribution** — *partly brought forward:* the §2.5 per-file transfer record is done, §2.7 is not | §2.7, §2.5 | interrupted-overwrite regression green (`UNCERTAIN`, not `COPIED`); SIGTERM-to-Java test passes the five properties; bounded cancel latency during a single large hash; blocked-I/O reported honestly; reuse after cancel, rejection after `close()`; timeout vs cancel wording |
 | **5. truthful verdicts and counts** | §2.13, §2.4, §2.12 | `checked` equation asserted in every consumer; symlink verdicts; partial-job records; no limit-warning lies; CSV metadata and formula safety tested |
@@ -416,9 +418,50 @@ named as unconfirmable, and that is stated in the warnings. README now says plai
 a network mount can be several times higher, and no automatic size threshold was added - attribution is not
 silently weakened for large jobs.
 
+**Phase 2 — write safety (2026-10-22)**
+
+Landed on `remediation/audit`; `main` untouched, `pom.xml` still 1.4.0, nothing tagged or pushed.
+
+| Item | What the code now does | Fixture, and the sabotage that proves it |
+| --- | --- | --- |
+| A01 overlap | Refused in preflight, in both directions, and against the directory a path *lands on* as well as the path as given: destination inside source, source inside destination, same directory through a link, and source reached through a link inside the destination ("Source is reached through the destination directory … by way of …") | `WriteSafetyTest`: `aCopyWhoseDestinationContainsTheSourceIsRefusedBeforeAnythingIsWritten`, `aCopyIntoASubdirectoryOfTheSourceIsRefusedTheOtherWayRoundToo`, `aDestinationThatIsALinkToTheSourceIsRefusedAsTheSameDirectory`, `aSourceReachedThroughALinkInsideTheDestinationIsRefusedToo`. Switching the four containment branches off turns all four red (16 run, 4 failed); restoring them turns them green |
+| A04 containment | Every name the job was asked to handle is checked against its own tree, ancestors resolved (deepest existing ancestor resolved, remainder re-attached), so `..` and a contained-looking name that leaves through a linked directory are both refused before rsync starts. Applies to Verify Only too | `aSelectedPathThatClimbsOutOfTheDestinationIsRefusedBeforeWriting`, `aContainedLookingNameThatEscapesThroughALinkedDirectoryIsRefusedAsWell`, `verifyOnlyIsHeldToTheSameContainmentRuleEvenThoughItWritesNothingForever` - each asserts the file outside the destination still holds its own contents. Switching the refusal off: 16 run, 10 failed |
+| §2.6 export | Existing path refused (file, directory or link) with no override; a *new* report inside either tree needs `--allow-report-in-tree` or a GUI confirmation; unique temp file plus move without replacement; no directory created for a report; failure or refusal exits **4** | `aReportIsNeverWrittenOverAFileTheJobIsProtecting`, `aReportInsideTheCopiedTreesNeedsAnExplicitDecisionAndSaysWhy`, `evenInsideTheTreesAnExistingFileIsNeverOverwritten`, `bothFormatsAreRefusedTheSameWayAndNeitherCreatesTheDirectoryItWasToldToWriteIn`, `aReportTargetThatIsALinkOrADirectoryIsRefusedRatherThanFollowed`. Writing over an existing target again (old behaviour): 43 run, 3 failed; in-tree rule off: 1 failed |
+| §2.11 collisions | A copy refuses until the caller accepts it (`--allow-collision-names`, or *Copy them anyway?* in the window), writes nothing, and keeps the warning after acceptance; Verify Only and dry runs still just report the pairs | `aCopyThatFindsCollidingNamesRefusesUntilSomebodyAcceptsIt`, `aDryRunStillShowsWhatCollidingNamesWouldDo`, `verifyOnlyNamesCollidingFilesWithoutRefusingOrAsking`, and `CollisionAndRaceTest.namesThatDifferOnlyByCaseAreNamedAsARisk` rewritten to the new contract. Refusal switched off: 21 run, 2 failed |
+| Source immutability | `FileSyncEngineTest` (48 fixtures) and `CliTest` (27 fixtures) now assert the source tree is digest-for-digest unchanged after every run; a fixture that means to change the source must call the differently-named helper | the check is in the shared helpers, so a copy that damages its source fails even when the destination looks right; `TestSupport.digests`/`assertUnchanged` are the shared builders and mark unreadable fixtures as `<unreadable>` rather than skipping them |
+
+Two contract changes were recorded rather than smoothed over: CLI fixtures that used to write their report
+inside the destination now use a separate reports directory (the refusal they hit is the new rule, tested in
+`WriteSafetyTest`), and the collision test that used to expect "warning and a completed job" now expects a
+refusal followed by an accepted re-run.
+
+**Matrix-isolation follow-up (2026-10-22)**
+
+`FCU_RSYNC` pinned the process default, and then six tests put the literal `"rsync"` back - not the value
+they replaced - so everything after them in the same JVM silently ran against the binary on PATH while the
+run was reported as pinned. Fixed by scoping the binary to the engine that needs it (`useRsync`, used by all
+four matrix cases and four engine cases), by `TestSupport.withRsyncBinary` restoring exactly what it replaced
+where a process-wide override is unavoidable, and by three regressions (`anOverridePutsBackExactlyTheBinaryItReplaced`,
+`aFakeRsyncTestLeavesTheConfiguredBinaryToTheTestsAfterIt`, `aWholeRunPinnedToABinaryKeepsThatBinary`). Proof
+they bite: restoring the old habit in `TestSupport` makes two of them fail while pinned to 3.1.3. CI clears
+`FCU_RSYNC_BINARIES` for each per-version fixture run; the all-four run remains its own step. Pinned runs on
+this machine: 124 tests green against 3.1.3 and 124 against 3.4.0, each with `FCU_RSYNC_BINARIES` cleared.
+
+**Suite now:** 217 tests, 0 failures, 0 errors, 1 skipped (the `FCU_RSYNC`-specific test, which only means
+something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean verify` succeeds.
+
+**Still open from Phase 0b:** the workflows are written and reviewed statically (jobs, step wiring, pinned
+action SHAs, checksum-pinned tarballs), but **no GitHub Actions run has been executed or observed** - that
+needs an authorised push. Until then the validation gate is *specified*, not *demonstrated*.
+
 **Next, in order**
 
-1. Phase 2: write safety - A01 overlap refusal, §2.6 export protection, A04 containment across the whole
+1. Phase 3: selection authority - immutable scan identity versus mutable live selection, one `JobRequest`
+   captured at Run, refuse a Run whose scan does not match.
+2. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
+   single large hash, channel workers that cannot block termination, and the completion-signal decision
+   (`%b` start header vs `%b` completion line) confirmed on 3.2.7 and 3.3.0 through the matrix.
+3. Old 2. write safety - A01 overlap refusal, §2.6 export protection, A04 containment across the whole
    path, §2.11 collision acknowledgement - with the source-immutability assertion added to every copy test.
 2. Phase 3: selection authority (§2.3 identity/selection split, one immutable `JobRequest` at Run).
 3. Then propose **1.5.0** (gate green: `remediation/audit` merged to `main`, validate green on the exact

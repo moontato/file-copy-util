@@ -70,6 +70,37 @@
   `PATH`. A test run with `FCU_RSYNC` set to a binary it cannot run now refuses to run at all rather than
   quietly skipping every rsync-dependent test.
 
+### Added — the job cannot write where it has no business writing
+
+- **A job whose source and destination overlap is refused before anything is written.** In both
+  directions, and against the directory a path *lands on* rather than the path as spelled: a destination
+  inside the source, a source inside the destination (the audit's overwrite fixture), a destination that is
+  a symbolic link to the source, and a source reached through a link inside the destination. Each refusal
+  names the relationship and what to do instead; a refused job has changed no file.
+- **Selected paths are contained in both trees, ancestors included** (A04). A name carrying `..` is
+  refused, and so is a name that looks contained but reaches outside through a linked directory: containment
+  resolves the deepest existing ancestor before judging it. Applies to Verify Only too - a comparison
+  against a file outside the destination is not a destination verdict. Documented limit: the check happens
+  before the copy, not atomically at each write, and no cross-process lock is held.
+- **A report can no longer displace the files it describes** (A11). A report path that already exists is
+  refused - this program cannot tell a report it wrote earlier from a file the job protects, so it does not
+  guess; the same for a directory or a symbolic link. Writing a *new* report inside the source or
+  destination tree is a separate decision and needs `--allow-report-in-tree` (CLI) or a confirmation in the
+  window, and even then it never overwrites. Reports are written to a unique temporary file and moved, so a
+  failed export leaves no half-written report and no `.fcu-report-*.tmp`. `--csv`/`--json` no longer create
+  a missing directory: a path that does not exist is a mistake to report.
+- **New exit code 4**: the job did what it was asked to do and a report could not be written.
+- **Colliding names now need an answer before a copy runs** (A6). Two names differing only by case or by
+  how an accent is composed are one file on a case-insensitive or normalising destination, so copying both
+  overwrites one with the other: the job refuses, writes nothing, and says how to accept it
+  (`--allow-collision-names`, or confirming in the window). Verify Only still just warns, because it writes
+  nothing, and a dry run still shows what the collision would do.
+- GUI: the same two decisions are dialogs, not silent defaults - a report placed among the copied files is
+  confirmed, and a collision refusal is followed by "Copy them anyway?" that re-runs the job with the risk
+  accepted.
+- Tests: every engine and CLI copy fixture now asserts the source tree is byte-for-byte unchanged after the
+  run; a fixture that means to change the source says so by name. 217 tests, 0 failures.
+
 ### CI and releases
 
 - One reusable validation workflow - tests, CLI smoke tests, and an rsync matrix built from checksum-pinned

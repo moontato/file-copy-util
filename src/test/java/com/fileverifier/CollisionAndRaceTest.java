@@ -30,14 +30,30 @@ class CollisionAndRaceTest {
         TestSupport.write(src.resolve("a.txt"), "lower");
         TestSupport.write(src.resolve("keep.txt"), "keep");
 
-        FileSyncEngine.JobResult result = FileSyncEngine.runOnce(
+        FileSyncEngine.JobResult refused = FileSyncEngine.runOnce(
             TestSupport.request(src, dst, FileSyncEngine.JobType.COPY_AND_VERIFY,
                 TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
 
-        // Both names are genuinely two files here, so the job runs; what it must do is say what such a
-        // pair means on a destination that folds case.
+        // Both names are genuinely two files here, but copying them is the case the destination folds into
+        // one: so the copy refuses until somebody accepts it (plan 2.11) and then says what the pair means.
+        assertEquals(FileSyncEngine.JobStatus.FAILED, refused.status(),
+            "a copy of colliding names needs an answer from the caller, not a warning and a shrug: "
+                + refused.message());
+        assertEquals(0, refused.filesCopied(), refused.message());
+        try (var entries = Files.list(dst)) {
+            assertEquals(0, entries.count(), "a refusal writes nothing at all");
+        }
+
+        FileSyncEngine.JobResult result;
+        try (FileSyncEngine accepted = new FileSyncEngine()) {
+            accepted.acknowledgeCollisions(true);
+            result = accepted.execute(TestSupport.request(src, dst, FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selectAllOf(src), FileSyncEngine.Selection.none()), SILENT);
+        }
+
         assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message());
         assertEquals(3, result.filesCopied());
+
         String collision = result.warnings().stream()
             .filter(w -> w.contains("name collision"))
             .findFirst()

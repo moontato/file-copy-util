@@ -31,6 +31,11 @@ public final class Cli {
     public static final int EXIT_USAGE = 2;
     /** The job completed, but verification found mismatched or missing files. */
     public static final int EXIT_VERIFICATION_PROBLEMS = 3;
+    /**
+     * The job did what it was asked to do and the report did not arrive. A run that cannot say what it did
+     * has not been recorded, so it is not exit 0.
+     */
+    public static final int EXIT_REPORT_FAILED = 4;
 
     private static final String USAGE = """
         File Copy Util - copy and verify files between directories (window title: File Verifier & Copier)
@@ -71,8 +76,16 @@ public final class Cli {
           --max-results N           how many individual results to keep (default 50000); counters are
                                     exact either way, but an export can only list what was kept
           --dry-run                 show what would happen and write nothing (rsync --dry-run)
+          --allow-collision-names   accept colliding names (names differing only by case or accent) and copy
+                                    them anyway. Without it a copy that finds collisions refuses and writes
+                                    nothing; Verify Only reports them without asking
           --csv PATH                write the job report as CSV
           --json PATH               write the job report as JSON
+                                    A report is never written over a file that already exists, and never
+                                    inside the source or destination tree unless you say so: see
+                                    --allow-report-in-tree
+          --allow-report-in-tree    allow a new report file inside the source or destination tree. It never
+                                    allows overwriting anything that is already there
           --quiet                   no progress output
           --help                    this text
 
@@ -128,7 +141,8 @@ public final class Cli {
     /** A parsed command line: one job request plus how to run and report it. */
     public record Options(JobRequest request, long timeoutMillis, long bandwidthLimitKbps,
                           int maxResults, Path csvPath, Path jsonPath, boolean quiet,
-                          List<String> destinationExcluded) {
+                          List<String> destinationExcluded, boolean allowReportInTree,
+                          boolean allowCollisionNames) {
 
         public Options {
             destinationExcluded = List.copyOf(destinationExcluded);
@@ -186,6 +200,8 @@ public final class Cli {
         String csvPath = null;
         String jsonPath = null;
         boolean quiet = false;
+        boolean allowReportInTree = false;
+        boolean allowCollisionNames = false;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -274,6 +290,8 @@ public final class Cli {
                     timeoutMillis = seconds == 0 ? FileSyncEngine.NO_TIMEOUT : seconds * 1000L;
                 }
                 case "--dry-run" -> dryRun = true;
+                case "--allow-report-in-tree" -> allowReportInTree = true;
+                case "--allow-collision-names" -> allowCollisionNames = true;
                 case "--bwlimit" -> {
                     String value = value(args, i, arg);
                     i++;
@@ -393,7 +411,7 @@ public final class Cli {
         return new Options(request, timeoutMillis, bandwidthLimitKbps, maxResults,
                 csvPath == null ? null : Path.of(csvPath),
                 jsonPath == null ? null : Path.of(jsonPath), quiet,
-                List.copyOf(excludedAtDestination));
+                List.copyOf(excludedAtDestination), allowReportInTree, allowCollisionNames);
     }
 
     /**
@@ -555,6 +573,10 @@ public final class Cli {
         engine.setJobTimeoutMillis(options.timeoutMillis());
         engine.setBandwidthLimitKbps(options.bandwidthLimitKbps());
         engine.setResultLimit(options.maxResults());
+        // Colliding names are refused before a copy unless the caller said they meant it: on a
+        // case-insensitive destination the two names are one file, and the copy overwrites one with the
+        // other. Verify Only reports them either way, because it writes nothing.
+        engine.acknowledgeCollisions(options.allowCollisionNames());
         ProgressReporter reporter = new ProgressReporter(out, options.quiet(), options.request().jobType());
         JobResult result;
         try {
@@ -582,7 +604,11 @@ public final class Cli {
         }
 
         int exit = exitCode(result);
-        writeReports(options, result, out);
+        if (!writeReports(options, result, out, err) && exit == EXIT_OK) {
+            // The copies happened; the record of them did not survive. A run whose report could not be
+            // written is not a clean run.
+            exit = EXIT_REPORT_FAILED;
+        }
         return exit;
     }
 
@@ -593,25 +619,37 @@ public final class Cli {
         return result.filesMismatched() + result.filesMissing() > 0 ? EXIT_VERIFICATION_PROBLEMS : EXIT_OK;
     }
 
-    private static void writeReports(Options options, JobResult result, PrintStream out) {
+    /** @return true when every requested report was written */
+    private static boolean writeReports(Options options, JobResult result, PrintStream out,
+            PrintStream err) {
+        JobRequest request = options.request();
+        boolean ok = true;
         if (options.csvPath() != null) {
-            write(options.csvPath(), ReportExporter.toCsv(result), out, "CSV");
+            ok &= write(options.csvPath(), ReportExporter.Format.CSV, result, request,
+                options.allowReportInTree(), out, err, "CSV");
         }
         if (options.jsonPath() != null) {
-            write(options.jsonPath(), ReportExporter.toJson(result), out, "JSON");
+            ok &= write(options.jsonPath(), ReportExporter.Format.JSON, result, request,
+                options.allowReportInTree(), out, err, "JSON");
         }
+        return ok;
     }
 
-    private static void write(Path target, String content, PrintStream out, String label) {
+    private static boolean write(Path target, ReportExporter.Format format, JobResult result,
+            JobRequest request, boolean allowReportInTree, PrintStream out, PrintStream err,
+            String label) {
         try {
-            Path parent = target.toAbsolutePath().getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
-            Files.writeString(target, content, StandardCharsets.UTF_8);
-            out.println(label + " report written: " + target.toAbsolutePath());
-        } catch (IOException e) {
-            System.err.println("could not write " + label + " report " + target + ": " + e.getMessage());
+            Path written = ReportExporter.writeReport(target, result, format, request.sourceDir(),
+                request.destDir(), allowReportInTree);
+            out.println(label + " report written: " + written);
+            return true;
+        } catch (ReportExporter.ReportRefusal refusal) {
+            err.println("Refused the " + label + " report: " + refusal.getMessage());
+            return false;
+        } catch (IOException failure) {
+            err.println("could not write the " + label + " report " + target + ": "
+                    + failure.getMessage());
+            return false;
         }
     }
 

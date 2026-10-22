@@ -91,12 +91,16 @@ files are used exactly as written; a file that is not valid UTF-8 is refused rat
 | 1 | the job failed: preflight problem, rsync error, cancellation |
 | 2 | bad command line |
 | 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
+| 4 | the job succeeded, but a report could not be written (refused, or the write failed) — the copies happened, the record of them did not |
 
 Other CLI options: `--verify-only`, `--no-verify` (copy without comparing; the two flags contradict each
 other and using both is a usage error), `--dry-run`, `--exclude a.txt,...` (with `--all`),
 `--exclude-dest a.txt,...` (with `--verify-only`), `--ignore "GLOB,GLOB"`
 (adds to the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
-`--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--max-results N`, `--quiet`.
+`--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--max-results N`, `--quiet`,
+`--allow-report-in-tree` (permit a *new* report file inside the source or destination tree; never permits
+overwriting anything), `--allow-collision-names` (accept colliding names and copy them; without it a copy
+that finds collisions refuses and writes nothing).
 
 ### Workflow
 
@@ -197,7 +201,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-198 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+217 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
@@ -277,8 +281,37 @@ LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.4.0.jar --cli --source DIR --de
 
 The selected files include names that differ only by case (`A.txt` and `a.txt`) or only by how an accent is
 composed. Both exist on Linux; on a case-insensitive or normalising destination — a Windows share, an exFAT
-card, some macOS volumes — they are the same file, and the later transfer overwrites the earlier one. The job
-runs and says so up front. If the destination is case-insensitive, rename one of them.
+card, some macOS volumes — they are the same file, and the later transfer overwrites the earlier one.
+
+A **copy** refuses until someone accepts that: nothing is written, and the message names the pairs. Accept it
+with `--allow-collision-names`, or by answering *Copy them anyway?* in the window; the warning stays either
+way, because accepting the risk is not the same as the risk being gone. **Verify Only** and **dry run** report
+the same names without asking, because they write nothing. If the destination is case-insensitive, the real
+fix is to rename one of the files.
+
+### "Source is inside the destination directory" / "Destination is inside the source directory"
+
+The job would write into the tree it is reading. A copy from a directory into its own subdirectory, or from a
+subdirectory up into its parent, means the destination holds a copy of the source and the run cannot say
+which copy is the original — and a run stopped half way leaves the source half overwritten by its own copy.
+These are refused before `rsync` starts, so nothing on disk has changed. The same applies when the two
+directories only *look* separate: a destination that is a symbolic link to the source, or a source reached
+through a link inside the destination, is the same directory as far as the filesystem is concerned. Put the
+destination outside the source tree.
+
+### "Refused: N selected path(s) point outside the directory they belong to"
+
+A selected name reaches a file outside the tree the job is working on — either it carries `..`, or it looks
+contained and walks out through a linked directory on the way (`dest/sub` being a link is enough). The job
+refuses and writes nothing. Fix the name, or remove that link from the destination.
+
+### "Refused the CSV report: A file is already there"
+
+A report is never written over something that exists: this program cannot tell a report it wrote earlier from
+a file the job is protecting, and guessing is what put data in danger. Choose a path that does not exist yet.
+If the path you wanted is *inside* the source or destination tree, that is a separate question — a new file
+there is allowed with `--allow-report-in-tree` (or a confirmation in the window), but an existing file there
+is never replaced. A failed or refused export exits **4** and leaves no temporary file behind.
 
 ### "changed in the source while the job ran"
 

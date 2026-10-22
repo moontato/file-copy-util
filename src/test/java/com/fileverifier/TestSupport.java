@@ -3,15 +3,20 @@ package com.fileverifier;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /** Shared helpers for the test suite. */
 final class TestSupport {
@@ -30,6 +35,37 @@ final class TestSupport {
             throw new IllegalStateException("FCU_RSYNC names " + pinned + " but that rsync cannot be run;"
                     + " refusing to run the rsync tests against anything else.");
         }
+    }
+
+    /**
+     * Every regular file under {@code root}, as relative path to digest. Take it before a job runs and
+     * hand it to {@link #assertUnchanged} afterwards: a refused or failed job must leave the tree exactly
+     * as it found it. "The job reported failure" is not the same statement as "nothing was destroyed".
+     */
+    static Map<String, String> digests(Path root) throws Exception {
+        Map<String, String> hashes = new TreeMap<>();
+        try (var paths = Files.walk(root)) {
+            for (Path path : paths.toList()) {
+                if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                    String digest;
+                    try {
+                        digest = FileHasher.computeHash(path);
+                    } catch (IOException unreadable) {
+                        // A fixture that makes a file unreadable on purpose still has to be comparable
+                        // before and after: the marker says "this one could not be read", and it says the
+                        // same thing both times.
+                        digest = "<unreadable>";
+                    }
+                    hashes.put(root.relativize(path).toString().replace('\\', '/'), digest);
+                }
+            }
+        }
+        return hashes;
+    }
+
+    static void assertUnchanged(Path root, Map<String, String> before) throws Exception {
+        assertEquals(before, digests(root),
+            "the tree at " + root + " is not what it was before this job ran");
     }
 
     static boolean rsyncAvailable() {
