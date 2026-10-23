@@ -616,14 +616,33 @@ figures; copied 0 because the stand-in wrote nothing), and the renamed
 `aFailedCopyNamesTheHalfWrittenFileItLeft` (the 1.2.1 lesson — rsync's claim is not hidden, leftovers are named —
 asserted without claiming an unsupported copy). No assertion was deleted or weakened to make a new code path pass.
 
-Suite after item 2: **274 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0.
-Pinned single-binary runs: **268 tests green** pinned to 3.1.3; pinned to 3.4.0, **268 green in four full runs and
-four targeted repeats** — but one earlier pinned-3.4.0 run reported **1 failure whose identity was not captured**
-and which has not reproduced in the seven runs since. Recorded here as an open loose end rather than smoothed over:
+A second fixture on the same rule found a live defect while it was being written
+(`aCappedResultListStillReportsTheFiguresForTheWholeJob`, `dff1450`): the announced-name list was itself capped by
+the results limit, so with `--max-results 1` a three-file copy reported `copied=1` — the exact "counters stay exact
+whatever the cap is" promise, broken. Announced names are now collected in full and only the reported rows are
+capped; the warning that says the list is short is unchanged.
+
+Suite after item 2: **275 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0.
+Pinned single-binary runs: **269 green** pinned to 3.1.3 and **269 green** pinned to 3.4.0 (five full pinned-3.4.0
+runs and four targeted repeats since item 2) — but one earlier pinned-3.4.0 run reported **1 failure whose identity
+was not captured** and which has not reproduced in the runs since. Recorded here as an open loose end rather than smoothed over:
 it will be caught by the release-gate run, and if it recurs the fixture gets fixed or re-specified.
 
-Still to do in Phase 5: item 3 (partial/capped reports — the `truncated` flag exists and is in the JSON; the CSV
-metadata block and the GUI/CLI prominence are still to be done), item 4 (CSV formula neutralisation, documented as a
+Mutation coverage for item 2 — again in a disposable `git worktree` at `dff1450`, with both trees verified clean at
+that commit afterwards (worktree `HEAD` and status printed before removal).
+
+| Mutation | Caught? |
+|---|---|
+| `checked` returns the row count again | yes — 3 fixtures: the extras fixture in `CounterTruthTest`, the same rule in `FileSyncEngineTest`, and the JSON totals in `ReportExporterTest` |
+| completed jobs report announcements as `copied` | yes — 2 dry-run fixtures (`CounterTruthTest`, `FileSyncEngineTest`) |
+| announced-name list re-capped by `--max-results` | yes — the fixture written for it, and only that fixture: it is a one-line regression with a one-line guard |
+| JSON drops the `wouldCopy` figure | yes — the JSON export fixture |
+| CLI omits the `transfers:` totals line | yes — the end-to-end CLI fixture |
+| transfer figures never tallied at all (`tally = NONE`) | yes — 37 fixtures, which is the measure of how much of the suite reads these figures |
+| the ledger's dry-run early return removed | **not observable.** The engine builds no ledger for a dry run (`if (!dryRun)` around the snapshot), so `transferFacts`' own dry-run branch decides first and the ledger's check sits on a path no dry run reaches. Recorded as a second guard, not as covered behaviour. |
+
+Still to do in Phase 5: item 3 (partial/capped reports — the `truncated` flag exists, is set from the results cap and
+is in the JSON; the CSV metadata block and the GUI/CLI prominence of truncation are still to be done), item 4 (CSV formula neutralisation, documented as a
 CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never
 invent a verdict).
 
