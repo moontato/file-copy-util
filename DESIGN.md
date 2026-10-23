@@ -635,6 +635,18 @@ Now each job owns its state:
   a signal that reaches only the JVM (plain `kill`, a closing terminal, a stopping container) leaves rsync and
   its children reading the source after this program has gone.
 
+And one rule that a second review caught the first version breaking: **admission and closing share one critical
+section**. Asking for the engine (check that admission is permitted, claim the engine, install this job's
+controller) and marking the engine closed (capture the controller that closing has to stop) happen under the same
+lock, so exactly one of two things is true: the job got in and closing has hold of it and will stop it, or closing
+was marked first and the job is refused. Termination, thread joins and listener callbacks stay outside that lock.
+An earlier version checked whether the engine was closed outside the section and never rechecked it in the way that
+mattered, and closing did not enter the section at all - which let `execute()` admit a job moments after
+`close()` had returned with nothing to stop, and that job then copied, finished and reported `COMPLETED` with the
+watchdog already retired. Two endings are acceptable; a close that misses an admitted controller is not. The same
+review's fix also made sure that a job which loses the publication race gives its destination claim back: a claim
+belonging to a job that no longer runs would keep that directory shut to every job afterwards.
+
 Four holes in that design were found by an independent review after the first version of it, and are part of what
 the section now describes:
 

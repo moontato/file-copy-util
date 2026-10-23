@@ -1,8 +1,8 @@
-# Audit remediation plan — File Copy Util (revision 9)
+# Audit remediation plan — File Copy Util (revision 10)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 9 — Phase 4's job-ownership work was corrected after an independent review found four further lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and that cancellation did not stop hashing. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+**Status:** approved and under way, revision 10 — Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
 report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
 correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
@@ -690,6 +690,52 @@ re-ordering, not a schedule-forcing test.
 Whole suite pinned to one binary with `FCU_RSYNC_BINARIES` cleared: **251 green** against 3.1.3 and **251 green**
 against 3.4.0. The count moved 245 → 251 with the first Phase 4 round and 251 → 257 with these corrections.
 Protocol decision unchanged: **Option A**, with Option B's shape recorded and 3.2.7/3.3.0 still owed by the matrix.
+
+### The remaining blocker from the next review: closing could miss a job being admitted
+
+Reproduced independently: `execute()` checked `closed` outside the lock that admits a job and never rechecked it in
+the way that mattered, and `closeOnce()` did not enter that lock at all. Holding the lifecycle lock with reflection
+and releasing it after `close()` returned showed the sequence plainly — close returned with no controller to stop
+and the watchdog retired, then `execute()` admitted the job and **copied**: `status=COMPLETED`, `abortCause=NONE`,
+`copied after close=true`. Stale status would have been bad enough; this is writing destination data after the
+program closed.
+
+The correction is exactly the one required, and no redesign: **one critical section covers asking permission,
+claiming the engine and installing the controller, and marking the engine closed while capturing the controller
+closing must stop** (`admit(...)` and `closeOnce()` both under `lifecycleLock`). Termination, thread joins and
+listener callbacks stay outside it. The two acceptable endings are the two the review named:
+
+- **close wins** → admission is refused (`execute()` throws, `start()` returns false), nothing is copied;
+- **admission wins** → close captured that controller and stops it (`abortCause=ENGINE_CLOSED`, no `rsync` left).
+
+There is no third outcome. Two supporting invariants came with it: a job that loses the publication race gives its
+**destination claim** back (a claim left by a job that no longer runs would shut that directory forever), and a job
+already asked to stop while being admitted does not reach the destination or claim a reservation the terminal result
+has already published past — the message is the same *"before rsync started"* wording used elsewhere, so one fact
+has one phrasing.
+
+Fixtures (4 new; `JobOwnershipTest` 17 → 21):
+
+| Fixture | What it locks |
+|---|---|
+| `closingTakesItsTurnAtTheSameLockThatAdmitsAJob` | the mechanism: with the lifecycle section held elsewhere, `close()` is found `BLOCKED` behind it — a close that walked past the section fails here, deterministically |
+| `aCloseMarkedBeforeAJobIsAskedForRefusesThatJob` | close-wins outcome for both `execute()` and `start()`, with nothing written |
+| `aCloseAfterAJobIsRunningStopsThatJobInsteadOfMissingIt` | admission-wins outcome: `ENGINE_CLOSED`, file not written, no `rsync` survives, **and the same destination is usable by the next engine** (claim handed back) |
+| `aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped` | 40 rounds of the reproduced race with a real `rsync`: every round ends refused or stopped, never copied-after-close, never with a stranded destination claim (`destinationClaimsInUse()`, a package seam added for exactly this) |
+
+Mutation results for this round, disclosed:
+
+| Mutation | Caught? |
+|---|---|
+| `closeOnce()` walks past the lifecycle section again | **yes** — 2 fixtures; the contention one reproduced the reviewer's failure text ("`close()` had already returned with nothing copied, and the job then copied anyway") |
+| `execute()`'s checks moved outside the section (the exact old shape) | **yes** — by the mechanism fixture; the contention fixture did not land in that build's 40 rounds, which is why the mechanism fixture is the real lock |
+| the stop-check before claiming the destination reservation, removed | not observable on its own — the other guard alone suffices |
+| the dropped-result destination release, removed | not observable on its own — the same |
+| **both** of those guards removed together | **yes** — "the job in round 0 left its destination claim behind" |
+
+Counts: matrix `clean verify` **261 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs **0**; whole suite pinned to
+3.1.3 **255 green**, pinned to 3.4.0 **255 green** (251 → 255 pinned, 257 → 261 in the matrix run with the four new
+fixtures).
 
 **Still open after this phase**
 

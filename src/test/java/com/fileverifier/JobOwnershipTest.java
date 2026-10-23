@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,6 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -523,6 +526,183 @@ class JobOwnershipTest {
         }
     }
 
+    // ------------------------------------------------------------------ closing vs admission
+
+    @Test
+    void closingTakesItsTurnAtTheSameLockThatAdmitsAJob(@TempDir Path tmp) throws Exception {
+        // The correction, tested at the mechanism rather than at one lucky interleaving: marking the engine
+        // closed and capturing the job to stop happen inside the lifecycle critical section, so closing cannot
+        // slip past a job that is being admitted. A close that does not participate in that section never
+        // queues behind it.
+        FileSyncEngine engine = new FileSyncEngine();
+        Object lock = lifecycleLockOf(engine);
+        CountDownLatch closerStarted = new CountDownLatch(1);
+        Thread closer = new Thread(() -> {
+            closerStarted.countDown();
+            engine.close();
+        }, "closer-under-test");
+        try {
+            synchronized (lock) {
+                closer.start();
+                assertTrue(closerStarted.await(10, TimeUnit.SECONDS));
+                awaitThreadState(closer, Thread.State.BLOCKED, 3_000);
+                assertEquals(Thread.State.BLOCKED, closer.getState(),
+                        "close() walked past the lifecycle lock instead of waiting its turn behind it: "
+                                + closer.getState());
+            }
+            closer.join(10_000);
+            assertFalse(closer.isAlive(), "the close never got the lock it was waiting for");
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void aCloseMarkedBeforeAJobIsAskedForRefusesThatJob(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path copied = TestSupport.write(src.resolve("a.txt"), "a\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(TestSupport.fakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt", 0).toString());
+            engine.close();
+            assertThrows(IllegalStateException.class,
+                    () -> engine.execute(request(src, dst, JobType.COPY_ONLY, "a.txt"), null));
+            assertFalse(engine.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), null),
+                    "start() took a job after the engine had closed");
+            assertFalse(Files.exists(dst.resolve("a.txt")), "a job refused after close still wrote to it");
+            assertFalse(engine.isRunning());
+            assertNull(engine.lastResult());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void aCloseAfterAJobIsRunningStopsThatJobInsteadOfMissingIt(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            Recorder recorder = new Recorder();
+            engine.useRsync(TestSupport.hangingFakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt", "inflight.marker").toString());
+            assertTrue(engine.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), recorder));
+            awaitMarker(dst.resolve("inflight.marker"));
+
+            // Admission won, so closing has to have hold of this controller: it stops the job rather than
+            // returning and leaving it copying with nothing watching.
+            engine.close();
+            assertTrue(recorder.awaitCompletion(20_000), "the closed engine never reported its job");
+            assertEquals(AbortCause.ENGINE_CLOSED, recorder.result().abortCause(), recorder.result().message());
+            assertFalse(Files.exists(dst.resolve("a.txt")), "the stopped job wrote the file anyway");
+            TestSupport.assertNoProcessesRunning("rsync", "after closing over a running copy");
+
+            // And it gives the destination back: a stranded claim would keep that directory shut to every
+            // engine that comes after, with no job left to release it.
+            FileSyncEngine next = new FileSyncEngine();
+            try {
+                next.useRsync(TestSupport.fakeRsync(Files.createDirectories(tmp.resolve("fake2")),
+                        ">f+++++++++|a.txt", 0).toString());
+                Recorder second = new Recorder();
+                // The very same destination the stopped job was using: if closing or the dropped result left a
+                // claim behind, that directory stays shut with no job alive to release it.
+                assertTrue(next.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), second),
+                        "the destination stayed claimed after the job that held it was stopped");
+                assertTrue(second.awaitCompletion(20_000));
+                assertEquals(JobStatus.COMPLETED, second.result().status(), second.result().message());
+            } finally {
+                next.close();
+            }
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        Path fakeDir = Files.createDirectories(tmp.resolve("fake"));
+
+        // The reproduced race: a job is being admitted exactly as the program closes. Only two endings are
+        // acceptable - the close was marked first and the job is refused, or the job got in and the close
+        // captured and stopped it. What must never happen is a close that returned having never seen the job,
+        // which then copies with the watchdog already retired.
+        for (int round = 0; round < 40; round++) {
+            // A destination of its own per round, so a file left by one round can never be mistaken for a
+            // file written by the next one.
+            Path roundDest = Files.createDirectories(dst.resolve("r" + round));
+            FileSyncEngine engine = new FileSyncEngine();
+            engine.useRsync(TestSupport.fakeRsync(fakeDir, ">f+++++++++|a.txt", 0).toString());
+            engine.setJobTimeoutMillis(20_000L);
+            JobRequest request = request(src, roundDest, JobType.COPY_ONLY, "a.txt");
+            AtomicReference<JobResult> outcome = new AtomicReference<>();
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            AtomicBoolean runningAtClose = new AtomicBoolean();
+            AtomicBoolean copiedAtClose = new AtomicBoolean();
+            final int r = round;
+
+            Thread caller = new Thread(() -> {
+                try {
+                    outcome.set(engine.execute(request, null));
+                } catch (Throwable t) {
+                    thrown.set(t);
+                }
+            }, "caller-" + r);
+            Thread closer = new Thread(() -> {
+                engine.closeOnce();
+                runningAtClose.set(engine.isRunning());
+                copiedAtClose.set(Files.exists(roundDest.resolve("a.txt")));
+            }, "closer-" + r);
+            caller.start();
+            closer.start();
+            caller.join(30_000);
+            closer.join(30_000);
+            assertFalse(caller.isAlive(), "round " + round + ": the caller never came back");
+            assertFalse(closer.isAlive(), "round " + round + ": the close never came back");
+
+            JobResult result = outcome.get();
+            if (result == null) {
+                assertTrue(thrown.get() instanceof IllegalStateException,
+                        "round " + round + ": refused, but not with the reason: " + thrown.get());
+            } else {
+                if (result.message().startsWith("Another job in this program is already using the destination")) {
+                    fail("round " + round + ": the destination stayed claimed with no job holding it: "
+                            + result.message());
+                }
+                if (result.status() == JobStatus.COMPLETED && !copiedAtClose.get()) {
+                    fail("round " + round + ": close() had already returned with nothing copied, and the job"
+                            + " then copied anyway - close missed the controller it had admitted. running at"
+                            + " close=" + runningAtClose.get() + ", result=" + result);
+                }
+            }
+            assertFalse(engine.isRunning(), "round " + round + ": the engine is still running after closing");
+            assertFalse(Files.exists(roundDest.resolve("a.txt")) && !copiedAtClose.get(),
+                    "round " + round + ": a file appeared after close() returned");
+            try {
+                TestSupport.assertNoProcessesRunning("rsync", "in round " + round + " of closing vs admission");
+            } finally {
+                engine.close();
+            }
+        }
+
+        // And no round may leave its destination claimed. A claim belonging to a job that has stopped running
+        // is a directory locked forever, with nothing left alive to hand it back.
+        Set<String> claims = FileSyncEngine.destinationClaimsInUse();
+        for (int round = 0; round < 40; round++) {
+            String key = dst.resolve("r" + round).toRealPath().toString();
+            assertFalse(claims.contains(key),
+                    "the job in round " + round + " left its destination claim behind: " + key);
+        }
+    }
+
     // ------------------------------------------------------------------ hashing that keeps reading
 
     @Test
@@ -755,6 +935,20 @@ class JobOwnershipTest {
         }
         throw new AssertionError("the abandoned job's result was never dropped and counted; it may have been"
                 + " applied to the job that ran after it");
+    }
+
+    private static Object lifecycleLockOf(FileSyncEngine engine) throws Exception {
+        java.lang.reflect.Field field = FileSyncEngine.class.getDeclaredField("lifecycleLock");
+        field.setAccessible(true);
+        return field.get(engine);
+    }
+
+    private static void awaitThreadState(Thread thread, Thread.State wanted, long millis)
+            throws InterruptedException {
+        long until = System.currentTimeMillis() + millis;
+        while (thread.getState() != wanted && System.currentTimeMillis() < until) {
+            Thread.sleep(20L);
+        }
     }
 
     /** Wait until no live thread still carries this name - a stopped job's hashing threads included. */

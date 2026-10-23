@@ -196,6 +196,15 @@ public class FileSyncEngine implements AutoCloseable {
     /** Destinations with a live job in this program. Released by {@link #finishJob}. */
     private static final Set<String> DESTINATIONS_IN_USE =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * The destinations a job in this program currently holds a claim on. A seam for the lifecycle fixtures:
+     * a claim left behind by a job that no longer runs would keep that directory shut to every job that comes
+     * after, with nothing alive to hand it back.
+     */
+    static Set<String> destinationClaimsInUse() {
+        return Set.copyOf(DESTINATIONS_IN_USE);
+    }
     private final AtomicReference<String> reservedDestination = new AtomicReference<>();
 
     /** Preflight as this engine would run it, including its own rsync override. */
@@ -675,18 +684,12 @@ public class FileSyncEngine implements AutoCloseable {
      */
     public boolean start(JobRequest request, ProgressListener listener) {
         final ProgressListener progressListener = withoutListener(listener);
-        if (closed || !jobRunning.compareAndSet(false, true)) {
+        final Admission admission = admit(request, progressListener);
+        if (!admission.admitted()) {
+            // Closed, or already busy. Either way the answer is the same shape from here: nothing happens.
             return false;
         }
-        // The claim is taken here, outside the lock, and released inside it - see finishJob.
-        final JobControl control;
-        synchronized (lifecycleLock) {
-            if (closed) {
-                jobRunning.set(false);
-                return false;
-            }
-            control = beginJob(request, progressListener);
-        }
+        final JobControl control = admission.control();
         try {
             Thread worker = new Thread(() -> {
                 JobResult result;
@@ -714,17 +717,46 @@ public class FileSyncEngine implements AutoCloseable {
     /** Synchronous variant, for tests and headless callers. Blocks until the job finishes. */
     public JobResult execute(JobRequest request, ProgressListener listener) {
         listener = withoutListener(listener);
-        if (closed) {
+        final Admission admission = admit(request, listener);
+        if (admission.closed()) {
             throw new IllegalStateException("Engine is closed");
         }
-        if (!jobRunning.compareAndSet(false, true)) {
+        if (!admission.admitted()) {
             throw new IllegalStateException("Engine is busy: a job is already running");
         }
-        final JobControl control;
-        synchronized (lifecycleLock) {
-            control = beginJob(request, listener);
-        }
+        final JobControl control = admission.control();
         return finishJob(runGuarded(request, control, listener), control, listener);
+    }
+
+    /** What asking for the engine got: a controller this call installed, or the reason it was refused. */
+    private record Admission(JobControl control, boolean closed, boolean busy) {
+        boolean admitted() {
+            return control != null;
+        }
+    }
+
+    /**
+     * Ask for the engine, and install this job's controller for it, in <b>one</b> critical section. Closing
+     * marks itself in the same section (see {@link #closeOnce()}), so exactly one of two things is true: this
+     * call got the engine and closing has hold of the controller it installed, or closing was marked first and
+     * this call is refused. An earlier version checked {@code closed} outside the lock and rechecked it inside,
+     * which let {@code execute()} admit a job moments after {@code close()} had returned with no controller to
+     * stop - a copy that ran, and finished, after the program had closed the engine and retired its watchdog.
+     *
+     * <p>The claim on {@code jobRunning} is taken here and released by {@code finishJob}, inside the same lock.
+     * Nothing slow happens in here: no process, no listener, no disk.
+     */
+    private Admission admit(JobRequest request, ProgressListener listener) {
+        synchronized (lifecycleLock) {
+            if (closed) {
+                return new Admission(null, true, false);
+            }
+            if (jobRunning.get()) {
+                return new Admission(null, false, true);
+            }
+            jobRunning.set(true);
+            return new Admission(beginJob(request, listener), false, false);
+        }
     }
 
     /** A caller that does not want progress callbacks gets silence, not a job that fails on a null. */
@@ -779,8 +811,15 @@ public class FileSyncEngine implements AutoCloseable {
         if (!closeStarted.compareAndSet(false, true)) {
             return;
         }
-        closed = true;
-        JobControl control = currentControl.get();
+        final JobControl control;
+        synchronized (lifecycleLock) {
+            // Marked closed, and the job to stop captured, in the same critical section that admits a job.
+            // This is what makes the two sides agree: a job installed before this point is a job closing has
+            // hold of and will stop; a job asked for after it is refused. Marking closed outside the lock left
+            // a window in which close returned having never seen the controller, and that job then copied.
+            closed = true;
+            control = currentControl.get();
+        }
         if (control != null) {
             control.requestCancel(AbortCause.ENGINE_CLOSED);
             control.terminate();
@@ -875,6 +914,13 @@ public class FileSyncEngine implements AutoCloseable {
             }
         }
         if (!mine) {
+            // The result is dropped, but its destination claim is not left behind: the winner may have
+            // published the engine idle before this job got as far as claiming, and a claim belonging to no
+            // running job would keep that directory shut to every job after it.
+            String orphan = control.reservation.getAndSet(null);
+            if (orphan != null) {
+                DESTINATIONS_IN_USE.remove(orphan);
+            }
             lateResultsDropped.incrementAndGet();
             return result;
         }
@@ -1241,6 +1287,14 @@ public class FileSyncEngine implements AutoCloseable {
         // job is still writing. This is an in-process guard, not a lock - a second process is a different
         // story, and writing a lock file into someone's destination tree is not a decision to make here.
         String destinationKey = canonical(destDir).toString();
+        if (control.abortRequested()) {
+            // Asked to stop while it was still being admitted - a close that captured this controller, most
+            // likely. It must not touch the destination, and it must not claim a reservation that the terminal
+            // result already published past: that claim would outlive the job that made it.
+            return abortedBeforeTransfer("Job " + abortWords(control.cause())
+                    + " before rsync started: no file was transferred.",
+                    List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause());
+        }
         if (!DESTINATIONS_IN_USE.add(destinationKey)) {
             return failure("Another job in this program is already using the destination " + destDir
                     + ". Wait for it to finish, or point this job at a different directory: two jobs writing"

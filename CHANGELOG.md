@@ -2,6 +2,16 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Fixed — closing the program can no longer miss a job that was being admitted
+
+`execute()` used to ask "is the engine closed?" outside the lock that admits a job, and closing did not enter that
+lock at all. So a job could pass its checks, wait its turn, and be admitted *after* `close()` had returned having
+seen nothing to stop - and it then copied files, finished, and reported `COMPLETED` while the program was closed and
+its watchdog had been retired. Asking for the engine and marking it closed now happen in one critical section, so
+either the close was marked first and the job is refused, or the job got in and the close captured and stopped it.
+A job whose result arrives too late to be published also gives its destination claim back, rather than leaving that
+directory claimed forever with no job alive to release it.
+
 ### Fixed — four lifecycle holes an independent review found in that work
 
 - **Closing the program while a progress callback was blocked left the job running with no result.** Closing
