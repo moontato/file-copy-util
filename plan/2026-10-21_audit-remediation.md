@@ -600,6 +600,20 @@ used to expect a directory link to be *skipped* (`skippedLinks=1`); it now expec
 Red-first, as required: all 7 behaviour fixtures failed before the code changed (the SKIP fixture passed, being the
 unchanged case), and pass after. Suite: **269 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0.
 
+Mutation coverage for item 1 — and the new process for it. **Mutations now run in a disposable `git worktree`** at
+the commit under test, never in the working tree, and the restoration is verified against the intended baseline
+before a green run is accepted (`HEAD` and a clean status in both trees afterwards). That closes the stale-restore
+failure mode that bit this work twice: the mutation copy can no longer overwrite a live file, and the baseline is a
+commit rather than a hand-refreshed backup.
+
+| Mutation | Caught? |
+|---|---|
+| scanner drops directory links and dangling links under LINK again | yes — 2 fixtures (directory link, dangling link) |
+| destination-link branch removed (falls through to hashing) | yes — 4 fixtures, including the outside-the-roots link whose row must carry no digests |
+| source-link-under-LINK branch removed (falls through to hashing) | yes — the kind-change fixture names the digests it must not have |
+| pre-transfer kind-change warning from the ledger not emitted | yes — the fixture that needs the warning **before** the copy erases the evidence |
+| FOLLOW "compared by bytes" warning not emitted | yes — the FOLLOW fixture |
+
 Still to do in Phase 5: item 2 (the `checked` equation asserted in engine, GUI, CLI and exports, with transfer
 dispositions kept separate), item 3 (partial/capped reports: status, truncation, counters and errors exposed), item 4
 (CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity), item 5
