@@ -914,6 +914,57 @@ class JobOwnershipTest {
         throw new AssertionError("the stand-in rsync never got as far as " + marker);
     }
 
+    @Test
+    void aForcedReportNamesTheRowsItLeftOut(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        CountDownLatch stuck = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            // The copy stand-in writes nothing and exits cleanly, so verification has a verdict to report, and
+            // the listener blocks on that row. The engine then has to report the job without the rows that
+            // thread had reached - and say how many it left out, not merely that some are missing.
+            ProgressListener blocking = new ProgressListener() {
+                @Override
+                public void onFileProcessed(String relPath, String kind, String sourceHash, String destHash) {
+                    if ("MISSING".equals(kind) || "MISMATCH".equals(kind) || "OK".equals(kind)) {
+                        stuck.countDown();
+                        try {
+                            released.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+
+                @Override
+                public void onCompletion(JobResult result) {
+                    // The point is the thread that cannot get back to the engine.
+                }
+            };
+            engine.useRsync(TestSupport.fakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt", 0).toString());
+            assertTrue(engine.start(request(src, dst, JobType.COPY_AND_VERIFY, "a.txt"), blocking));
+            assertTrue(stuck.await(30, TimeUnit.SECONDS), "the verdict callback never got as far as being blocked");
+
+            engine.cancel();
+            awaitIdle(engine, 20_000);
+            JobResult forced = engine.lastResult();
+            assertNotNull(forced);
+            assertEquals(JobStatus.FAILED, forced.status(), forced.message());
+            assertEquals(0, forced.rowsListed(), forced.toString());
+            assertEquals(1, forced.rowsOmitted(),
+                    "the report that replaced the stuck thread says how many rows it left out: " + forced);
+            assertTrue(forced.truncated(), forced.toString());
+        } finally {
+            released.countDown();
+            engine.close();
+        }
+    }
+
     private static void awaitIdle(FileSyncEngine engine, long millis) throws InterruptedException {
         long until = System.currentTimeMillis() + millis;
         while (System.currentTimeMillis() < until) {

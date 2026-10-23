@@ -600,8 +600,9 @@ FAILED with one error and that **no** data rows follow; `maxResultsBoundsTheExpo
 asserts three data rows plus `# truncated,true`, `# rowsListed,3`, `# rowsOmitted,2` and `# checked,5`, which is the
 same promise stated with numbers instead of a line count.
 
-Suite: **279 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **273 green** pinned
-to 3.1.3.
+Suite: **280 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **274 green** pinned
+to 3.1.3. `aForcedReportNamesTheRowsItLeftOut` covers the one figure the mutations first found uncovered: a report
+written for a thread that would not come back has to state the rows it left out.
 
 Still to do in Phase 5: item 4 (CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never invent a verdict).
 
