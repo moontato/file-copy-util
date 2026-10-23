@@ -463,8 +463,21 @@ class CliTest {
         assertEquals(Cli.EXIT_OK, exit, o.out());
         assertTrue(o.out().contains("checked=5"), o.out());
         List<String> lines = Files.readAllLines(csv);
-        assertEquals(4, lines.size(), "header plus the 3 kept results: " + o.out());
+        // Rows are bounded by --max-results; the counters, and the statement of how much is missing, are not.
+        int header = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).startsWith("status,path,")) {
+                header = i;
+            }
+        }
+        assertTrue(header >= 0, String.valueOf(lines));
+        assertEquals(3, lines.size() - header - 1, "three rows kept: " + lines);
+        assertTrue(lines.contains("# truncated,true"), String.valueOf(lines));
+        assertTrue(lines.contains("# rowsListed,3"), String.valueOf(lines));
+        assertTrue(lines.contains("# rowsOmitted,2"), String.valueOf(lines));
+        assertTrue(lines.contains("# checked,5"), String.valueOf(lines));
         assertTrue(o.out().contains("truncated at 3"), o.out());
+        assertTrue(o.out().contains("the per-file list holds 3 of the job's 5 row(s)"), o.out());
     }
 
     @Test

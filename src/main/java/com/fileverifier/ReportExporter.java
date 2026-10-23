@@ -337,8 +337,34 @@ public final class ReportExporter {
      * verification state. The new columns are last so anything already reading the first four still works.
      */
     public static String toCsv(FileSyncEngine.JobResult result) {
-        StringBuilder csv = new StringBuilder(
-                "status,path,source_sha256,destination_sha256,transfer,verification\n");
+        StringBuilder csv = new StringBuilder();
+        // The block before the columns answers "which job is this, how did it end, and am I looking at all of
+        // it". Rows without it read as a complete record, which a capped list or a stopped job is not. Each line
+        // is a '#' comment holding one key and its value, so a reader can skip the block or read it, and the
+        // columns row still arrives in the shape a spreadsheet expects.
+        csv.append("# file-copy-util report\n");
+        csv.append("# status,").append(result.status().name()).append('\n');
+        csv.append("# abortCause,").append(result.abortCause().name()).append('\n');
+        csv.append("# message,").append(csvField(result.message())).append('\n');
+        csv.append("# truncated,").append(result.truncated() ? "true" : "false").append('\n');
+        csv.append("# rowsListed,").append(result.rowsListed()).append('\n');
+        csv.append("# rowsOmitted,").append(result.rowsOmitted()).append('\n');
+        csv.append("# checked,").append(result.filesChecked()).append('\n');
+        csv.append("# matched,").append(result.filesMatched()).append('\n');
+        csv.append("# mismatched,").append(result.filesMismatched()).append('\n');
+        csv.append("# missing,").append(result.filesMissing()).append('\n');
+        csv.append("# extra,").append(result.filesExtra()).append('\n');
+        csv.append("# processed,").append(result.filesProcessed()).append('\n');
+        csv.append("# copied,").append(result.filesCopied()).append('\n');
+        csv.append("# wouldCopy,").append(result.filesWouldCopy()).append('\n');
+        csv.append("# uncertain,").append(result.filesUncertain()).append('\n');
+        csv.append("# notTransferred,").append(result.filesNotTransferred()).append('\n');
+        csv.append("# transfersAnnounced,").append(result.transfersAnnounced()).append('\n');
+        csv.append("# transfersCompletedByRsync,").append(result.transfersCompletedByRsync()).append('\n');
+        csv.append("# rsyncExitCode,").append(result.rsyncExitCode()).append('\n');
+        csv.append("# errors,").append(result.errors().size()).append('\n');
+        csv.append("# warnings,").append(result.warnings().size()).append('\n');
+        csv.append("status,path,source_sha256,destination_sha256,transfer,verification\n");
         for (FileSyncEngine.FileOutcome outcome : result.outcomes()) {
             csv.append(csvField(outcome.kind())).append(',')
                     .append(csvField(outcome.relPath())).append(',')
@@ -374,8 +400,11 @@ public final class ReportExporter {
         json.append("{\n");
         json.append("  \"status\": ").append(field(result.status().name())).append(",\n");
         json.append("  \"message\": ").append(field(result.message())).append(",\n");
-        // Whether this list is the whole list. A capped result has to say so, or 40 rows read as the lot.
-        json.append("  \"truncated\": ").append(result.truncated() ? "true" : "false").append(",\n");
+        // Whether this list is the whole list, and by how much it falls short: a capped report has to say so,
+        // or 40 rows read as the lot.
+        json.append("  \"truncated\": ").append(result.truncated() ? "true" : "false")
+                .append(", \"rowsListed\": ").append(result.rowsListed())
+                .append(", \"rowsOmitted\": ").append(result.rowsOmitted()).append(",\n");
         // Every figure here is the tally of the rows it is reported beside. "checked" counts verdicts, so an
         // extra file - reported, but not compared against anything - is not one of them. The transfer figures
         // are kept apart from the verdict figures because they answer different questions, and the count of

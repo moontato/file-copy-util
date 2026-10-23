@@ -2,6 +2,21 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Changed — a report says which job it came from, and how much of it is missing
+
+- The CSV begins with a `#` comment block naming the job: `status`, `abortCause`, `message`, `truncated`,
+  `rowsListed`, `rowsOmitted`, every count, `rsyncExitCode`, and how many `errors` and `warnings` the job
+  reported. Then the columns row, then the rows. **Reading the CSV changes:** the columns row is no longer the
+  first line, so skip lines starting with `#`. Nothing in the row format itself changed.
+- The JSON gains `abortCause`, `truncated`, `rowsListed` and `rowsOmitted` beside the `totals` object.
+- `truncated` is now derived from `rowsOmitted`, so a report cannot say it is complete while naming rows it left
+  out. The engine counts the rows a job produced whether or not the results limit let them into the report.
+- A stopped job whose per-file rows were never collected says how many rows are missing rather than only warning
+  that some are.
+- The window titles the Results tab `Results (3 of 12)` when the list is short, and logs the same in words; the
+  command line prints a `note:` line under its totals. A forced terminal report from a job whose thread would not
+  finish states the number of rows it left out.
+
 ### Changed — the figures count what their names say
 
 - `checked` is now the sum of `matched + mismatched + missing`. A destination-only file was **reported**, not

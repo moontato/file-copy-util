@@ -628,11 +628,23 @@ public final class Cli {
             // destination-only file - reported, never compared - is not in it. "copied" counts the transfers
             // this run can show arrived; what rsync announced and what it claimed to complete are its own
             // observations, reported beside them rather than merged into the same number.
+        }
+        if (options.request().jobType().copies()) {
+            // Printed for every job that copies, verification or not: for a copy-only job these figures are
+            // the whole story, and for a copy-and-verify job they are the half of it that the verdicts do not
+            // answer.
             out.printf("transfers: copied=%d would-copy=%d uncertain=%d not-transferred=%d,"
                     + " rsync-announced=%d rsync-said-completed=%d; rows reported=%d%n",
                     result.filesCopied(), result.filesWouldCopy(), result.filesUncertain(),
                     result.filesNotTransferred(), result.transfersAnnounced(),
                     result.transfersCompletedByRsync(), result.filesProcessed());
+        }
+        if (result.truncated()) {
+            // Said next to the figures, not only in the warning list above: a reader who counts the exported
+            // rows has to be able to see that what they are counting is part of the job.
+            out.printf("note: the per-file list holds %d of the job's %d row(s) - the results limit"
+                    + " (--max-results) cut it short; the totals above count the whole job%n",
+                    result.rowsListed(), result.rowsListed() + result.rowsOmitted());
         }
 
         int exit = exitCode(result);

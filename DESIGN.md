@@ -151,7 +151,8 @@ list and any export stay deterministic even though hashing runs on a bounded poo
 
 The destination is scanned only when destination-only reporting is asked for; a Verify Only job that does
 not want `EXTRA` rows does not walk the destination at all. The results list is bounded (`setResultLimit`,
-CLI `--max-results`); counters stay exact whatever it is, and a truncated list says so in the warnings.
+CLI `--max-results`); counters stay exact whatever it is, and the report states how many rows it left out —
+`rowsOmitted`, with `truncated` derived from it, in both exports, in the window's tab title and in a CLI note.
 
 
 
@@ -729,6 +730,16 @@ says, and the disagreement stays on the page instead of being averaged away.
 
 **Progress unit.** `processed` counts the rows the job reported on, extras included. That is what the progress bar
 counts. It is not `checked`.
+
+### A report introduces itself
+
+Rows are not the job. A job can have been stopped, or its per-file list cut short by the results limit, and a
+reader who counts four rows will otherwise take them for the whole story. So both exports put the job before the
+rows: the CSV in a `#` comment block (`status`, `abortCause`, `message`, `truncated`, `rowsListed`, `rowsOmitted`,
+every count, `rsyncExitCode`, and how many errors and warnings followed), the JSON in fields beside `totals`. The
+window says it where the rows are looked at — `Results (3 of 12)` in the tab title, and a line in the log — and the
+command line prints it as a note under the totals. `truncated` is derived from `rowsOmitted`, so a report cannot
+claim to be complete and name rows it left out at the same time.
 
 The equations the exports state and the fixtures assert:
 

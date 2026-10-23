@@ -163,6 +163,40 @@ class FileVerifierViewTest {
     }
 
     @Test
+    void aCroppedResultSaysSoWhereTheRowsAreShown() throws Exception {
+        FileVerifierView view = build();
+        JTable table = (JTable) field(view, "resultsTable");
+        javax.swing.JTabbedPane tabs = (javax.swing.JTabbedPane) field(view, "outputTabs");
+
+        // A job whose per-file list hit the results limit: the table cannot show the whole job, and a reader
+        // who sees eight rows must be able to tell that eight is not the total.
+        FileSyncEngine.JobResult result = new FileSyncEngine.JobResult(
+            FileSyncEngine.JobStatus.COMPLETED,
+            "Copy complete: 10 file(s) copied. Verification was turned off, so none of them were compared.",
+            0, 0, 0, 0, 10, 0, 0, 0, 10, 10, 0, 0,
+            List.of(new FileSyncEngine.FileOutcome("a.txt", "COPIED", null, null,
+                FileSyncEngine.TransferDisposition.COPIED)),
+            List.of(), List.of(), 9, FileSyncEngine.AbortCause.NONE);
+
+        java.lang.reflect.Method showResults = FileVerifierView.class
+            .getDeclaredMethod("showResults", FileSyncEngine.JobResult.class);
+        showResults.setAccessible(true);
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                showResults.invoke(view, result);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        assertEquals(1, table.getRowCount(), "the rows that survived the cap are still shown");
+        assertEquals("Results (1 of 10)", tabs.getTitleAt(1),
+            "the tab says the list is short, before anyone reads eight rows as the story");
+        assertTrue(logText(view).contains("9 row(s) are not listed"),
+            "the log names how many are missing, not just that some are: " + logText(view));
+    }
+
+    @Test
     void copiedRowsReachTheTableAndAreNotCountedAsProblems() throws Exception {
         FileVerifierView view = build();
         JTable table = (JTable) field(view, "resultsTable");

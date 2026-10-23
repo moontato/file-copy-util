@@ -216,7 +216,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-275 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+279 tests, headless (no display needed): counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
 copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
@@ -284,6 +284,50 @@ CSV carries both as the `transfer` and `verification` columns, JSON as `transfer
 fields, and the window shows the transfer answer in the Results table's `Transfer` column. Both are
 appended after the columns that were already there, so anything already reading `status`, `path` and the
 two digests still reads the same thing.
+
+### What a report says about the job itself
+
+A list of rows is not the whole job: a job can be stopped, or its per-file list cut short by the results
+limit, and four rows on a screen then read as a complete record. Both exports answer that before the rows.
+
+**CSV** begins with a comment block, one key and value per line, then the columns row, then the rows:
+
+```
+# file-copy-util report
+# status,FAILED
+# abortCause,USER_CANCELLED
+# message,"Job cancelled by the user while copying: rsync announced 1 file(s)."
+# truncated,true
+# rowsListed,1
+# rowsOmitted,4
+# checked,1
+# matched,0
+# mismatched,1
+# missing,0
+# extra,0
+# processed,1
+# copied,0
+# wouldCopy,0
+# uncertain,1
+# notTransferred,0
+# transfersAnnounced,1
+# transfersCompletedByRsync,1
+# rsyncExitCode,20
+# errors,1
+# warnings,1
+status,path,source_sha256,destination_sha256,transfer,verification
+"PENDING","half.txt","","","UNCERTAIN","pending"
+```
+
+Anything already parsing the columns and rows needs one change: skip the lines starting with `#` to find the
+columns row. The counts in that block are the whole job's counts, not the counts of the rows that survived.
+
+**JSON** carries the same facts as fields: `status`, `abortCause`, `truncated`, `rowsListed`, `rowsOmitted`, a
+`totals` object with every figure, plus the `errors` and `warnings` arrays in full.
+
+**The window** titles the Results tab `Results (3 of 12)` when the list is short and logs "9 row(s) are not
+listed here … the totals above count the whole job". **The command line** prints the same as a `note:` line
+under the totals.
 
 ## When a copy is interrupted
 

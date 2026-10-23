@@ -1427,7 +1427,19 @@ public final class FileVerifierView extends JPanel {
         resultsTable.setEnabled(true);
         exportCsvButton.setEnabled(true);
         exportJsonButton.setEnabled(true);
-        outputTabs.setTitleAt(1, "Results (" + shown + ")");
+        if (result.truncated()) {
+            // The tab count says how many rows are on show, and that they are part of a bigger job: a capped
+            // table with a plain count reads as a complete record. The log says the same in words, next to the
+            // totals the reader is adding up.
+            outputTabs.setTitleAt(1, "Results (" + shown + " of "
+                    + (result.rowsListed() + result.rowsOmitted()) + ")");
+            log(String.format("  %d row(s) are not listed here, because of the results limit: this report holds"
+                    + " %d of the job's %d row(s). The totals above count the whole job.",
+                    result.rowsOmitted(), result.rowsListed(),
+                    result.rowsListed() + result.rowsOmitted()));
+        } else {
+            outputTabs.setTitleAt(1, "Results (" + shown + ")");
+        }
     }
 
     /**

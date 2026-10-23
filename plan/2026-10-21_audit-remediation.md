@@ -1,12 +1,12 @@
-# Audit remediation plan — File Copy Util (revision 12)
+# Audit remediation plan — File Copy Util (revision 13)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
 **Status:** approved and under way, revision 12 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
 `33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
 under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
-green. Items 3–5 (partial/capped report completeness, CSV formula neutralisation, `--strict` and invalid-pattern
-warnings) follow. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
+green, and item 3 (report completeness) is implemented and green. Items 4–5 (CSV formula neutralisation, `--strict`
+and invalid-pattern warnings) follow. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
 DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
 ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
@@ -573,7 +573,37 @@ something in a pinned run); SpotBugs `BugInstance size is 0`; `javac -Xlint:all 
 
 ---
 
-## Phase 5 — truthful verdicts and counts (items 1–2 green)
+## Phase 5 — truthful verdicts and counts (items 1–3 green)
+
+**Item 3, a report that cannot look complete when it is not (§2.8, §2.13) — implemented, green.**
+
+Red first: `theCsvNamesTheJobItDescribesAndSaysWhetherItsRowsAreTheWholeJob`, `aReportThatHoldsEveryRowSaysSo`,
+`theJsonSaysWhenItsRowsAreOnlyPartOfTheJob` and `aCroppedResultSaysSoWhereTheRowsAreShown` were written against the
+old exports and failed before the code changed; they pass now.
+
+| Change | Why |
+|---|---|
+| `JobResult.rowsOmitted`, and `truncated()` derived from it | a report that names rows it left out cannot also claim to be whole; the old stored boolean could disagree with the list |
+| the reporter counts rows whether or not the cap let them in | the omitted figure has to exist for a capped job, which is exactly the job that needs it |
+| a forced terminal report states `counters.rowCount()` rows omitted | the abandoned thread had per-file rows; the report that replaced it holds none, and says how many are missing rather than only "some are missing" |
+| CSV metadata block before the columns | `status`, `abortCause`, `message`, `truncated`, `rowsListed`, `rowsOmitted`, every count, `rsyncExitCode`, and the error/warning counts — a stopped or capped CSV no longer reads as a complete record |
+| JSON gains `truncated`, `rowsListed`, `rowsOmitted` (already had `status`, `errors`, `warnings`) | the machine-readable form states the same facts as the human one |
+| Results tab `Results (3 of 12)` and a log line in the window; `note:` line in the CLI | the cue belongs where the rows are being read, not only in a warning list that scrolls away |
+
+**Format change, stated:** the CSV columns row is no longer the first line. Readers must skip `#` lines. The row
+format itself is unchanged, and the change is in the changelog and README, not only in the code.
+
+Three existing expectations were re-expressed rather than weakened: `csvHasAHeaderAndOneRowPerOutcomeWithFullDigests`
+and `twoPendingRowsWithDifferentTransfersExportDifferently` now address rows through a `dataRows` helper (rows after
+the columns row) and additionally assert the metadata; `anEmptyJobExportsAHeaderOnlyCsv` asserts the metadata says
+FAILED with one error and that **no** data rows follow; `maxResultsBoundsTheExportedRowsButNotTheCounters` now
+asserts three data rows plus `# truncated,true`, `# rowsListed,3`, `# rowsOmitted,2` and `# checked,5`, which is the
+same promise stated with numbers instead of a line count.
+
+Suite: **279 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **273 green** pinned
+to 3.1.3.
+
+Still to do in Phase 5: item 4 (CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never invent a verdict).
 
 **Item 2, the `checked` equation and the separation of transfer figures (§2.13) — implemented, green,
 `CounterTruthTest` (5 fixtures) plus the equation asserted in the existing engine, CLI and export fixtures.**
@@ -641,10 +671,7 @@ that commit afterwards (worktree `HEAD` and status printed before removal).
 | transfer figures never tallied at all (`tally = NONE`) | yes — 37 fixtures, which is the measure of how much of the suite reads these figures |
 | the ledger's dry-run early return removed | **not observable.** The engine builds no ledger for a dry run (`if (!dryRun)` around the snapshot), so `transferFacts`' own dry-run branch decides first and the ledger's check sits on a path no dry run reaches. Recorded as a second guard, not as covered behaviour. |
 
-Still to do in Phase 5: item 3 (partial/capped reports — the `truncated` flag exists, is set from the results cap and
-is in the JSON; the CSV metadata block and the GUI/CLI prominence of truncation are still to be done), item 4 (CSV formula neutralisation, documented as a
-CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never
-invent a verdict).
+Mutation coverage for item 3 is recorded in the commit after this one.
 
 **Item 1, symlink verdicts (§2.13) — implemented, green, `SymlinkVerdictTest` (8 fixtures).**
 

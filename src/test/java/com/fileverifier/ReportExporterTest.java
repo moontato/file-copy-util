@@ -28,17 +28,90 @@ class ReportExporterTest {
                 List.of("some files vanished"));
     }
 
+    /**
+     * A report that is part of a job has to say so, with numbers: which job it came from, how that job ended,
+     * how many rows are here and how many are missing, and the counters that describe the whole job. Four rows
+     * with no such header read as the whole story.
+     */
+    @Test
+    void theCsvNamesTheJobItDescribesAndSaysWhetherItsRowsAreTheWholeJob() {
+        String csv = ReportExporter.toCsv(cutShortSample());
+        assertTrue(csv.contains("# status,FAILED"), csv);
+        assertTrue(csv.contains("# abortCause,USER_CANCELLED"), csv);
+        assertTrue(csv.contains("# truncated,true"), csv);
+        assertTrue(csv.contains("# rowsListed,1"), csv);
+        assertTrue(csv.contains("# rowsOmitted,4"), csv);
+        assertTrue(csv.contains("# checked,1"), csv);
+        assertTrue(csv.contains("# mismatched,1"), csv);
+        assertTrue(csv.contains("# processed,1"), csv);
+        assertTrue(csv.contains("# uncertain,1"), csv);
+        assertTrue(csv.contains("# transfersAnnounced,1"), csv);
+        assertTrue(csv.contains("# transfersCompletedByRsync,1"), csv);
+        assertTrue(csv.contains("# rsyncExitCode,20"), csv);
+        assertTrue(csv.contains("# errors,1"), csv);
+        assertTrue(csv.contains("# warnings,1"), csv);
+        assertTrue(csv.contains("\nstatus,path,source_sha256,destination_sha256,transfer,verification\n"), csv);
+        assertTrue(csv.indexOf("status,path,") > csv.indexOf("# status,FAILED"),
+                "the reader meets the job before its rows: " + csv);
+        assertTrue(csv.contains("\"PENDING\",\"half.txt\""), csv);
+    }
+
+    @Test
+    void aReportThatHoldsEveryRowSaysSo() {
+        String csv = ReportExporter.toCsv(sample());
+        assertTrue(csv.contains("# status,COMPLETED"), csv);
+        assertTrue(csv.contains("# truncated,false"), csv);
+        assertTrue(csv.contains("# rowsListed,4"), csv);
+        assertTrue(csv.contains("# rowsOmitted,0"), csv);
+        assertTrue(csv.contains("# errors,1"), csv);
+    }
+
+    @Test
+    void theJsonSaysWhenItsRowsAreOnlyPartOfTheJob() {
+        String json = ReportExporter.toJson(cutShortSample());
+        assertTrue(json.contains("\"truncated\": true"), json);
+        assertTrue(json.contains("\"rowsListed\": 1"), json);
+        assertTrue(json.contains("\"rowsOmitted\": 4"), json);
+    }
+
+    /**
+     * The data rows of a CSV export - everything after the columns row. The metadata block before it is
+     * asserted where it matters, and ignored by the fixtures that are about rows.
+     */
+    private static java.util.List<String> dataRows(String csv) {
+        String[] lines = csv.split("\n");
+        int header = -1;
+        for (int i = 0; i < lines.length; i++) {
+            if (lines[i].equals("status,path,source_sha256,destination_sha256,transfer,verification")) {
+                header = i;
+            }
+        }
+        assertTrue(header >= 0, csv);
+        return java.util.Arrays.asList(lines).subList(header + 1, lines.length);
+    }
+
+    private static FileSyncEngine.JobResult cutShortSample() {
+        return new FileSyncEngine.JobResult(
+                FileSyncEngine.JobStatus.FAILED,
+                "Job cancelled by the user while copying: rsync announced 1 file(s).",
+                0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 20,
+                List.of(new FileSyncEngine.FileOutcome("half.txt", "PENDING", null, null,
+                        FileSyncEngine.TransferDisposition.UNCERTAIN)),
+                List.of("rsync: write failed on half.txt"),
+                List.of("1 file(s) had a transfer that cannot be confirmed"),
+                4, FileSyncEngine.AbortCause.USER_CANCELLED);
+    }
+
     @Test
     void csvHasAHeaderAndOneRowPerOutcomeWithFullDigests() {
         String csv = ReportExporter.toCsv(sample());
-        String[] lines = csv.split("\n");
+        java.util.List<String> rows = dataRows(csv);
 
-        assertEquals("status,path,source_sha256,destination_sha256,transfer,verification", lines[0]);
-        assertEquals(5, lines.length, csv);
+        assertEquals(4, rows.size(), csv);
         assertEquals("\"OK\",\"ok.txt\",\"aaaa1111bbbb2222\",\"aaaa1111bbbb2222\",\"COPIED\",\"compared\"",
-                lines[1], "a copied-and-compared file exports both facts, in one row");
+                rows.get(0), "a copied-and-compared file exports both facts, in one row");
         assertEquals("\"MISSING\",\"gone.txt\",\"ffff7777eeee8888\",\"\",\"UNCERTAIN\",\"compared\"",
-                lines[3], "a file with no destination copy exports an empty digest, not a fake one");
+                rows.get(2), "a file with no destination copy exports an empty digest, not a fake one");
         assertTrue(csv.contains("\"EXTRA\",\"only/at/dest.txt\",\"\",\"dddd9999cccc0000\",\"NOT_COPIED\""),
                 csv);
     }
@@ -103,9 +176,10 @@ class ReportExporterTest {
                 List.of(), List.of());
 
         String csv = ReportExporter.toCsv(stopped);
-        String[] lines = csv.split("\n");
-        assertEquals("\"PENDING\",\"finished.bin\",\"\",\"\",\"COPIED\",\"pending\"", lines[1], csv);
-        assertEquals("\"PENDING\",\"halfwritten.bin\",\"\",\"\",\"UNCERTAIN\",\"pending\"", lines[2], csv);
+        java.util.List<String> rows = dataRows(csv);
+        assertEquals("\"PENDING\",\"finished.bin\",\"\",\"\",\"COPIED\",\"pending\"", rows.get(0), csv);
+        assertEquals("\"PENDING\",\"halfwritten.bin\",\"\",\"\",\"UNCERTAIN\",\"pending\"", rows.get(1), csv);
+        assertTrue(csv.contains("# status,FAILED"), csv);
 
         String json = ReportExporter.toJson(stopped);
         assertTrue(json.contains("\"status\": \"PENDING\", \"path\": \"finished.bin\", \"sourceSha256\": null,"
@@ -142,8 +216,13 @@ class ReportExporterTest {
                 FileSyncEngine.JobStatus.FAILED, "Preflight failed: nothing selected.",
                 0, 0, 0, 0, 0, 0, 0, List.of(), List.of("nothing selected"), List.of());
 
-        assertEquals("status,path,source_sha256,destination_sha256,transfer,verification\n",
-                ReportExporter.toCsv(empty));
+        String csv = ReportExporter.toCsv(empty);
+        // A job that never got going still gets its header block - and no rows, which is the point.
+        assertTrue(csv.contains("# status,FAILED"), csv);
+        assertTrue(csv.contains("# errors,1"), csv);
+        assertTrue(csv.contains("# rowsListed,0"), csv);
+        assertTrue(csv.contains("# rowsOmitted,0"), csv);
+        assertTrue(dataRows(csv).isEmpty(), csv);
         assertTrue(ReportExporter.toJson(empty).contains("\"results\": [\n  ]"), ReportExporter.toJson(empty));
     }
 }
