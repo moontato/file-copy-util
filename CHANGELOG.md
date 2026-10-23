@@ -14,6 +14,8 @@
 - An ignore pattern with invalid glob syntax used to be dropped silently, which turned a typo into a directory being
   copied when the reader believed it was excluded. The job now warns and names the pattern; the other patterns still
   apply, and the file the broken one would have excluded is judged on what it is — a broken rule is not a verdict.
+- When one run has both a strict finding and a report that could not be written, the report failure is the exit code:
+  a run that cannot record itself is the worse of the two failures.
 
 ### Changed — a CSV cell that a spreadsheet would evaluate is disarmed
 
