@@ -163,6 +163,36 @@ class FileVerifierViewTest {
     }
 
     @Test
+    void aNameThatLooksLikeASpreadsheetFormulaIsStillShownAsTheNameItIs() throws Exception {
+        FileVerifierView view = build();
+        JTable table = (JTable) field(view, "resultsTable");
+
+        // The CSV disarms a leading formula character because a spreadsheet would evaluate it. The table is not
+        // a spreadsheet: the cell has to hold the name, so that what is on screen matches what is on disk.
+        FileSyncEngine.JobResult risky = new FileSyncEngine.JobResult(
+            FileSyncEngine.JobStatus.COMPLETED,
+            "Copy complete: 1 file(s) copied. Verification was turned off, so none of them were compared.",
+            0, 0, 0, 0, 0, 1, 0,
+            List.of(new FileSyncEngine.FileOutcome("=cmd.txt", "COPIED", null, null)),
+            List.of(), List.of());
+
+        java.lang.reflect.Method showResults = FileVerifierView.class
+            .getDeclaredMethod("showResults", FileSyncEngine.JobResult.class);
+        showResults.setAccessible(true);
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                showResults.invoke(view, risky);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        assertEquals(1, table.getRowCount());
+        assertEquals("=cmd.txt", table.getValueAt(0, 1),
+            "the window shows the name, disarmed or not");
+    }
+
+    @Test
     void aCroppedResultSaysSoWhereTheRowsAreShown() throws Exception {
         FileVerifierView view = build();
         JTable table = (JTable) field(view, "resultsTable");

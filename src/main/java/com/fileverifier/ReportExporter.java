@@ -25,11 +25,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * {@code destinationSha256} have always carried are unchanged and keep their order; {@code transfer} and
  * {@code verification} are appended. Names are written raw (an export is a record, not a display).
  *
- * <p>CSV quoting is not spreadsheet safety. A field beginning with {@code =}, {@code +}, {@code -}, or
- * {@code @} is quoted here, which keeps a spreadsheet from treating it as a separator or a quote - but a
- * spreadsheet that evaluates quoted formulas would still evaluate it. Neutralising the leading character
- * itself is scheduled (plan &#167;2.13) and has not been done; do not describe this format as safe to open
- * in a spreadsheet until it is.
+ * <p>A CSV field that a spreadsheet would try to evaluate is disarmed: a field whose first character is
+ * {@code =}, {@code +}, {@code -}, {@code @}, a tab or a carriage return gets a leading apostrophe, which is
+ * the convention a spreadsheet already reads as "this is text, not a formula". A file called
+ * {@code =HYPERLINK("http://attacker")} is therefore exported as {@code '=HYPERLINK("http://attacker")}.
  *
  * <p>No dependencies: the project has none, and a job report does not need a JSON library.
  */
@@ -488,11 +487,31 @@ public final class ReportExporter {
         return value == null ? "null" : field(value);
     }
 
-    /** CSV field: RFC 4180 quoting (a quote is doubled), which is not the same as JSON escaping. */
+    /**
+     * CSV field: RFC 4180 quoting (a quote is doubled, which is not the same as JSON escaping), plus a leading
+     * apostrophe on any field a spreadsheet would try to evaluate.
+     *
+     * <p>Why the apostrophe: a name is data, but a spreadsheet reads a cell starting with {@code =}, {@code +},
+     * {@code -} or {@code @} as a formula, and a tab or carriage return can make it look like a command that
+     * was pasted in. So a file named {@code =cmd.txt} in the folder being copied is an attack on whoever opens
+     * the report, not only on the report. The apostrophe is the convention spreadsheets already treat as "text
+     * literal", and it is visible, so nothing is hidden from a reader who wants to undo it.
+     *
+     * <p>What is <b>not</b> transformed: the name as the program matches on it, the name in the window's table,
+     * and the name in JSON. The CSV is the one format a spreadsheet evaluates, and an apostrophe in a name on
+     * disk would be a different file.
+     */
     static String csvField(String value) {
         if (value == null) {
             return "\"\"";
         }
-        return "\"" + value.replace("\"", "\"\"") + "\"";
+        String text = value;
+        if (!text.isEmpty()) {
+            char first = text.charAt(0);
+            if (first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r') {
+                text = "'" + text;
+            }
+        }
+        return "\"" + text.replace("\"", "\"\"") + "\"";
     }
 }

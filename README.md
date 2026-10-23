@@ -216,7 +216,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-280 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+283 tests, headless (no display needed): counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
 copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
@@ -328,6 +328,22 @@ columns row. The counts in that block are the whole job's counts, not the counts
 **The window** titles the Results tab `Results (3 of 12)` when the list is short and logs "9 row(s) are not
 listed here … the totals above count the whole job". **The command line** prints the same as a `note:` line
 under the totals.
+
+### A name that a spreadsheet would evaluate
+
+A folder can contain a file called `=HYPERLINK("http://attacker")`. In a CSV, a spreadsheet reads such a cell
+as a formula, so the person opening the report to check a copy is the one who gets the click. The CSV therefore
+prefixes a leading apostrophe — the convention spreadsheets read as "text, not a formula" — to any field whose
+first character is `=`, `+`, `-`, `@`, a tab or a carriage return:
+
+| Name on disk | In the CSV | In JSON, and in the window's table |
+| --- | --- | --- |
+| `=cmd.txt` | `'=cmd.txt` | `=cmd.txt` |
+| `@mail.txt` | `'@mail.txt` | `@mail.txt` |
+| `mid=equals.txt` | `mid=equals.txt` (not leading, not a formula) | `mid=equals.txt` |
+
+This is a CSV-only transformation. The name the program copies, compares, lists and exports as JSON is the name
+on disk, apostrophe-free — adding one to a file would be a different file.
 
 ## When a copy is interrupted
 

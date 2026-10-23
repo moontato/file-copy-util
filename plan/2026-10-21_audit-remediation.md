@@ -1,12 +1,13 @@
-# Audit remediation plan — File Copy Util (revision 13)
+# Audit remediation plan — File Copy Util (revision 14)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
 **Status:** approved and under way, revision 12 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
 `33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
 under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
-green, and item 3 (report completeness) is implemented and green. Items 4–5 (CSV formula neutralisation, `--strict`
-and invalid-pattern warnings) follow. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
+green, item 3 (report completeness) is implemented and green, and item 4 (CSV formula neutralisation) is
+implemented and green — which closes the one hardening item the changelog had been carrying as "not done". Item 5
+(`--strict` and invalid-pattern warnings) follows. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
 DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
 ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
@@ -573,7 +574,21 @@ something in a pinned run); SpotBugs `BugInstance size is 0`; `javac -Xlint:all 
 
 ---
 
-## Phase 5 — truthful verdicts and counts (items 1–3 green)
+**Item 4, CSV formula neutralisation (§2.13) — implemented, green.**
+
+Red first: `aNameThatASpreadsheetWouldEvaluateIsDisarmedInTheCsvAndStaysRawEverywhereElse` and
+`theCsvFieldRuleLeavesALoneFormulaCharacterAlone` failed against the quoting-only `csvField` (6 suppressed
+assertions between them); the window fixture `aNameThatLooksLikeASpreadsheetFormulaIsStillShownAsTheNameItIs` passed
+before and after, because the table was never the format at risk.
+
+- `csvField` prefixes `'` to a field whose first character is `=`, `+`, `-`, `@`, tab or CR. The job's `# message`
+  line goes through the same rule.
+- Only the CSV. Names in JSON, in the window's table, and in every comparison the program makes stay raw — an
+  apostrophe in a filename would be a different file. A non-leading `=` is ordinary text.
+- The class comment that told the next reader "do not describe this format as safe to open in a spreadsheet until
+  it is" is replaced by what the rule now is.
+
+## Phase 5 — truthful verdicts and counts (items 1–4 green)
 
 **Item 3, a report that cannot look complete when it is not (§2.8, §2.13) — implemented, green.**
 
@@ -604,7 +619,7 @@ Suite: **280 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4
 to 3.1.3. `aForcedReportNamesTheRowsItLeftOut` covers the one figure the mutations first found uncovered: a report
 written for a thread that would not come back has to state the rows it left out.
 
-Still to do in Phase 5: item 4 (CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never invent a verdict).
+Still to do in Phase 5: item 4 (CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity) and then item 5 (`--strict` and invalid-pattern warnings that never invent a verdict). Item 4 is implemented and green, documented in the section above.
 
 **Item 2, the `checked` equation and the separation of transfer figures (§2.13) — implemented, green,
 `CounterTruthTest` (5 fixtures) plus the equation asserted in the existing engine, CLI and export fixtures.**

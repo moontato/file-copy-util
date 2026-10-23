@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Phase 3 export formats: the CSV must be readable by a spreadsheet, the JSON by a machine. */
@@ -114,6 +116,66 @@ class ReportExporterTest {
                 rows.get(2), "a file with no destination copy exports an empty digest, not a fake one");
         assertTrue(csv.contains("\"EXTRA\",\"only/at/dest.txt\",\"\",\"dddd9999cccc0000\",\"NOT_COPIED\""),
                 csv);
+    }
+
+    /**
+     * A file whose name begins with a formula character is a spreadsheet attack surface: the person who opens
+     * the CSV to check a copy gets a cell that evaluates. So the CSV disarms the leading character, and nothing
+     * else does - the name on disk, the name in the table and the name in JSON are the name, untouched.
+     */
+    @Test
+    void aNameThatASpreadsheetWouldEvaluateIsDisarmedInTheCsvAndStaysRawEverywhereElse() {
+        FileSyncEngine.JobResult risky = new FileSyncEngine.JobResult(
+                FileSyncEngine.JobStatus.COMPLETED, "=SUM(1,2) was the job's message",
+                0, 0, 0, 0, 0, 0, 0,
+                List.of(
+                        new FileSyncEngine.FileOutcome("=cmd.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED),
+                        new FileSyncEngine.FileOutcome("+sum.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED),
+                        new FileSyncEngine.FileOutcome("-neg.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED),
+                        new FileSyncEngine.FileOutcome("@at.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED),
+                        new FileSyncEngine.FileOutcome("\ttab.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED),
+                        new FileSyncEngine.FileOutcome("mid=equals.txt", "OK", null, null,
+                                FileSyncEngine.TransferDisposition.COPIED)),
+                List.of(), List.of());
+
+        String csv = ReportExporter.toCsv(risky);
+        assertAll(
+                () -> assertTrue(csv.contains("\"'=cmd.txt\""), csv),
+                () -> assertTrue(csv.contains("\"'+sum.txt\""), csv),
+                () -> assertTrue(csv.contains("\"'-neg.txt\""), csv),
+                () -> assertTrue(csv.contains("\"'@at.txt\""), csv),
+                () -> assertTrue(csv.contains("\"'\ttab.txt\""), csv),
+                // A formula character that is not leading is ordinary text, and a name is not rewritten for
+                // something that could not be evaluated.
+                () -> assertTrue(csv.contains("\"mid=equals.txt\""), csv),
+                // The job's own message goes through the same rule.
+                () -> assertTrue(csv.contains("# message,\"'=SUM(1,2)"), csv),
+                () -> assertFalse(csv.contains(",\"="),
+                        "no CSV field may begin with an unquoted formula character: " + csv));
+
+        String json = ReportExporter.toJson(risky);
+        assertAll(
+                () -> assertTrue(json.contains("\"path\": \"=cmd.txt\""), json),
+                () -> assertTrue(json.contains("\"path\": \"@at.txt\""), json),
+                () -> assertFalse(json.contains("'="),
+                        "JSON is the record of the names as they are: " + json));
+    }
+
+    @Test
+    void theCsvFieldRuleLeavesALoneFormulaCharacterAlone() {
+        // Only a leading character can start an evaluation.
+        assertAll(
+                () -> assertEquals("\"'=1+1\"",
+                        ReportExporter.csvField("=1+1")),
+                () -> assertEquals("\"a=1\"",
+                        ReportExporter.csvField("a=1")),
+                () -> assertEquals("\"1=1\"",
+                        ReportExporter.csvField("1=1")));
     }
 
     @Test

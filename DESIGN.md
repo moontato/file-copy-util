@@ -731,6 +731,17 @@ says, and the disagreement stays on the page instead of being averaged away.
 **Progress unit.** `processed` counts the rows the job reported on, extras included. That is what the progress bar
 counts. It is not `checked`.
 
+### A CSV cell that a spreadsheet would evaluate
+
+A copied folder can contain a file named `=HYPERLINK("http://attacker")`. Quoting it is not enough: a spreadsheet
+evaluates a quoted cell that begins with `=`, `+`, `-` or `@` (and a leading tab or carriage return can make text
+look like a pasted command). So `csvField` prefixes a leading apostrophe — the convention spreadsheets already read
+as "text literal", and visible, so a reader can undo it knowingly.
+
+It applies to the CSV only, including the `#` metadata block's `message`. The name the program selects, copies,
+compares and reports in JSON, and the name in the window's table, are the name on disk: an apostrophe in a filename
+would be a different file. A formula character that is not leading cannot be evaluated, so it is left alone.
+
 ### A report introduces itself
 
 Rows are not the job. A job can have been stopped, or its per-file list cut short by the results limit, and a

@@ -2,6 +2,17 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Changed — a CSV cell that a spreadsheet would evaluate is disarmed
+
+- A CSV field whose first character is `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading
+  apostrophe, the convention spreadsheets read as "text, not a formula". A folder containing a file named
+  `=HYPERLINK("http://attacker")` used to export a cell that a spreadsheet might evaluate for whoever opened the
+  report; the job's own `message` field goes through the same rule.
+- **CSV-only.** The name as the program matches on it, the name in the window's Results table and the name in JSON
+  stay exactly as they are on disk: putting an apostrophe in front of a file's name would name a different file. A
+  non-leading formula character (`mid=equals.txt`) is ordinary text and is left alone.
+- This closes the item the earlier changelog and code comments said had not been done.
+
 ### Changed — a report says which job it came from, and how much of it is missing
 
 - The CSV begins with a `#` comment block naming the job: `status`, `abortCause`, `message`, `truncated`,
