@@ -96,6 +96,26 @@ public final class FileVerifierView extends JPanel {
 
     private boolean scanning = false;
     private boolean scanOptionsStale = false;
+    /**
+     * What is loaded, and on what authority: which scan produced it, which two directories were read, under
+     * which options. Everything a Run needs is checked against this, so a job cannot be started from rows that
+     * belong to another pair of directories or to options that are no longer set.
+     */
+    private volatile LoadedScan loadedScan;
+    /** Bumped every time a scan is started; a completion carrying an older number is thrown away. */
+    private long scanGeneration;
+    /** How many scans have been thrown away for being out of date - observable, because it is a decision. */
+    private final java.util.concurrent.atomic.AtomicInteger discardedScans =
+        new java.util.concurrent.atomic.AtomicInteger();
+    /**
+     * Scans reading the directories right now. "Scanning" follows this count rather than the fate of one scan:
+     * a scan discarded on the way home must not leave the window saying it is still scanning, and one that
+     * finishes while a newer one is queued must not clear the flag either.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger inFlightScans =
+        new java.util.concurrent.atomic.AtomicInteger();
+    /** The one immutable request the current job is running - and the one a collision answer belongs to. */
+    private FileSyncEngine.JobRequest pendingRequest;
     private FileSyncEngine.JobType currentJobType = FileSyncEngine.JobType.COPY_AND_VERIFY;
     private JLabel workSetLabel;
 
@@ -631,12 +651,71 @@ public final class FileVerifierView extends JPanel {
      * and a long ignore field must not trigger a rescan per keystroke. So the frame says it out loud
      * once, when a completed scan has become stale.
      */
+    /** Scan options changed: the same invalidation, because the rows depend on them. */
     private void noteScanOptionsChanged() {
         if (scanOptionsStale || sourceModel.total() == 0) {
             return;
         }
         scanOptionsStale = true;
         log("Scan options changed - press Scan Files to apply them.");
+    }
+
+    /** Reading a directory is a step a test may want to slow down, so it is behind a seam. */
+    interface Scanner {
+        DirectoryScanner.ScanResult scan(Path root, ScanOptions options);
+    }
+
+    private Scanner scanner = DirectoryScanner::scanFiles;
+
+    void setScannerForTesting(Scanner replacement) {
+        this.scanner = replacement;
+    }
+
+    /** The button a user would press; package-private so a test can press it too. */
+    void scanRequested() {
+        scanDirectories();
+    }
+
+    /** One scan, identified. Nothing about a job may be decided from rows that are not backed by this. */
+    record LoadedScan(long generation, Path sourceRoot, Path destRoot, ScanOptions options,
+                      int sourceRows, int destinationRows) {
+    }
+
+    /** The scan currently on screen, or null when nothing on screen can be trusted for a job. */
+    LoadedScan scanInUse() {
+        return loadedScan;
+    }
+
+    /** The request the current job was started from, exactly as it was captured at Run. */
+    FileSyncEngine.JobRequest requestInUse() {
+        return pendingRequest;
+    }
+
+    /** Why Run is not allowed right now, or null when it is. Kept separate from the dialog so it is testable. */
+    String runRefusal() {
+        if (scanning) {
+            return "A scan is still running. Wait for it to finish - the lists on screen are the ones the job"
+                + " would use, and they are not complete yet.";
+        }
+        LoadedScan scan = loadedScan;
+        if (scan == null) {
+            return "Nothing has been scanned yet. Scan the two directories first: an empty selection means no"
+                + " files, not all files, and this program will not guess what you meant.";
+        }
+        Path source = userPath(sourcePathField.getText().trim());
+        Path dest = userPath(destPathField.getText().trim());
+        if (!java.util.Objects.equals(source, scan.sourceRoot())
+                || !java.util.Objects.equals(dest, scan.destRoot())) {
+            return "The directories changed since the scan (" + scan.sourceRoot() + " and " + scan.destRoot()
+                + " were read). The rows on screen belong to those directories. Scan again before running.";
+        }
+        ScanOptions options = currentScanOptions();
+        if (!java.util.Objects.equals(options, scan.options())) {
+            return "The scan options changed since the scan (" + scan.sourceRoot() + " and " + scan.destRoot()
+                + " were read with " + scan.options() + "). Files that the old options hid may be missing from"
+                + " the lists, and files they showed may not belong here. Scan again before running.";
+        }
+        return null;
     }
 
     private void scanDirectories() {
@@ -691,6 +770,8 @@ public final class FileVerifierView extends JPanel {
             destPathField.setText(destShown.toString());
         });
 
+        final long generation = ++scanGeneration;
+        inFlightScans.incrementAndGet();
         scanning = true;
         statusLabel.setText("Scanning files...");
         savePreferences();
@@ -698,36 +779,89 @@ public final class FileVerifierView extends JPanel {
         SwingWorker<ScanPair, Void> worker = new SwingWorker<>() {
             @Override
             protected ScanPair doInBackground() {
-                return new ScanPair(DirectoryScanner.scanFiles(source, options),
-                    DirectoryScanner.scanFiles(dest, options));
+                return new ScanPair(scanner.scan(source, options), scanner.scan(dest, options));
             }
 
             @Override
             protected void done() {
+                ScanPair result = null;
+                Exception failure = null;
                 try {
-                    ScanPair result = get();
-                    // A re-scan keeps the user's ticks by relative path; new rows start ticked.
-                    // A re-scan keeps the ticks the user actually removed; every other row -
-                    // including one that disappeared under a filter and has now come back - is ticked.
-                    applyScanResult(sourceModel, result.source(), untickedSource);
-                    applyScanResult(destModel, result.dest(), untickedDest);
-                    statusLabel.setText(String.format("Scanned: %d source files, %d destination files",
-                        result.source().files().size(), result.dest().files().size()));
-                    log(String.format("Scanned %d source files and %d destination files.",
-                        result.source().files().size(), result.dest().files().size()));
-                    logScanDetails(result.source(), "source");
-                    logScanDetails(result.dest(), "destination");
-                    scanOptionsStale = false;
+                    result = get();
+                } catch (Exception e) {
+                    failure = e;
+                }
+                try {
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    finishScan(generation, source, dest, options, result, untickedSource, untickedDest);
                 } catch (Exception e) {
                     String message = rootCauseMessage(e);
                     statusLabel.setText("Scan failed: " + message);
                     log("Scan failed: " + message);
+                    loadedScan = null;
                 } finally {
-                    scanning = false;
+                    // "Scanning" means a scan is reading the directories, so it follows the count of scans in
+                    // flight, not the fate of one of them: a discarded scan must not leave the window stuck
+                    // saying it is scanning, and a scan that finishes while a newer one is still queued must
+                    // not clear the flag either.
+                    scanning = inFlightScans.decrementAndGet() > 0;
                 }
             }
         };
         worker.execute();
+    }
+
+    /** Rows on screen, or null when the scan they came from is no longer the one that counts. */
+    int loadedSourceRows() {
+        return loadedScan == null ? 0 : loadedScan.sourceRows();
+    }
+
+    /**
+     * Put a finished scan's rows on screen - or throw them away.
+     *
+     * <p>A scan belongs to the window state it was started from. If the directories have been edited since, or
+     * another scan has been started, these rows belong to something else, and putting them on screen would list
+     * one directory's files under another directory's name. They are discarded, and the log says so: a silently
+     * dropped result is indistinguishable from a scan that found nothing.
+     *
+     * @param generation the scan number this result came from
+     */
+    void finishScan(long generation, Path source, Path dest, ScanOptions options, ScanPair result,
+            Set<String> untickedSource, Set<String> untickedDest) {
+        if (generation != scanGeneration) {
+            discardedScans.incrementAndGet();
+            log("A scan of " + source + " and " + dest + " finished after a newer scan had started; its"
+                + " results were discarded.");
+            return;
+        }
+        // A re-scan keeps the ticks the user actually removed; every other row - including one that
+        // disappeared under a filter and has now come back - is ticked.
+        applyScanResult(sourceModel, result.source(), untickedSource);
+        applyScanResult(destModel, result.dest(), untickedDest);
+        loadedScan = new LoadedScan(generation, source, dest, options,
+            result.source().files().size(), result.dest().files().size());
+        statusLabel.setText(String.format("Scanned: %d source files, %d destination files",
+            result.source().files().size(), result.dest().files().size()));
+        log(String.format("Scanned %d source files and %d destination files.",
+            result.source().files().size(), result.dest().files().size()));
+        logScanDetails(result.source(), "source");
+        logScanDetails(result.dest(), "destination");
+        scanOptionsStale = false;
+    }
+
+    /** The number a finished scan has to carry for its rows to be allowed on screen. */
+    long currentScanGeneration() {
+        return scanGeneration;
+    }
+
+    /** Scan the two directories a caller names, bypassing the fields - the seam the tests use. */
+    void applyFinishedScan(long generation, Path source, Path dest, ScanOptions options) {
+        finishScan(generation, source, dest, options,
+            new ScanPair(DirectoryScanner.scanFiles(source, options),
+                DirectoryScanner.scanFiles(dest, options)),
+            Set.of(), Set.of());
     }
 
     private void applyScanResult(FileListModel model, DirectoryScanner.ScanResult scan, Set<String> unticked) {
@@ -751,7 +885,7 @@ public final class FileVerifierView extends JPanel {
         }
     }
 
-    private record ScanPair(DirectoryScanner.ScanResult source, DirectoryScanner.ScanResult dest) {
+    record ScanPair(DirectoryScanner.ScanResult source, DirectoryScanner.ScanResult dest) {
     }
 
     private static String rootCauseMessage(Throwable t) {
@@ -915,19 +1049,73 @@ public final class FileVerifierView extends JPanel {
                 "Missing Paths", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        if (sourceModel.total() == 0 && destModel.total() == 0) {
-            JOptionPane.showMessageDialog(this, "Please scan directories first.",
-                "No Directories", JOptionPane.WARNING_MESSAGE);
+        runRequested();
+    }
+
+    /**
+     * Press Run.
+     *
+     * <p>The refusal check and the capture live here rather than in the button handler, so the button, the
+     * keyboard shortcut and the tests all go through the same rule.
+     */
+    void runRequested() {
+        String refusal = runRefusal();
+        if (refusal != null) {
+            reportRefusal(refusal);
             return;
         }
 
+        // One request, captured once. Everything after this point - the engine, the collision answer, the
+        // re-run after that answer - works from this object, so ticking a row while the job is running cannot
+        // change what the running job does, and a re-run is provably the same job.
         FileSyncEngine.Selection sourceSelection = selectionModelOf(sourceModel);
         FileSyncEngine.Selection destSelection = selectionModelOf(destModel);
         FileSyncEngine.JobRequest request = new FileSyncEngine.JobRequest(
-            userPath(sourcePath), userPath(destPath), currentJobType,
-            sourceSelection, destSelection, currentScanOptions(), extraCheck.isSelected(),
+            loadedScan.sourceRoot(), loadedScan.destRoot(), resolvedJobType(),
+            sourceSelection, destSelection, loadedScan.options(), extraCheck.isSelected(),
             dryRunCheck.isSelected());
+        pendingRequest = request;
 
+        startRequest(request);
+    }
+
+    /** Re-start the exact request that is already captured; this is what a collision answer belongs to. */
+    private void runCapturedRequest() {
+        if (engine.isRunning() || pendingRequest == null) {
+            return;
+        }
+        startRequest(pendingRequest);
+    }
+
+    /**
+     * Say, in the window and in the log, why a job was not started. The log is the part that does not need a
+     * display, and it is written first: a refusal that only existed in a dialog would be forgotten the moment
+     * it was closed.
+     */
+    private void reportRefusal(String refusal) {
+        log("Refused to start: " + refusal);
+        statusLabel.setText("Run refused - nothing scanned, or the scan no longer matches the window");
+        try {
+            JOptionPane.showMessageDialog(this, refusal, "Nothing Scanned", JOptionPane.WARNING_MESSAGE);
+        } catch (java.awt.HeadlessException noDisplay) {
+            // The words are already in the log; there is nowhere else to put them.
+        }
+    }
+
+    /** How many finished scans were thrown away rather than applied. */
+    int discardedScanCount() {
+        return discardedScans.get();
+    }
+
+    /** Whether a scan is in flight right now. */
+    boolean scanInProgress() {
+        return scanning;
+    }
+
+    /** Start the job described by {@code request} - which is the request that was captured when Run was
+     * pressed, never a newer one built from what the lists look like now.
+     */
+    private void startRequest(FileSyncEngine.JobRequest request) {
         // Preflight before touching anything, so the user gets one clear dialog instead of a
         // failed job in the log. The engine repeats every check itself.
         List<String> problems = engine.preflight(request);
@@ -940,8 +1128,8 @@ public final class FileVerifierView extends JPanel {
             return;
         }
 
-        int selectedSource = sourceSelection.selected().size();
-        if (selectedSource == 0 && destSelection.selected().isEmpty()) {
+        int selectedSource = request.sourceSelection().selected().size();
+        if (selectedSource == 0 && request.destinationSelection().selected().isEmpty()) {
             JOptionPane.showMessageDialog(this,
                 "Nothing is ticked in either list. An empty selection means no files, not all files.",
                 "Empty Selection", JOptionPane.WARNING_MESSAGE);
@@ -949,16 +1137,16 @@ public final class FileVerifierView extends JPanel {
         }
 
         savePreferences();
-        currentJobType = resolvedJobType();
+        currentJobType = request.jobType();
         launchedJobType = request.jobType();
         log("Starting " + currentJobType.describe() + "...");
         if (!currentJobType.verifies()) {
             log("Verification is OFF: files will be copied but not compared.");
         }
-        log("Source: " + sourcePath);
-        log("Destination: " + destPath);
+        log("Source: " + request.sourceDir());
+        log("Destination: " + request.destDir());
         log("Selected: " + selectedSource + " source file(s), "
-            + destSelection.selected().size() + " destination file(s)");
+            + request.destinationSelection().selected().size() + " destination file(s)");
         engine.setJobTimeoutMillis(jobTimeoutMillis());
         if (engine.jobTimeoutMillis() > 0) {
             log("Job timeout: " + engine.jobTimeoutMillis() + " ms");
@@ -1045,6 +1233,23 @@ public final class FileVerifierView extends JPanel {
         boolean accept(String question);
     }
 
+    /**
+     * The question the window asks before copying colliding names.
+     *
+     * <p>It names the files at risk, because that is what the answer is about, and it does not claim they are
+     * the same file: whether they collide is a property of the destination volume, which this program cannot
+     * see. Saying "these are identical and one will survive" would be a guess dressed up as a fact.
+     */
+    static String collisionCopyQuestion(List<String> collisions) {
+        List<String> shown = new ArrayList<>();
+        for (String pair : collisions) {
+            shown.add(RsyncNameCodec.forDisplay(pair));
+        }
+        return "Colliding names: " + String.join(", ", shown)
+            + ". They differ only by case or by how an accent is written, and the destination would hold one"
+            + " file where the list has more than one. Copy them anyway?";
+    }
+
     private CollisionConfirmation collisionConfirmation = question ->
         JOptionPane.showConfirmDialog(this, question + "\n\nCopy them anyway?", "Colliding Names",
             JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION;
@@ -1064,7 +1269,10 @@ public final class FileVerifierView extends JPanel {
         if (!collisionConfirmation.accept(question)) {
             return false;
         }
-        engine.acknowledgeCollisions(collisions);
+        // The engine refused a specific job; the answer belongs to that job and nothing else. Accepting here
+        // means the same request - same directories, same kind of job, same files - may go ahead. It does not
+        // make this window permissive about names in general.
+        engine.acceptDetectedCollisions();
         return true;
     }
 
@@ -1083,9 +1291,11 @@ public final class FileVerifierView extends JPanel {
         if (result.status() == FileSyncEngine.JobStatus.FAILED
                 && result.message().contains("colliding name(s)")) {
             List<String> detected = engine.collisionsDetectedByLastJob();
-            if (askAboutCollisions(detected, result.message())) {
-                log("Collision risk accepted for these names - starting the same job again.");
-                runJob();
+            if (!detected.isEmpty() && askAboutCollisions(detected, collisionCopyQuestion(detected))) {
+                log("Collision risk accepted for these names - starting that job again.");
+                // The request that was refused is the one that runs. Capturing a fresh one from the lists on
+                // screen would put files under an answer the user never saw.
+                runCapturedRequest();
                 return;
             }
         }
@@ -1249,13 +1459,20 @@ public final class FileVerifierView extends JPanel {
      * is a job whose selection came from somewhere else.
      */
     private void pathFieldChanged() {
-        if (pathEditSuppressed || !hasLoadedLists()) {
+        if (pathEditSuppressed) {
+            return;
+        }
+        // A scan that is reading the directory this field used to name is now reading the wrong place, so its
+        // results are no longer allowed on screen - whether or not there were rows here to clear.
+        scanGeneration++;
+        if (!hasLoadedLists()) {
             return;
         }
         sourceModel.clear();
         destModel.clear();
         showResults(null);
         lastJobResult = null;
+        loadedScan = null;
         updateWorkSetSummary();
         log("Path changed - the loaded lists were cleared, because they belong to the directory this field "
             + "used to name. Press Scan Files (Ctrl+S) to load the new one.");

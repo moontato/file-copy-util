@@ -527,3 +527,56 @@ and asked again, so one dialog is not a licence for the rest of the session; the
 wider, because it was typed for this run. Accepting is the caller saying they know and accept the overwrite; it
 is not a claim that the copy is safe, and the warning stays. A dry run reports the pairs without refusing, because a dry run writes
 nothing to overwrite.
+
+## 15. Which scan the window is answering for
+
+A copy is a write, so the set of files it writes has to be a fact the user can point at — not something assembled
+from whatever the tables show when a background thread gets around to asking.
+
+**A scan is identified.** `LoadedScan` records the scan number, the two directories, the `ScanOptions` it was read
+with, and its row counts. The ticked and unticked rows belong to that scan, not to the window in general.
+
+**Run is refused when the window is not answering for anything.** `runRefusal()` returns the reason;
+`runRequested()` writes it to the log as well as showing it — a refusal that only existed in a dialog is forgotten
+the moment the dialog is closed, and the log is the part that can be tested without a display.
+
+| Situation | Why a job would not mean what the user sees |
+|---|---|
+| no scan yet | an empty selection means no files; guessing "everything" is the opposite bug |
+| scan in flight | the lists are half-filled, so a job captured now follows part of a directory |
+| a path field edited | the rows belonged to the directory that used to be named in the field |
+| scan options edited | hidden files, ignored directories and link policy decide what is in the list |
+
+**One request, captured once.** Run builds a single immutable `JobRequest`: roots taken from the *scan* rather
+than from the fields, plus the ticks as they are at that instant. Everything after that — engine call, progress
+poller, results table, report export, collision answer — uses that object, and the collision re-run starts the
+same object, so "the job that ran is the job that was asked about" is a fact rather than a hope. Ticking rows
+during a job changes what the *next* job would do.
+
+**Stale scan results are discarded, and counted.** A result whose generation is not the current one is not
+applied, and the log says so. "Scanning" follows a count of scans in flight rather than the fate of one of them,
+so a discarded scan cannot leave the window stuck, and a finished one cannot clear the flag under a newer scan.
+
+**What this does not do.** The refusal is a check before the copy, not a lock. A directory re-pointed by another
+process between the check and `rsync` is the cross-process race already recorded under §14; cross-process locking
+was considered and declined.
+
+## 16. An acceptance answers one question
+
+§2.11's collision refusal is answered by a person, so the answer needs a scope. `CollisionAcceptance` holds the
+collision signature **and** a job identity: source directory, destination directory, job type, and the sorted
+relative names of the work set. An acceptance counts only when both match — or when the caller used the
+deliberately wider CLI waiver, `acceptAnyCollisions()`, which is what `--allow-collision-names` means.
+
+That rules out two confusions by construction:
+
+- the same relative pair under different roots — `/backup/src1/a.TXT` and `/backup/src2/a.TXT` are different
+  files, and a yes for one says nothing about the other;
+- the same roots with a different selection — a job asked to handle more files is a different job.
+
+The window's *Copy them anyway?* then re-runs **the request it had already captured**. A question asked about
+three names followed by a job started over thirty would be a lie about what was accepted.
+
+The question text is built by `collisionCopyQuestion(names)`: it names the files at risk and does not claim they
+are identical, because whether two names become one file is a property of the destination volume — a Windows
+share, an exFAT card, some macOS volumes — which this program cannot see.

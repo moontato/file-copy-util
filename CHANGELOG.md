@@ -140,6 +140,44 @@
   validates the exact commit its tag names before publishing anything, and refuses when the tag does not
   resolve or when the jar's own version does not match the tag. Third-party actions are pinned by commit SHA.
 
+### Added — the window decides from one scan, and an acceptance belongs to one job
+
+**Run works from one captured request, not from whatever the tables show at the moment a background thread gets
+to them.** A scan is now a thing with an identity — a number, the two directories, the options it was read with,
+and how many rows it produced — and the ticked rows belong to *that* scan. Pressing Run takes the current ticks
+once, puts them into one immutable request, and everything downstream (the engine, the collision question, the
+re-run after a collision answer) works from that object. Run refuses, in the log as well as in a dialog, when a
+job would not mean what the user can see:
+
+- nothing has been scanned — *an empty selection means no files, not all files, and this program will not guess
+  what you meant*;
+- a scan is still reading the directories;
+- a path field has been edited since the scan — the rows belonged to the directory that used to be named there,
+  so they are cleared with it;
+- the scan options have changed — the rows describe a different set of files, because hidden files, ignored
+  directories and symbolic links decide what a directory contains.
+
+A scan that finishes after a newer one has taken over is **discarded and counted**, with a line in the log: a
+quietly dropped result is indistinguishable from a scan that found nothing. "Scanning" now follows the number of
+scans in flight, so a discarded scan can neither leave the window stuck saying it is scanning nor clear the flag
+out from under a newer one.
+
+**A collision acceptance belongs to the job it was given for.** The acceptance carries the collision set *and* the
+job: the two directories, the kind of job, and the files that job was asked to handle. So the same relative pair
+under other roots (`src1/a.TXT` accepted does not cover `src2/a.TXT`), and the same roots with a bigger
+selection, are different questions and get asked again. The window's *Copy them anyway?* re-runs the request it
+had already captured, so the files that go are the files that were named in the question. The question itself
+names the files and does not claim they are identical — whether two names are one file is a property of the
+destination volume, which this program cannot see. `--allow-collision-names` stays the deliberately wider answer:
+it was typed for that run.
+
+Tests: `FileVerifierViewTest` grows to 21 — Run refused before any scan, refused during a scan, a typed path
+taking its list with it, changed scan options refusing Run until the scan is redone, a scan result carrying an
+older number discarded and said so, a running job keeping the ticks that were on screen when Run was pressed, and
+the collision acceptance being asked again for another directory pair and a larger selection. Checked by removing
+each guard: Run's authority check out — 5 of 21 fail; the stale-scan discard out — 2 fail; acceptance not bound to
+the job — 2 fail across the view, write-safety and collision suites.
+
 ## 1.4.0 — verification is a switch, not a mode
 
 - **The mode control is now `Copy | Verify only`, with a `Verify after copying` checkbox beside it**

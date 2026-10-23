@@ -3,9 +3,11 @@ package com.fileverifier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JList;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
@@ -19,8 +21,10 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.prefs.Preferences;
 import java.util.stream.Stream;
 
@@ -394,34 +398,392 @@ class FileVerifierViewTest {
         assertTrue(condition.getAsBoolean(), message);
     }
 
+
     /**
-     * The window's "Copy them anyway?" is about a named pair of names, not about the window. An answer given
-     * for one pair must not carry into a different pair in a later job - otherwise the dialog is a one-time
-     * inconvenience and the rule it enforces is a formality.
-     *
-     * <p>No dialog is shown to test this: the confirmation is a seam, which is exactly why it is one.
+     * An acceptance answers a question, and the question names the job as well as the names at risk. So an
+     * answer cannot be carried to another pair of directories, to a bigger selection, or to the next pair of
+     * names the engine finds.
      */
     @Test
-    void acceptingOneCollisionSetDoesNotWaiveTheNextOne() throws Exception {
+    void anAcceptedCollisionSetCoversTheJobItWasGivenForAndNoOther(@TempDir Path roots) throws Exception {
+        Path src1 = Files.createDirectories(roots.resolve("src1"));
+        Path src2 = Files.createDirectories(roots.resolve("src2"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        for (Path src : List.of(src1, src2)) {
+            TestSupport.write(src.resolve("a.TXT"), "upper");
+            TestSupport.write(src.resolve("a.txt"), "lower");
+            TestSupport.write(src.resolve("c.TXT"), "upper");
+            TestSupport.write(src.resolve("c.txt"), "lower");
+        }
         FileVerifierView view = build();
-        List<String> asked = new java.util.ArrayList<>();
+        List<String> asked = new ArrayList<>();
+        List<Boolean> answers = new ArrayList<>(List.of(false, true, false));
         view.setCollisionConfirmation(question -> {
             asked.add(question);
-            return asked.size() == 1;      // yes the first time, no afterwards
+            return answers.get(asked.size() - 1);
         });
 
-        assertTrue(view.askAboutCollisions(List.of("A.txt / a.txt"), "the first pair"),
-            "the first answer is accepted");
-        assertTrue(view.engineInUse().collisionAcceptanceCovers(List.of("A.txt / a.txt")),
-            "and it covers exactly those names");
-        assertFalse(view.engineInUse().collisionAcceptanceCovers(List.of("B.txt / b.txt")),
-            "same window, same engine, a different pair: the earlier yes must not reach this far");
+        typePaths(view, src1, dest);
+        view.scanRequested();
+        awaitScan(view);
+        Object sourceModel = modelOf(view, "sourceModel");
+        SwingUtilities.invokeAndWait(() -> tickOnly(sourceModel, List.of("a.TXT", "a.txt")));
+        awaitEventQueue();
+        java.nio.file.Files.createDirectories(roots.resolve("fake"));
+        view.engineInUse().useRsync(TestSupport.fakeRsync(roots.resolve("fake"), "", 0).toString());
 
-        assertFalse(view.askAboutCollisions(List.of("B.txt / b.txt"), "the second pair"),
-            "the second pair is asked about again, and this time the answer is no");
-        assertFalse(view.engineInUse().collisionAcceptanceCovers(List.of("B.txt / b.txt")));
-        assertEquals(List.of("the first pair", "the second pair"), asked,
-            "two questions asked, not one question and a saved answer");
+        view.runRequested();
+        waitUntil(() -> asked.size() >= 1, "the job was refused and the window asked about it");
+        awaitEventQueue();
+        assertEquals(1, asked.size(), "the window asked once, and only once: " + logText(view));
+        assertFalse(view.engineInUse().isRunning(), "refusing to answer really stopped the job");
+        assertTrue(asked.get(0).contains("a.TXT"),
+            "the question names the files at risk: " + asked.get(0));
+        assertFalse(asked.get(0).toLowerCase().contains("identical"),
+            "and it does not claim they are the same file: " + asked.get(0));
+
+        // Nothing has been accepted yet: not for this job, not for any other.
+        FileSyncEngine engine = view.engineInUse();
+        String thisJob = FileSyncEngine.jobIdentityFor(view.requestInUse(), List.of("a.TXT", "a.txt"));
+        assertFalse(engine.collisionAcceptanceCovers(thisJob, engine.collisionsDetectedByLastJob()),
+            "a question answered no leaves nothing on record");
+
+        // The same job again, this time answered yes. It is asked again rather than being waved through from
+        // the previous refusal, and the answer belongs to this request.
+        view.runRequested();
+        waitUntil(() -> asked.size() >= 2,
+            "the same job is asked about again rather than waved through on a saved answer");
+        waitUntil(() -> logNow(view).contains("JOB COMPLETED"), "the answered job finished");
+        awaitEventQueue();
+        assertEquals(2, asked.size(), "the same job, answered no and then yes: asked again, not remembered");
+        assertTrue(logText(view).contains("JOB COMPLETED"),
+            "and the answered job did go ahead: " + logText(view));
+
+        assertTrue(engine.collisionAcceptanceCovers(thisJob, engine.collisionsDetectedByLastJob()),
+            "the answer covers the job it was given for");
+
+        // The same two relative names under different roots: different files, so a different question, and the
+        // yes does not reach them.
+        FileSyncEngine.JobRequest elsewhere = TestSupport.request(src2, dest,
+            FileSyncEngine.JobType.COPY_ONLY,
+            new FileSyncEngine.Selection(Set.of("a.TXT", "a.txt"), Set.of("a.TXT", "a.txt")),
+            new FileSyncEngine.Selection(Set.of(), Set.of()));
+        assertFalse(engine.collisionAcceptanceCovers(
+            FileSyncEngine.jobIdentityFor(elsewhere, List.of("a.TXT", "a.txt")),
+            engine.collisionsDetectedByLastJob()),
+            "the same relative names in another directory are another question, asked again");
+
+        // The same roots with more files in the selection: a different job, so a different question.
+        FileSyncEngine.JobRequest grown = TestSupport.request(src1, dest,
+            FileSyncEngine.JobType.COPY_ONLY,
+            new FileSyncEngine.Selection(Set.of("a.TXT", "a.txt", "c.TXT", "c.txt"),
+                Set.of("a.TXT", "a.txt", "c.TXT", "c.txt")),
+            new FileSyncEngine.Selection(Set.of(), Set.of()));
+        assertFalse(engine.collisionAcceptanceCovers(
+            FileSyncEngine.jobIdentityFor(grown, List.of("a.TXT", "a.txt", "c.TXT", "c.txt")),
+            engine.collisionsDetectedByLastJob()),
+            "a job asked to handle more files is another question again");
+
+        // The next pair of colliding names is a fresh question, in the same window, for the same kind of job.
+        SwingUtilities.invokeAndWait(() -> tickOnly(sourceModel, List.of("c.TXT", "c.txt")));
+        awaitEventQueue();
+        view.runRequested();
+        waitUntil(() -> asked.size() >= 3, "the second collision set was refused and asked about");
+        awaitEventQueue();
+        assertEquals(3, asked.size(), "the next collision set is asked about on its own merits");
+        assertTrue(asked.get(2).contains("c.TXT"), "and it names those: " + asked.get(2));
+        assertFalse(view.engineInUse().isRunning(), "and the earlier yes did not carry into it");
+        view.engineInUse().close();
+    }
+
+    /**
+     * Run means something only about the lists the user can see. If nothing has been read, the selection is
+     * empty, and an empty selection is no files - never "everything, hopefully".
+     */
+    @Test
+    void runIsRefusedUntilTheDirectoriesHaveBeenScanned(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+
+        typePaths(view, src, dest);
+        assertEquals("Nothing has been scanned yet. Scan the two directories first: an empty selection means no"
+            + " files, not all files, and this program will not guess what you meant.", view.runRefusal());
+        assertEquals(0, view.loadedSourceRows());
+        view.runRequested();
+        assertEquals(null, view.requestInUse(), "and Run really did refuse: nothing was started");
+        assertTrue(logText(view).contains("Refused to start"),
+            "and the refusal is in the log, not only in a dialog: " + logText(view));
+
+        view.scanRequested();
+        awaitScan(view);
+        assertEquals(null, view.runRefusal(), "a scan of the two directories named now is enough");
+        assertEquals(1, view.loadedSourceRows());
+        view.engineInUse().close();
+    }
+
+    /**
+     * While a scan is reading the directories, the lists on screen are half-built. A job captured now would
+     * run against a set of files nobody chose.
+     */
+    @Test
+    void aScanStillUnderwayCannotBeRunAgainst(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        typePaths(view, src, dest);
+
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        view.setScannerForTesting((root, options) -> {
+            try {
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return DirectoryScanner.scanFiles(root, options);
+        });
+
+        view.scanRequested();
+        assertTrue(view.scanInProgress(), "the scan is reading the directories");
+        assertTrue(view.runRefusal() != null && view.runRefusal().contains("still running"),
+            "the lists are not complete, so a job started now would use half of them: " + view.runRefusal());
+        view.runRequested();
+        assertEquals(null, view.requestInUse(), "and Run really refused: no request was captured");
+        assertFalse(view.engineInUse().isRunning(), "and no job was started anyway");
+        release.countDown();
+        awaitScan(view);
+        assertFalse(view.engineInUse().isRunning());
+        view.engineInUse().close();
+    }
+
+    /**
+     * The user typed a new directory into a field. The rows underneath belonged to the directory that used to
+     * be named there, so they are gone - and Run has nothing to work from until the new one is scanned.
+     */
+    @Test
+    void editingATypedPathTakesTheLoadedListsWithIt(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path first = Files.createDirectories(roots.resolve("first"));
+        Path second = Files.createDirectories(roots.resolve("second"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(first.resolve("old.txt"), "1");
+        typePaths(view, first, dest);
+        view.scanRequested();
+        awaitScan(view);
+        assertEquals(1, view.loadedSourceRows());
+
+        JTextField sourceField = (JTextField) field(view, "sourcePathField");
+        SwingUtilities.invokeAndWait(() -> sourceField.setText(second.toString()));
+        awaitEventQueue();
+        assertEquals(0, view.loadedSourceRows(), "the list went with the directory it came from");
+        assertEquals("Nothing has been scanned yet. Scan the two directories first: an empty selection means no"
+            + " files, not all files, and this program will not guess what you meant.", view.runRefusal(),
+            "the list belonged to the directory that used to be named, so there is nothing to run from");
+        view.runRequested();
+        assertEquals(null, view.requestInUse(),
+            "and Run really refused rather than running a dead list against a new directory");
+        view.engineInUse().close();
+    }
+
+    /**
+     * The scan options decide which files the lists can hold. Change them and the rows on screen describe a
+     * different set of files, so Run is refused until the scan is redone.
+     */
+    @Test
+    void changingTheScanOptionsAfterAScanRefusesTheRunUntilTheScanIsRedone(@TempDir Path roots)
+            throws Exception {
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        Files.createSymbolicLink(src.resolve("link.txt"), src.resolve("a.txt"));
+        typePaths(view, src, dest);
+        view.scanRequested();
+        awaitScan(view);
+        assertEquals(1, view.loadedSourceRows(), "the link was skipped, as the options said");
+        assertEquals(null, view.runRefusal(), "the lists match the options on screen");
+
+        JComboBox<?> policyCombo = (JComboBox<?>) field(view, "symlinkCombo");
+        SwingUtilities.invokeAndWait(() -> policyCombo.setSelectedItem(ScanOptions.SymlinkPolicy.FOLLOW));
+        awaitEventQueue();
+        assertTrue(view.runRefusal().startsWith("The scan options changed since the scan"),
+            view.runRefusal());
+        view.runRequested();
+        assertEquals(null, view.requestInUse(),
+            "and Run really refused: the job would have covered files that are not listed");
+
+        view.scanRequested();
+        awaitScan(view);
+        assertEquals(2, view.loadedSourceRows(), "the redo sees the link");
+        assertEquals(null, view.runRefusal(), "and now the lists and the options agree again");
+        view.engineInUse().close();
+    }
+
+    /**
+     * A scan belongs to the window state it was started from. A result carrying an older scan number must not
+     * replace the rows on screen: that would list one directory's files under another directory's name, and a
+     * job started from them would write the wrong files.
+     */
+    @Test
+    void aScanResultCarryingAnOlderScanNumberIsDiscardedAndSaidSo(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path first = Files.createDirectories(roots.resolve("first"));
+        Path second = Files.createDirectories(roots.resolve("second"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(first.resolve("old.txt"), "1");
+        TestSupport.write(second.resolve("new.txt"), "2");
+
+        ScanOptions options = ScanOptions.parse("", true, ScanOptions.SymlinkPolicy.SKIP);
+        typePaths(view, first, dest);
+        long generation = view.currentScanGeneration();
+        view.applyFinishedScan(generation, first, dest, options);
+        assertEquals(1, view.loadedSourceRows());
+        assertEquals(List.of("old.txt"), relPaths(view, "sourceModel"));
+
+        // The user moves on to another directory. The list goes with the directory it belonged to, and a scan
+        // carrying the old number is not allowed to bring it back: that would relabel first/'s files as
+        // second/'s.
+        typePaths(view, second, dest);
+        assertEquals(List.of(), relPaths(view, "sourceModel"), "leaving the directory took its list with it");
+        view.applyFinishedScan(generation, first, dest, options);
+        assertEquals(1, view.discardedScanCount(), "the older result was thrown away, not applied");
+        assertEquals(List.of(), relPaths(view, "sourceModel"),
+            "and the stale rows did not reappear under the new directory's name");
+        assertTrue(logText(view).contains("discarded"),
+            "and the window said what happened to it: " + logText(view));
+
+        view.applyFinishedScan(view.currentScanGeneration(), second, dest, options);
+        assertEquals(List.of("new.txt"), relPaths(view, "sourceModel"), "the current scan's rows do land");
+        assertEquals(1, view.discardedScanCount(), "one discarded, not two");
+        view.engineInUse().close();
+    }
+
+    /**
+     * Ticking and unticking belongs to the window; the job belongs to the request that was captured when Run
+     * was pressed. Changing a tick mid-job changes what the next job would do, not this one.
+     */
+    @Test
+    void aRunningJobKeepsTheSelectionThatWasTickedWhenRunWasPressed(@TempDir Path roots) throws Exception {
+        TestSupport.assertNoProcessesRunning("rsync", "before");
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        TestSupport.write(src.resolve("b.txt"), "2");
+        typePaths(view, src, dest);
+        view.scanRequested();
+        awaitScan(view);
+
+        java.nio.file.Files.createDirectories(roots.resolve("fake"));
+        Path fake = TestSupport.hangingFakeRsync(roots.resolve("fake"), "", "");
+        FileSyncEngine engine = view.engineInUse();
+        engine.useRsync(fake.toString());
+
+        view.runRequested();
+        awaitEventQueue();
+        FileSyncEngine.JobRequest captured = view.requestInUse();
+        assertNotNull(captured, "Run captured one request");
+        assertEquals(Set.copyOf(List.of("a.txt", "b.txt")), captured.sourceSelection().selected(),
+            "Run captured the ticks that were on screen at that moment");
+
+        Object untickEverything = modelOf(view, "sourceModel");
+        SwingUtilities.invokeAndWait(() -> tickOnly(untickEverything, List.<String>of()));
+        awaitEventQueue();
+
+        assertEquals(Set.copyOf(List.of("a.txt", "b.txt")), view.requestInUse().sourceSelection().selected(),
+            "the job in flight is still the job that was asked for, ticks and all");
+        engine.cancel();
+        awaitEventQueue();
+        TestSupport.assertNoProcessesRunning("rsync", "after cancelling");
+        engine.close();
+    }
+
+    /** The log as it stands, for a wait condition that cannot throw. */
+    private static String logNow(FileVerifierView view) {
+        try {
+            return logText(view);
+        } catch (Exception shouldNotHappen) {
+            return "";
+        }
+    }
+
+    private static String logText(FileVerifierView view) throws Exception {
+        JTextArea area = (JTextArea) field(view, "logArea");
+        return area.getText();
+    }
+
+    private static Object modelOf(FileVerifierView view, String name) throws Exception {
+        return field(view, name);
+    }
+
+    /** Tick exactly the named rows in a list model, leaving the rest unticked. */
+    @SuppressWarnings("unchecked")
+    private static void tickOnly(Object model, List<String> names) {
+        try {
+            java.lang.reflect.Method all = model.getClass().getDeclaredMethod("all");
+            all.setAccessible(true);
+            java.lang.reflect.Method toggle = model.getClass().getDeclaredMethod("toggle", int.class);
+            toggle.setAccessible(true);
+            java.lang.reflect.Method unticked = model.getClass().getDeclaredMethod("untickedPaths");
+            unticked.setAccessible(true);
+            List<?> rows = (List<?>) all.invoke(model);
+            Set<String> currentlyUnticked = (Set<String>) unticked.invoke(model);
+            for (int i = 0; i < rows.size(); i++) {
+                java.lang.reflect.Method entry = rows.get(i).getClass().getDeclaredMethod("entry");
+                entry.setAccessible(true);
+                String rel = ((FileEntry) entry.invoke(rows.get(i))).relPath();
+                boolean want = names.contains(rel);
+                boolean isTicked = !currentlyUnticked.contains(rel);
+                if (want != isTicked) {
+                    toggle.invoke(model, i);
+                }
+            }
+        } catch (ReflectiveOperationException couldNot) {
+            throw new IllegalStateException(couldNot);
+        }
+    }
+
+    /** The relative paths a list model is holding, sorted. */
+    private static List<String> relPaths(FileVerifierView view, String modelName) throws Exception {
+        Object model = field(view, modelName);
+        java.lang.reflect.Method all = model.getClass().getDeclaredMethod("all");
+        all.setAccessible(true);
+        List<String> names = new ArrayList<>();
+        for (Object row : (List<?>) all.invoke(model)) {
+            java.lang.reflect.Method entry = row.getClass().getDeclaredMethod("entry");
+            entry.setAccessible(true);
+            names.add(((FileEntry) entry.invoke(row)).relPath());
+        }
+        java.util.Collections.sort(names);
+        return names;
+    }
+
+    /** Write the two path fields the way typing does, so the window's own change rules run. */
+    private static void typePaths(FileVerifierView view, Path source, Path dest) throws Exception {
+        JTextField sourceField = (JTextField) field(view, "sourcePathField");
+        JTextField destField = (JTextField) field(view, "destPathField");
+        SwingUtilities.invokeAndWait(() -> {
+            sourceField.setText(source.toString());
+            destField.setText(dest.toString());
+        });
+        awaitEventQueue();
+    }
+
+    private static void awaitScan(FileVerifierView view) throws Exception {
+        for (int i = 0; i < 600 && view.scanInProgress(); i++) {
+            Thread.sleep(25);
+            awaitEventQueue();
+        }
+        assertFalse(view.scanInProgress(), "the scan did not finish");
+        awaitEventQueue();
+    }
+
+    private static void awaitEventQueue() throws Exception {
+        java.util.concurrent.Semaphore done = new java.util.concurrent.Semaphore(1);
+        SwingUtilities.invokeAndWait(done::release);
+        done.acquire();
     }
 
     private static FileVerifierView build() throws Exception {

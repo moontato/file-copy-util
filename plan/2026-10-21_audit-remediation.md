@@ -1,14 +1,16 @@
-# Audit remediation plan — File Copy Util (revision 4)
+# Audit remediation plan — File Copy Util (revision 7)
 
 **Date:** 2026-10-21, status updated 2026-10-22
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 6. Phase 0a, Phase 0b, Phase 1 and **Phase 2 (write safety, including the five corrections from your
-source review of `facd1c9`/`7efc525`)** are implemented and green on this machine, along with the part of Phase 4
-that gates 1.5.0 (per-file transfer records for interrupted copy jobs) and the matrix-isolation follow-up. Phase 0b's
-workflows are written and reviewed but **have not been run on GitHub**, so its gate is specified rather than
-demonstrated. Matrix status is qualified as agreed: local evidence for 3.1.3 and 3.4.0, GitHub coverage pending for
-all four and local for 3.2.7/3.3.0. Next: Phase 3 (selection authority), only on go-ahead. Branch `remediation/audit`; `main` is held at the approved baseline commit
-`0069285`, `pom.xml` is still 1.4.0, and no tag, push or release is authorised.
+**Status:** approved and under way, revision 7. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
+report targets) and **Phase 3 (selection authority, with collision acceptance bound to the job)** are implemented and
+green on this machine, along with the part of Phase 4 that gates 1.5.0 (per-file transfer records for interrupted copy
+jobs) and the matrix-isolation follow-up. Phase 0b's workflows are written and reviewed but **have not been run on
+GitHub**, so its gate is specified rather than demonstrated. Matrix status is qualified as agreed: local evidence for
+3.1.3 and 3.4.0, GitHub coverage pending for all four and local for 3.2.7/3.3.0. Next: the Phase 4 remainder, only on
+go-ahead. Branch `remediation/audit`; `main` is held at the approved baseline commit `0069285`, `pom.xml` is still
+1.4.0, and no tag, push or release is authorised.
 
 ## Revision log (v4, from your second review)
 
@@ -308,7 +310,9 @@ Identity stays raw everywhere. Log lines, table cells and dialogs escape control
 
 ### 2.11 Collisions (A6)
 
-The collision report is computed before `writeFilesFrom` and surfaced as a pre-transfer event, so it appears before any byte moves — **stated as notification, not prevention**. To *start* a copy whose work set contains names that would collide (case-fold/NFC), the job additionally requires `--allow-collisions` (CLI) or a GUI confirmation. The message says the names may collide on some filesystems and that proceeding is not proof the transfer is safe. Read-only verification never needs the acknowledgement.
+The collision report is computed before `writeFilesFrom` and surfaced as a pre-transfer event, so it appears before any byte moves — **stated as notification, not prevention**. To *start* a copy whose work set contains names that would collide (case-fold/NFC), the job additionally requires `--allow-collision-names` (CLI) or a confirmation in the window. The message says the names may collide on some filesystems and that proceeding is not proof the transfer is safe. Read-only verification never needs the acknowledgement.
+
+**The acceptance belongs to one job** (Phase 3). `CollisionAcceptance` is the collision signature *plus* a job identity: source directory, destination directory, job type and the sorted relative names of the work set. An acceptance counts only when both the names and the job match, so the same relative pair under other roots, and the same roots with a different selection, are different questions and are asked again. The window answers by calling `acceptDetectedCollisions()`, which grants exactly what the last job refused, and then re-runs **the request it had already captured** — not a fresh request assembled from the lists as they now stand. `acceptAnyCollisions()` remains the CLI's deliberately wider waiver (`--allow-collision-names` was typed for that run). The question text is `FileVerifierView.collisionCopyQuestion(names)`: it names the files and does not claim they are identical, because whether two names are one file is a property of the destination volume.
 
 ### 2.12 `--strict` (A8)
 
@@ -463,10 +467,77 @@ something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean veri
 action SHAs, checksum-pinned tarballs), but **no GitHub Actions run has been executed or observed** - that
 needs an authorised push. Until then the validation gate is *specified*, not *demonstrated*.
 
+**Phase 2 closeout (2026-10-22)** — committed as `6ff14f3`, then completed by Phase 3
+
+| Item | Outcome |
+| --- | --- |
+| 1. publication that cannot replace | The `Files.createFile` + `Files.copy(..., REPLACE_EXISTING)` fallback is **gone**: a filesystem without hard links gets a refusal naming the reason, not a weaker publication. Content is staged by `Files.createTempFile` in the report's own directory; publication is `Files.createLink`, which cannot take a name that appeared in the interval; `justBeforePublishing` and `justAfterPublication` seams and an injectable `Publication` make the interval testable. Javadoc corrected: staging is the report's directory, not the system temporary directory |
+| 2. two spellings, one target | `--csv`/`--json` compare the **resolved directory plus the final name** (`ReportExporter.publicationName`) with `Files.isSameFile` as a second opinion, so `reports/real/result` and `reports/alias/result` (alias a symlink) are one target, refused before the copy; `publicationName` also resolves the directory portion of the report path, so a report path whose directory link leaves both trees is judged where it lands, and one that lands inside them is still held to the in-tree rule. Publication-time validation stays: a path that changes during the run is caught at publication (exit 4) |
+| 3. collision acceptance lifetime | Carried into Phase 3 and done there (see below) |
+
+Fixtures added with the closeout: `aFilesystemThatCannotHardLinkIsRefusedRatherThanGivenAWeakerPromise`,
+`aReportNameAppearsAlreadyHoldingTheWholeReport`,
+`aReportReplacedAfterPublicationIsLeftAloneBecauseOnlyOurOwnTemporaryIsRemoved`,
+`twoSpellingsOfOneReportPathThroughALinkedDirectoryAreRefusedBeforeTheCopy`,
+`aReportPathInsideALinkedDirectoryIsJudgedByWhereItActuallyLands`. Publication reverted to a
+replace-allowing copy: 3 failures; the alias check reverted to lexical comparison: 2 failures; report directory not
+resolved: 1 failure. Validation: **232 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0, `-Werror` clean.
+
+**Phase 3 — selection authority (2026-10-22)**
+
+*The window decides from one scan, and an acceptance belongs to one job.*
+
+- **A scan has an identity.** `LoadedScan` = generation number + source root + destination root + `ScanOptions` +
+  row counts. The live ticks belong to that scan. `scanDirectories()` bumps the generation, and a completion
+  carrying an older number is **discarded** by `finishScan(...)`, counted in `discardedScanCount()`, and logged - a
+  silently dropped result is indistinguishable from a scan that found nothing.
+- **Run is refused when the window is not answering for anything.** `runRefusal()` returns the reason;
+  `runRequested()` logs it as well as showing it (the log is the part testable without a display, and the part that
+  survives the dialog being closed). Four reasons: no scan yet; a scan in flight; a path field edited since the
+  scan (which clears the loaded scan - the rows belonged to the directory that used to be named there); scan
+  options changed since the scan.
+- **One immutable request per job.** Run builds a single `JobRequest` with roots taken from the *scan* and the
+  ticks as of that instant; `startRequest(request)` and everything downstream (poller, results, report export,
+  collision answer) use it. Ticking rows during a job does not change the job in flight.
+- **"Scanning" follows the count of scans in flight** (`inFlightScans`), so a discarded scan cannot leave the
+  window stuck saying it is scanning, and cannot clear the flag under a newer scan that has not finished.
+- **Collision acceptance is bound to the job it was granted for** (§2.11 above): `CollisionAcceptance(jobIdentity,
+  collisionSignature)`, `jobIdentity` = roots + job type + sorted work-set names; `acceptDetectedCollisions()`
+  grants exactly the last refusal; `lastCollisionRefusal` records it. The window re-runs the captured request.
+
+Fixtures (`FileVerifierViewTest`, now 21 tests): `runIsRefusedUntilTheDirectoriesHaveBeenScanned`,
+`aScanStillUnderwayCannotBeRunAgainst`, `editingATypedPathTakesTheLoadedListsWithIt`,
+`changingTheScanOptionsAfterAScanRefusesTheRunUntilTheScanIsRedone`,
+`aScanResultCarryingAnOlderScanNumberIsDiscardedAndSaidSo`,
+`aRunningJobKeepsTheSelectionThatWasTickedWhenRunWasPressed`,
+`anAcceptedCollisionSetCoversTheJobItWasGivenForAndNoOther` (asked, answered no, refused; asked again for the same
+job, answered yes, completed; the same relative pair under **other roots** and a **larger selection** are still
+refused; the next pair `c.TXT`/`c.txt` is asked about again). New seams: `FileVerifierView.Scanner`
+(`setScannerForTesting`), `applyFinishedScan(...)`, `currentScanGeneration()`, `runRequested()`, `requestInUse()`,
+`scanInUse()`, `discardedScanCount()`, `loadedSourceRows()`, `engineInUse()`; `FileSyncEngine.jobIdentityFor(...)`,
+`collisionAcceptanceCovers(jobIdentity, names)`, `acceptDetectedCollisions()`.
+
+Sabotage evidence: Run's authority check removed - 5 of 21 fail; the stale-scan discard disabled - 2 fail;
+acceptance not bound to the job - 2 fail across `FileVerifierViewTest`, `WriteSafetyTest` and
+`CollisionAndRaceTest`. Restoring each guard returns green; the whole view suite ran green three times in a row
+(it is the suite's most timing-sensitive file, so it was repeated deliberately).
+
+**Limitations Phase 3 does not remove, on purpose:** the check is *before* the copy, not a lock - a directory
+re-pointed by another process between the check and `rsync` is the same cross-process race already recorded for
+containment, and cross-process locking stays declined. A scan is not re-run automatically, so the remedy for every
+refusal is to press Scan Files; that is a decision you approved. The GUI confirmation and the in-tree report
+confirmation are exercised through seams, not as rendered dialogs (no display in this container).
+
+**Suite now:** **238 tests, 0 failures, 0 errors, 1 skipped** (the `FCU_RSYNC`-specific test, which only means
+something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean verify` succeeds.
+
+**Still open from Phase 0b:** the workflows are written and reviewed statically (jobs, step wiring, pinned
+action SHAs, checksum-pinned tarballs), but **no GitHub Actions run has been executed or observed** - that
+needs an authorised push. Until then the validation gate is *specified*, not *demonstrated*.
+
 **Next, in order**
 
-1. Phase 3: selection authority - immutable scan identity versus mutable live selection, one `JobRequest`
-   captured at Run, refuse a Run whose scan does not match.
+1. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
 2. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
    single large hash, channel workers that cannot block termination, and the completion-signal decision
    (`%b` start header vs `%b` completion line) confirmed on 3.2.7 and 3.3.0 through the matrix.

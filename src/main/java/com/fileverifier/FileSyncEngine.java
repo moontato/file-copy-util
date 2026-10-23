@@ -319,14 +319,25 @@ public class FileSyncEngine implements AutoCloseable {
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
     private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
     private volatile boolean closed;
-    /** §2.11: whether the caller has accepted the collision risk. A copy without it is refused. */
-    /** &#167;2.11: the collision set somebody has accepted, as a signature. A different set is a different
-     * question and needs a fresh answer. */
-    private volatile String acceptedCollisionSet;
+    /** The one collision answer on record: that set, for that job. */
+    private volatile CollisionAcceptance collisionAcceptance;
+    /** What the last job refused, so an answer can be bound to it and to nothing else. */
+    private volatile CollisionAcceptance lastCollisionRefusal;
     /** The CLI convenience: {@code --allow-collision-names} was typed for this run, so it covers this run. */
     private volatile boolean acceptAnyCollisions;
     /** What the last job actually found, so the front end can ask about <i>that</i> set and not a guess. */
     private volatile List<String> lastDetectedCollisions = List.of();
+
+    /**
+     * An acceptance and the job it belongs to. The job is named by the two directories, the kind of job, and
+     * the files it was asked to handle - so the same relative pair under other roots, or a different selection
+     * under these roots, is a different question and gets asked again.
+     */
+    private record CollisionAcceptance(String jobIdentity, String collisionSignature) {
+    }
+
+    /** The identity an acceptance is not tied to any one job - for a caller that accepts by name. */
+    private static final String ANY_JOB = "*";
     private final AtomicReference<Process> liveProcess = new AtomicReference<>();
     /**
      * Every process the live rsync had spawned, snapshotted while the parent was still alive. A local
@@ -686,7 +697,19 @@ public class FileSyncEngine implements AutoCloseable {
      * file on the destination volume and accepts that one overwrites the other.
      */
     public void acknowledgeCollisions(List<String> collisions) {
-        acceptedCollisionSet = collisionSignature(collisions);
+        collisionAcceptance = new CollisionAcceptance(ANY_JOB, collisionSignature(collisions));
+    }
+
+    /**
+     * Accept exactly what the last job refused: that collision set, for that job.
+     *
+     * <p>This is what the window does when somebody answers "Copy them anyway?". Nothing is remembered about
+     * the caller being agreeable in general. The acceptance names the directories, the kind of job and the
+     * files it was about, and it stops meaning anything as soon as any of those change - which is why the
+     * window re-runs the request it had already captured rather than a fresh one.
+     */
+    public void acceptDetectedCollisions() {
+        collisionAcceptance = lastCollisionRefusal;
     }
 
     /** Accept whatever the job turns out to find. Only the CLI uses this; the window names the set. */
@@ -695,7 +718,7 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     public boolean collisionsAcknowledged() {
-        return acceptAnyCollisions || acceptedCollisionSet != null;
+        return acceptAnyCollisions || collisionAcceptance != null;
     }
 
     /**
@@ -703,9 +726,27 @@ public class FileSyncEngine implements AutoCloseable {
      * and the same two names in a different pair, are different questions: an acceptance granted for one
      * cannot answer the other.
      */
-    private boolean collisionsAcceptedFor(List<String> collisions) {
-        return acceptAnyCollisions || (acceptedCollisionSet != null
-                && acceptedCollisionSet.equals(collisionSignature(collisions)));
+    private boolean collisionsAcceptedFor(String jobIdentity, List<String> collisions) {
+        if (acceptAnyCollisions) {
+            return true;
+        }
+        CollisionAcceptance accepted = collisionAcceptance;
+        if (accepted == null || !accepted.collisionSignature().equals(collisionSignature(collisions))) {
+            return false;
+        }
+        return ANY_JOB.equals(accepted.jobIdentity()) || accepted.jobIdentity().equals(jobIdentity);
+    }
+
+    /**
+     * Which job this is, for the purpose of an acceptance: the two directories, the kind of job, and the
+     * files it was asked to handle. Anything that changes what would be written changes the identity, so an
+     * acceptance cannot be carried from one job to the next.
+     */
+    private static String jobIdentity(JobRequest request, Collection<String> workSetNames) {
+        List<String> names = new ArrayList<>(workSetNames);
+        Collections.sort(names);
+        return request.sourceDir() + "\u0001" + request.destDir() + "\u0001" + request.jobType()
+                + "\u0001" + String.join("\u0002", names);
     }
 
     private static String collisionSignature(List<String> collisions) {
@@ -717,9 +758,14 @@ public class FileSyncEngine implements AutoCloseable {
         return List.copyOf(lastDetectedCollisions);
     }
 
-    /** Test window into the rule: does the acceptance on record cover this set? */
-    boolean collisionAcceptanceCovers(List<String> collisions) {
-        return collisionsAcceptedFor(collisions);
+    /** Test window into the rule: does the acceptance on record cover this set for this job? */
+    boolean collisionAcceptanceCovers(String jobIdentity, List<String> collisions) {
+        return collisionsAcceptedFor(jobIdentity, collisions);
+    }
+
+    /** The identity an acceptance would have to match to cover a job like this one. */
+    static String jobIdentityFor(JobRequest request, Collection<String> workSetNames) {
+        return jobIdentity(request, workSetNames);
     }
 
     public String rsyncBinaryInUse() {
@@ -944,11 +990,14 @@ public class FileSyncEngine implements AutoCloseable {
         // mismatch as if the copy had been honest.
         List<String> collisions = collidingNames(workSet);
         lastDetectedCollisions = List.copyOf(collisions);
+        String identity = jobIdentity(request, namesOf(workSet));
+        lastCollisionRefusal = new CollisionAcceptance(identity, collisionSignature(collisions));
         if (!collisions.isEmpty()) {
             // §2.11. Two of these names are one file on a case-insensitive or normalising destination, and
             // the later transfer overwrites the earlier one: a copy is a write, so it needs the caller to
             // have accepted that. Verification changes nothing, so it keeps warning without refusing.
-            if (request.jobType().copies() && !request.dryRun() && !collisionsAcceptedFor(collisions)) {
+            if (request.jobType().copies() && !request.dryRun()
+                    && !collisionsAcceptedFor(identity, collisions)) {
                 String problem = "Refused: " + collisions.size() + " colliding name(s) in the work set: "
                         + describeNames(collisions) + ". On a case-insensitive or normalising destination"
                         + " these are the same file, and copying one over the other is what the job would do."
@@ -1974,6 +2023,15 @@ public class FileSyncEngine implements AutoCloseable {
      * Groups of work-set paths that would name the same file on a case-insensitive or normalising
      * destination. A group is only a collision when it holds more than one distinct path.
      */
+    /** The relative paths of a work set, in the order the identity wants them. */
+    private static Collection<String> namesOf(Collection<FileEntry> entries) {
+        List<String> names = new ArrayList<>();
+        for (FileEntry entry : entries) {
+            names.add(entry.relPath());
+        }
+        return names;
+    }
+
     static List<String> collidingNames(Collection<FileEntry> entries) {
         Map<String, List<String>> byKey = new TreeMap<>();
         for (FileEntry entry : entries) {

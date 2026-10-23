@@ -203,11 +203,13 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-228 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+238 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
-the names it was given), the CLI
+the job it was given for), scan authority (Run refused before a scan, during a scan, after a typed path is
+edited, or after the scan options change; a stale scan result discarded and said so; a running job keeping the
+ticks that were on screen when Run was pressed), the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
 checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
@@ -290,9 +292,36 @@ card, some macOS volumes — they are the same file, and the later transfer over
 
 A **copy** refuses until someone accepts that: nothing is written, and the message names the pairs. Accept it
 with `--allow-collision-names`, or by answering *Copy them anyway?* in the window; the warning stays either
-way, because accepting the risk is not the same as the risk being gone. **Verify Only** and **dry run** report
+way, because accepting the risk is not the same as the risk being gone. In the window the answer belongs to the
+job it was asked about - these directories, this kind of job, these files - and the job that runs afterwards is
+the same request that was refused, not a new one built from the lists as they now stand. The same pair of names
+under other directories, or a selection with extra files in it, is a different question and is asked again.
+`--allow-collision-names` is deliberately the wider answer: you typed it for that run. **Verify Only** and **dry run** report
 the same names without asking, because they write nothing. If the destination is case-insensitive, the real
 fix is to rename one of the files.
+
+### "Run refused - nothing scanned, or the scan no longer matches the window"
+
+A job is started from the lists on screen, so if those lists are not the two directories currently named, Run
+refuses and says why in the log:
+
+- **nothing has been scanned** - an empty selection means no files, and guessing "everything" would be the
+  opposite bug. Press *Scan Files*.
+- **a scan is still reading the directories** - the lists are half-filled; wait for it.
+- **a path was edited since the scan** - the rows belonged to the directory that used to be named in the field,
+  so they are cleared with it. Scan the new pair.
+- **the scan options changed** - hidden files, ignored directories and symbolic links decide which files exist
+  in the list, so the rows describe a different set. Scan again to apply the new options.
+
+The job itself runs from one request captured at the moment Run was pressed: unticking rows while a job is
+running changes what the *next* job would do, not the one in flight.
+
+### "A scan of ... finished after a newer scan had started; its results were discarded"
+
+Two scans were in flight, or the directories were changed while one was running. The newer scan is the one that
+matches the window, so the older result is thrown away rather than put on screen under the current
+directory's name. The line is logged because a silently dropped result looks exactly like a scan that found
+nothing.
 
 ### "Source is inside the destination directory" / "Destination is inside the source directory"
 
