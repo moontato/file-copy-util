@@ -672,7 +672,17 @@ that commit afterwards (worktree `HEAD` and status printed before removal).
 | transfer figures never tallied at all (`tally = NONE`) | yes — 37 fixtures, which is the measure of how much of the suite reads these figures |
 | the ledger's dry-run early return removed | **not observable.** The engine builds no ledger for a dry run (`if (!dryRun)` around the snapshot), so `transferFacts`' own dry-run branch decides first and the ledger's check sits on a path no dry run reaches. Recorded as a second guard, not as covered behaviour. |
 
-Mutation coverage for item 3 is recorded in the commit after this one.
+Mutation coverage for item 3, in a disposable `git worktree` at `d420419` (and the last line re-run at `66c6650`),
+with both trees verified clean at the intended commit before the worktree was removed.
+
+| Mutation | Caught? |
+|---|---|
+| `truncated()` always false | yes — 5 fixtures: the CSV block, the JSON, the capped-counters fixture, the window's tab title, the CLI note |
+| `rowsOmitted` always 0 | yes — 2 fixtures: capped counters and the CLI `--max-results` export |
+| the CSV metadata block removed | yes — 7 fixtures plus 1 error, across the exporter and both CLI export fixtures |
+| JSON stops carrying `rowsListed` / `rowsOmitted` | yes — the JSON completeness fixture, and one engine fixture that reads the export incidentally |
+| the window drops the `of 10` from the Results tab title | yes — the window fixture |
+| a forced terminal report claims 0 rows omitted | **not caught at first.** The mutation found the gap; `aForcedReportNamesTheRowsItLeftOut` (`66c6650`) closes it, and the same mutation is then caught by that fixture alone. |
 
 **Item 1, symlink verdicts (§2.13) — implemented, green, `SymlinkVerdictTest` (8 fixtures).**
 
