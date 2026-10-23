@@ -171,6 +171,24 @@ names the files and does not claim they are identical — whether two names are 
 destination volume, which this program cannot see. `--allow-collision-names` stays the deliberately wider answer:
 it was typed for that run.
 
+**Correction from review: a finished job's report is judged by that job's directories.** The export path still
+asked the two text fields where the source and destination were, so a report could be judged against directories
+the job never touched. The finished result is now paired with the one request that produced it
+(`CompletedJob(request, result)`, paired inside the completion callback that names its own request - there is no
+"current request" field for a later job to overwrite). Results rendering and export protection read the pair. Two
+consequences, both intended: editing a path field no longer wipes the rows of a job that already ran, and a later
+request that the engine refuses before starting cannot re-point the older job's report. Export goes through
+`writeCompletedReport(target, format, allowInsideDataTrees)`, which is the policy seam - the file chooser only
+picks a path, and the file chooser is not needed to test the rule. Dialogs are also headless-safe now: a refusal
+that could not be shown no longer throws, because the log already carries the words.
+
+`FileVerifierViewTest` grows to 23: `aReportOfACompletedJobIsJudgedByTheDirectoriesThatJobWorkedIn` (a report
+among the copied files stays refused after the fields are moved elsewhere, and a path inside the *newly typed*
+directories is written because it is outside the job that ran) and
+`aRequestThatNeverStartedDoesNotRepointTheReportOfTheJobThatRan` (a request refused by preflight leaves the
+pairing alone; the report is still refused among the first job's files). Export pointed back at the fields:
+**both fail**.
+
 Tests: `FileVerifierViewTest` grows to 21 — Run refused before any scan, refused during a scan, a typed path
 taking its list with it, changed scan options refusing Run until the scan is redone, a scan result carrying an
 older number discarded and said so, a running job keeping the ticks that were on screen when Run was pressed, and

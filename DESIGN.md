@@ -549,9 +549,23 @@ the moment the dialog is closed, and the log is the part that can be tested with
 
 **One request, captured once.** Run builds a single immutable `JobRequest`: roots taken from the *scan* rather
 than from the fields, plus the ticks as they are at that instant. Everything after that — engine call, progress
-poller, results table, report export, collision answer — uses that object, and the collision re-run starts the
-same object, so "the job that ran is the job that was asked about" is a fact rather than a hope. Ticking rows
-during a job changes what the *next* job would do.
+poller, collision answer — uses that object, and the collision re-run starts the same object, so "the job that ran
+is the job that was asked about" is a fact rather than a hope. Ticking rows during a job changes what the *next*
+job would do.
+
+**A finished job keeps its request.** `finishJob(request, result)` pairs the two into `CompletedJob`. The request
+is named by the completion callback that produced the result, so there is no "current request" field that a later
+job — including one the engine refused before starting anything — could overwrite. The Results table and the
+report export read the pair:
+
+- export protection ("never over an existing file", "not among the files this job copied unless somebody says
+  so") is judged by **the directories that job worked in**. `ReportExporter` is given `completedJob.request()`'s
+  roots, never `userPath(sourcePathField.getText())`: by the time somebody presses Export, the fields may name
+  another pair, and then the rule would be applied to the wrong trees in both directions — a report among the
+  copied files allowed, and a report outside them refused;
+- a request that preflight refuses returns before `engine.start`, so the pairing on screen is untouched;
+- editing a path field clears the two file lists (they belong to the directory that used to be named) but keeps
+  the finished job's rows and its pairing: a job that ran is not un-run by typing somewhere else.
 
 **Stale scan results are discarded, and counted.** A result whose generation is not the current one is not
 applied, and the log says so. "Scanning" follows a count of scans in flight rather than the fate of one of them,

@@ -32,6 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -712,6 +714,108 @@ class FileVerifierViewTest {
     private static String logText(FileVerifierView view) throws Exception {
         JTextArea area = (JTextArea) field(view, "logArea");
         return area.getText();
+    }
+
+    /**
+     * A report belongs to the job it describes. The rule about where it may be written - never over an existing
+     * file, and not among the files that job copied unless somebody decides otherwise - is a rule about the
+     * directories <i>that job</i> worked in, so it is judged by them and not by whatever the two fields happen
+     * to say when somebody presses Export.
+     */
+    @Test
+    void aReportOfACompletedJobIsJudgedByTheDirectoriesThatJobWorkedIn(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        Path elsewhere = Files.createDirectories(roots.resolve("elsewhere"));
+        TestSupport.write(src.resolve("a.txt"), "one");
+        typePaths(view, src, dest);
+        view.scanRequested();
+        awaitScan(view);
+        view.runRequested();
+        awaitJob(view);
+        FileVerifierView.CompletedJob jobA = view.completedJobInUse();
+        assertEquals(src, jobA.request().sourceDir(), "the window knows which request produced these rows");
+        assertEquals(1, jobA.result().outcomes().size());
+
+        // The user moves on: the fields now name another pair of directories. The finished job's record - and
+        // the rules about where its report may go - stay with the pair it actually worked in.
+        typePaths(view, elsewhere, roots.resolve("nowhere"));
+        awaitEventQueue();
+
+        ReportExporter.ReportRefusal insideTheCopiedTree = assertThrows(ReportExporter.ReportRefusal.class,
+            () -> view.writeCompletedReport(dest.resolve("report.csv"), "csv", false),
+            "a report among the files that job copied is still refused, although no field names that pair any"
+                + " more");
+        assertTrue(insideTheCopiedTree.getMessage().contains("inside"),
+            insideTheCopiedTree.getMessage());
+        assertTrue(Files.notExists(dest.resolve("report.csv")),
+            "and the refusal really wrote nothing: the copied tree holds only a.txt");
+        assertEquals(1, countFiles(dest), "the copied file is still the only thing there");
+
+        // The other direction: a path inside the directories the fields name *now* is outside the job that ran,
+        // so it is not held to that job's rules. Judging by the fields instead would refuse this, and the user
+        // would be told their own report directory was off limits.
+        Path written = view.writeCompletedReport(elsewhere.resolve("report.csv"), "csv", false);
+        assertTrue(Files.exists(written), "the report went where it was asked, outside the job's trees");
+
+        JTable results = (JTable) field(view, "resultsTable");
+        assertEquals(1, results.getRowCount(),
+            "and the finished job's rows are still on screen: editing a path field does not un-happen a job"
+                + " that already ran");
+        view.engineInUse().close();
+    }
+
+    /**
+     * A request the engine refuses before it starts must not become the window's job. If it did, the report of
+     * the job that really ran would be judged by the other request's directories - and might be written where
+     * it has no business being.
+     */
+    @Test
+    void aRequestThatNeverStartedDoesNotRepointTheReportOfTheJobThatRan(@TempDir Path roots) throws Exception {
+        FileVerifierView view = build();
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "one");
+        typePaths(view, src, dest);
+        view.scanRequested();
+        awaitScan(view);
+        view.runRequested();
+        awaitJob(view);
+        FileVerifierView.CompletedJob jobA = view.completedJobInUse();
+
+        // A second request the engine refuses before anything is written: the destination is inside the source.
+        Path nested = Files.createDirectories(src.resolve("nested"));
+        typePaths(view, src, nested);
+        view.scanRequested();
+        awaitScan(view);
+        view.runRequested();
+        awaitEventQueue();
+        assertFalse(view.engineInUse().isRunning(), "the second request was refused before it started");
+        assertTrue(logNow(view).contains("preflight"), "and said so: " + logNow(view));
+
+        assertSame(jobA, view.completedJobInUse(),
+            "the refused request did not take over the record of the job that ran");
+        assertEquals(dest, view.completedJobInUse().request().destDir(),
+            "the report is still judged by the first job's destination");
+        assertThrows(ReportExporter.ReportRefusal.class,
+            () -> view.writeCompletedReport(dest.resolve("report.csv"), "csv", false),
+            "still refused among the copied files, even though the fields now name somewhere else");
+        assertTrue(Files.notExists(dest.resolve("report.csv")), "and nothing was written there");
+        view.engineInUse().close();
+    }
+
+    /** Wait for the job started by Run to finish and have its result paired with its request. */
+    private static void awaitJob(FileVerifierView view) throws Exception {
+        waitUntil(() -> view.completedJobInUse() != null && !view.engineInUse().isRunning(),
+            "the job came back and was paired with the request it ran from");
+        awaitEventQueue();
+    }
+
+    private static int countFiles(Path directory) throws Exception {
+        try (java.util.stream.Stream<Path> entries = Files.list(directory)) {
+            return (int) entries.count();
+        }
     }
 
     private static Object modelOf(FileVerifierView view, String name) throws Exception {

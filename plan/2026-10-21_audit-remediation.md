@@ -528,8 +528,38 @@ containment, and cross-process locking stays declined. A scan is not re-run auto
 refusal is to press Scan Files; that is a decision you approved. The GUI confirmation and the in-tree report
 confirmation are exercised through seams, not as rendered dialogs (no display in this container).
 
-**Suite now:** **238 tests, 0 failures, 0 errors, 1 skipped** (the `FCU_RSYNC`-specific test, which only means
-something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean verify` succeeds.
+**Phase 3 correction, from your review of `335ef2d` (2026-10-22)**
+
+The claim "results, export … all use that object" was not true: `exportReport` still passed
+`userPath(sourcePathField.getText().trim())` and the destination field to `ReportExporter`, so the export rules
+were applied to whatever the fields said at press time rather than to the directories the job worked in. Fixed by
+pairing a finished result with the request that produced it:
+
+- `record CompletedJob(JobRequest request, JobResult result)`; `finishJob(request, result)` is called from the
+  completion callback, which **names its own request** - deliberately not a `runningRequest`/`pendingRequest`
+  field, because a later request refused by preflight would otherwise re-point an older job's report;
+- results rendering and `writeCompletedReport(target, format, allowInsideDataTrees)` read the pair. The chooser
+  only chooses a path; the policy is in the seam, so it is testable without showing a file chooser;
+- two consequences recorded as behaviour, not accidents: a finished job's rows survive a path-field edit (a job
+  that ran is not un-run by typing elsewhere), and a request refused by preflight returns before `engine.start`
+  and leaves the pairing alone;
+- dialogs are headless-safe (`inform(...)` catches `HeadlessException`; the chooser logs and tells the user to use
+  `--csv`/`--json`). A refusal that cannot be displayed must not crash the window.
+
+Fixtures: `aReportOfACompletedJobIsJudgedByTheDirectoriesThatJobWorkedIn` - a report among the copied files is
+still refused after the fields move elsewhere, **and** a path inside the newly typed directories is written
+because it is outside the job that ran (judging by the fields would refuse that in the other direction);
+`aRequestThatNeverStartedDoesNotRepointTheReportOfTheJobThatRan` - after a preflight refusal, the pairing is the
+same object (`assertSame`) and the report is still refused among the first job's files. Sabotage: export reading
+the fields again - **2 failures**. `FileVerifierViewTest` is now 23.
+
+Claim kept precise, as you asked: the deterministic seam establishes the **stale-result rule** (a completion
+carrying an older generation is discarded), not every possible `SwingWorker` interleaving. A latch-controlled
+worker integration test is listed as possible follow-up work, and a flaky race test is not a gate.
+
+**Suite now:** **240 tests, 0 failures, 0 errors, 1 skipped** (the `FCU_RSYNC`-specific test, which only means
+something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean verify` succeeds. Whole suite pinned to
+one binary with `FCU_RSYNC_BINARIES` cleared: **234 green** against 3.1.3 and **234 green** against 3.4.0.
 
 **Still open from Phase 0b:** the workflows are written and reviewed statically (jobs, step wiring, pinned
 action SHAs, checksum-pinned tarballs), but **no GitHub Actions run has been executed or observed** - that
@@ -537,7 +567,7 @@ needs an authorised push. Until then the validation gate is *specified*, not *de
 
 **Next, in order**
 
-1. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
+1. Phase 4 remainder (approved on this checkpoint): per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
 2. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
    single large hash, channel workers that cannot block termination, and the completion-signal decision
    (`%b` start header vs `%b` completion line) confirmed on 3.2.7 and 3.3.0 through the matrix.

@@ -203,7 +203,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-238 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+240 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
@@ -315,6 +315,10 @@ refuses and says why in the log:
 
 The job itself runs from one request captured at the moment Run was pressed: unticking rows while a job is
 running changes what the *next* job would do, not the one in flight.
+
+A job that has finished keeps its own record. Its rows stay in Results even if you edit a path field afterwards,
+its report is exported against the directories that job worked in (not wherever the fields point when you press
+Export), and a later request that the pre-flight checks refuse does not take over that record.
 
 ### "A scan of ... finished after a newer scan had started; its results were discarded"
 

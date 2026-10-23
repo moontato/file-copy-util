@@ -123,7 +123,22 @@ public final class FileVerifierView extends JPanel {
     private final FileSyncEngine engine = new FileSyncEngine();
 
     /** Kept so the Results tab can be re-filtered or exported after the job ends. */
-    private FileSyncEngine.JobResult lastJobResult;
+    /**
+     * The finished job whose rows are on screen: its result, and the request it was run from.
+     *
+     * <p>A report belongs to the job it describes. Whether a report path is allowed - never over an existing
+     * file, not among the files the job copied unless somebody decides otherwise - is a rule about the
+     * directories <i>that job</i> worked in. By the time somebody presses Export, the path fields may name
+     * somewhere quite different, and a later request that never started (preflight refused it) must not
+     * re-point an older job's report. So the two are paired here, at the moment the job finishes, and
+     * everything that reads this job's facts reads the pair.
+     */
+    private CompletedJob completedJob;
+
+    /** A finished result and the one request that produced it. */
+    record CompletedJob(FileSyncEngine.JobRequest request, FileSyncEngine.JobResult result) {
+    }
+
     /** What the finished job actually was, so its results can be described correctly afterwards. */
     private FileSyncEngine.JobType launchedJobType;
 
@@ -496,7 +511,8 @@ public final class FileVerifierView extends JPanel {
         onlyProblemsCheck = UiTheme.check("Only problems");
         // ChangeListener rather than ActionListener: a JCheckBox fires ActionEvent only on a click, so a
         // programmatically changed box would leave the table showing the unfiltered rows.
-        onlyProblemsCheck.addChangeListener(e -> showResults(lastJobResult));
+        onlyProblemsCheck.addChangeListener(e -> showResults(
+            completedJob == null ? null : completedJob.result()));
         toolbarLeft.add(onlyProblemsCheck);
         exportCsvButton = UiTheme.button("Export CSV");
         exportCsvButton.addActionListener(e -> exportReport("csv"));
@@ -1092,6 +1108,18 @@ public final class FileVerifierView extends JPanel {
      * display, and it is written first: a refusal that only existed in a dialog would be forgotten the moment
      * it was closed.
      */
+    /**
+     * Show a message, but never fail over showing it. A headless JVM has nowhere to put a dialog; the words
+     * have already gone to the log, which is the channel that survives without a display.
+     */
+    private void inform(String message, String title, int kind) {
+        try {
+            JOptionPane.showMessageDialog(this, message, title, kind);
+        } catch (java.awt.HeadlessException noDisplay) {
+            // Logged by the caller. Crashing the window to report a refusal would be its own bug.
+        }
+    }
+
     private void reportRefusal(String refusal) {
         log("Refused to start: " + refusal);
         statusLabel.setText("Run refused - nothing scanned, or the scan no longer matches the window");
@@ -1120,8 +1148,7 @@ public final class FileVerifierView extends JPanel {
         // failed job in the log. The engine repeats every check itself.
         List<String> problems = engine.preflight(request);
         if (!problems.isEmpty()) {
-            JOptionPane.showMessageDialog(this, String.join("\n", problems),
-                "Preflight failed", JOptionPane.ERROR_MESSAGE);
+            inform(String.join("\n", problems), "Preflight failed", JOptionPane.ERROR_MESSAGE);
             for (String problem : problems) {
                 log("preflight: " + problem);
             }
@@ -1130,8 +1157,7 @@ public final class FileVerifierView extends JPanel {
 
         int selectedSource = request.sourceSelection().selected().size();
         if (selectedSource == 0 && request.destinationSelection().selected().isEmpty()) {
-            JOptionPane.showMessageDialog(this,
-                "Nothing is ticked in either list. An empty selection means no files, not all files.",
+            inform("Nothing is ticked in either list. An empty selection means no files, not all files.",
                 "Empty Selection", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -1156,6 +1182,10 @@ public final class FileVerifierView extends JPanel {
         progressBar.setString("Running...");
         showResults(null);
 
+        // Only a request the engine accepted gets this far. A request refused by preflight, or by an empty
+        // selection, returned earlier, so the finished job already on screen keeps its own pairing. The
+        // completion callback below names the request it belongs to; there is no "current request" field for a
+        // later job to overwrite.
         if (!engine.start(request, new FileSyncEngine.ProgressListener() {
             @Override
             public void onPhase(String phase) {
@@ -1191,11 +1221,12 @@ public final class FileVerifierView extends JPanel {
 
             @Override
             public void onCompletion(FileSyncEngine.JobResult result) {
-                SwingUtilities.invokeLater(() -> finishJob(result));
+                // The request is captured in this closure: it is the one this callback describes, not whatever
+                // the window is thinking about now.
+                SwingUtilities.invokeLater(() -> finishJob(request, result));
             }
         })) {
-            JOptionPane.showMessageDialog(this, "A job is already running.",
-                "Job Running", JOptionPane.WARNING_MESSAGE);
+            inform("A job is already running.", "Job Running", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
@@ -1281,10 +1312,10 @@ public final class FileVerifierView extends JPanel {
         return engine;
     }
 
-    private void finishJob(FileSyncEngine.JobResult result) {
+    private void finishJob(FileSyncEngine.JobRequest request, FileSyncEngine.JobResult result) {
         livenessTimer.stop();
         setJobControlsEnabled(true);
-        lastJobResult = result;
+        completedJob = new CompletedJob(request, result);
 
         // §2.11: the engine refused rather than overwrite one selected file with another. That refusal is
         // the user's decision to make, once: accepting re-runs the same job with the risk acknowledged.
@@ -1377,15 +1408,47 @@ public final class FileVerifierView extends JPanel {
         outputTabs.setTitleAt(1, "Results (" + shown + ")");
     }
 
+    /**
+     * Decide whether a report path is allowed for the job that finished, and write it.
+     *
+     * <p>The file chooser only chooses a path. Everything about whether that path may be written is
+     * {@link ReportExporter}'s rule, applied to the directories of the request the job was run from - not to
+     * whatever the two fields say now. Kept separate from the chooser so the rule is testable without a
+     * display.
+     */
+    Path writeCompletedReport(Path target, String format, boolean allowInsideDataTrees) throws IOException {
+        CompletedJob done = completedJob;
+        if (done == null) {
+            throw new ReportExporter.ReportRefusal("There is no finished job to export.");
+        }
+        return ReportExporter.writeReport(target, done.result(),
+            "json".equals(format) ? ReportExporter.Format.JSON : ReportExporter.Format.CSV,
+            done.request().sourceDir(), done.request().destDir(), allowInsideDataTrees);
+    }
+
+    /** The finished job whose rows are on screen, together with the request it came from. */
+    CompletedJob completedJobInUse() {
+        return completedJob;
+    }
+
     private void exportReport(String format) {
-        if (lastJobResult == null) {
+        if (completedJob == null) {
             return;
         }
         JFileChooser chooser = new JFileChooser();
         String base = "file-copy-report";
         chooser.setSelectedFile(new File(base + "." + format));
         chooser.setDialogTitle("Export job report");
-        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+        int choice;
+        try {
+            choice = chooser.showSaveDialog(this);
+        } catch (java.awt.HeadlessException noDisplay) {
+            log("No display is available, so the file chooser could not be opened - use the command line"
+                + " front end (--csv/--json) to export here.");
+            statusLabel.setText("Export needs a display here - use --csv or --json on the command line.");
+            return;
+        }
+        if (choice != JFileChooser.APPROVE_OPTION) {
             return;
         }
         File chosen = chooser.getSelectedFile();
@@ -1407,10 +1470,7 @@ public final class FileVerifierView extends JPanel {
         boolean allowInsideDataTrees = false;
         while (true) {
             try {
-                Path written = ReportExporter.writeReport(target, lastJobResult,
-                    "json".equals(format) ? ReportExporter.Format.JSON : ReportExporter.Format.CSV,
-                    userPath(sourcePathField.getText().trim()),
-                    userPath(destPathField.getText().trim()), allowInsideDataTrees);
+                Path written = writeCompletedReport(target, format, allowInsideDataTrees);
                 log("Report written: " + written);
                 statusLabel.setText("Report written: " + written);
                 return;
@@ -1470,12 +1530,14 @@ public final class FileVerifierView extends JPanel {
         }
         sourceModel.clear();
         destModel.clear();
-        showResults(null);
-        lastJobResult = null;
         loadedScan = null;
         updateWorkSetSummary();
+        // The two lists go, because they belong to the directory that used to be named here. The finished job's
+        // rows stay: they describe a job that happened, and changing a path field does not un-happen it. Its
+        // report is still exported against the directories that job worked in.
         log("Path changed - the loaded lists were cleared, because they belong to the directory this field "
-            + "used to name. Press Scan Files (Ctrl+S) to load the new one.");
+            + "used to name. Press Scan Files (Ctrl+S) to load the new one. The results of the job that"
+            + " already ran are kept.");
     }
 
     /** Write a path field without the watcher treating it as the user changing directories. */
