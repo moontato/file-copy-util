@@ -332,11 +332,34 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * What a job found, and what it can say it did.
+     *
+     * <p>Every figure is a tally of one kind of event, and no figure is a tally of another kind of event: the
+     * verdict figures come from verdicts, the transfer figures come from per-file transfer dispositions, and
+     * rsync's announcement count is kept apart because an announcement says a transfer started, not that it
+     * finished. {@link #filesChecked()} is a sum of the verdict figures rather than a counter of its own, which
+     * is what stops it drifting away from them.
+     *
+     * @param filesCopied          files this job can show it wrote (disposition {@code COPIED})
+     * @param filesWouldCopy       files a dry run would have written
+     * @param filesUncertain       files rsync started and the destination cannot account for
+     * @param filesNotTransferred  rows the job knows about that were not transferred
+     * @param transfersAnnounced   how many transfers rsync announced; an observation, never a completion
+     * @param transfersCompletedByRsync how many transfers rsync's own {@code (xfr#N)} count claimed as
+     *                             finished (0 also covers a run that printed no such count) - another
+     *                             observation, kept apart from what this program can prove
+     * @param filesProcessed       rows this job reported on, extras included - the progress-unit count
+     * @param truncated            whether the per-file list was capped, so an incomplete report cannot read as
+     *                             a complete one
+     */
     public record JobResult(JobStatus status, String message,
-                            int filesChecked, int filesMatched, int filesMismatched,
-                            int filesMissing, int filesExtra, int filesCopied,
+                            int filesMatched, int filesMismatched, int filesMissing, int filesExtra,
+                            int filesCopied, int filesWouldCopy, int filesUncertain,
+                            int filesNotTransferred, int transfersAnnounced, int transfersCompletedByRsync,
+                            int filesProcessed,
                             int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
-                            List<String> warnings, AbortCause abortCause) {
+                            List<String> warnings, boolean truncated, AbortCause abortCause) {
 
         public JobResult {
             outcomes = List.copyOf(outcomes);
@@ -345,14 +368,31 @@ public class FileSyncEngine implements AutoCloseable {
             abortCause = abortCause == null ? AbortCause.NONE : abortCause;
         }
 
-        /** A result that does not name a cause did not stop early; it simply ended. */
+        /**
+         * The shape used before the transfer figures were kept apart from the verdict figures, where the
+         * leading figure counted processed rows. That figure is {@code filesProcessed} now, and "checked" is a
+         * sum rather than a stored count. Hand-built results announce exactly the transfers they claim, because
+         * nothing else is known about them. New code uses the full constructor.
+         */
         public JobResult(JobStatus status, String message,
-                         int filesChecked, int filesMatched, int filesMismatched,
+                         int filesProcessed, int filesMatched, int filesMismatched,
                          int filesMissing, int filesExtra, int filesCopied,
                          int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
                          List<String> warnings) {
-            this(status, message, filesChecked, filesMatched, filesMismatched, filesMissing, filesExtra,
-                    filesCopied, rsyncExitCode, outcomes, errors, warnings, AbortCause.NONE);
+            this(status, message, filesMatched, filesMismatched, filesMissing, filesExtra, filesCopied,
+                    0, 0, 0, filesCopied, filesCopied, filesProcessed, rsyncExitCode, outcomes, errors,
+                    warnings, false, AbortCause.NONE);
+        }
+
+        /**
+         * The verdicts that answered a question about a file: this file matched, mismatched or was missing.
+         *
+         * <p>An extra file in the destination was <b>reported</b>, not compared against anything the job was
+         * asked to handle, so it is not part of this figure: a job that found three extras and compared nothing
+         * checked nothing. This is a sum of the three verdict figures, so it cannot disagree with them.
+         */
+        public int filesChecked() {
+            return filesMatched + filesMismatched + filesMissing;
         }
 
         public boolean wasAborted() {
@@ -1453,6 +1493,7 @@ public class FileSyncEngine implements AutoCloseable {
         TransferLedger ledger = null;
         // Per announced file, what the destination can prove about its transfer (A10, 2.5).
         Map<String, TransferDisposition> transfers = Map.of();
+        TransferTally tally = TransferTally.NONE;
 
         if (copies && verifies) {
             // Its own phase, because it is its own wait: hashing reads the whole source before rsync has
@@ -1531,6 +1572,7 @@ public class FileSyncEngine implements AutoCloseable {
                 boolean cleanCopy = !control.timedOut() && !control.cancelRequested()
                         && isSuccessfulExit(rsyncExitCode);
                 transfers = transferFacts(ledger, announcedNames, cleanCopy, dryRun);
+                tally = TransferTally.of(transfers);
                 if (!cleanCopy) {
                     // A job that is about to be reported as cancelled, timed out or failed still owes the
                     // user a per-file answer. Without it the report is a count with no names, and a count
@@ -1543,16 +1585,16 @@ public class FileSyncEngine implements AutoCloseable {
                 }
 
                 if (control.timedOut()) {
-                    return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun,
+                    return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun,
                             verifies);
                 }
                 if (control.cancelRequested()) {
-                    return cancelledDuringCopy(control, progress, outcomes, rsyncExitCode, errors, warnings,
+                    return cancelledDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
-                    return rsyncFailedDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
+                    return rsyncFailedDuringCopy(progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
                 if (rsyncExitCode == 24) {
@@ -1577,15 +1619,15 @@ public class FileSyncEngine implements AutoCloseable {
                         + " the export must name every file.");
             }
             if (control.timedOut()) {
-                return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+                return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
             }
             if (control.cancelRequested()) {
-                return cancelledDuringCopy(control, progress, outcomes, rsyncExitCode, errors, warnings,
+                return cancelledDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                         destinationTargets, dryRun, verifies);
             }
             progress.finish(dryRun ? "Dry run complete" : "Copy complete");
             listener.onPhase("done");
-            return completedResult(progress, outcomes, errors, warnings, rsyncExitCode, dryRun,
+            return completedResult(progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun,
                     request.jobType());
         }
 
@@ -1604,10 +1646,10 @@ public class FileSyncEngine implements AutoCloseable {
         verifyEntries(control, workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
                 warnings, !copies, transfers, options.symlinkPolicy());
         if (control.timedOut()) {
-            return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+            return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
         if (control.cancelRequested()) {
-            return cancelledDuringVerify(control, progress, outcomes, errors, warnings);
+            return cancelledDuringVerify(control, progress, tally, outcomes, errors, warnings);
         }
 
         if (outcomes.size() >= resultLimit) {
@@ -1616,15 +1658,54 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         if (control.timedOut()) {
-            return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+            return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
         if (control.cancelRequested()) {
-            return cancelledDuringVerify(control, progress, outcomes, errors, warnings);
+            return cancelledDuringVerify(control, progress, tally, outcomes, errors, warnings);
         }
 
         progress.finish("Verification complete");
         listener.onPhase("done");
-        return completedResult(progress, outcomes, errors, warnings, rsyncExitCode, dryRun, request.jobType());
+        return completedResult(progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun, request.jobType());
+    }
+
+    /**
+     * rsync's own count of transfers it says it finished, from the {@code (xfr#N)} field on its progress
+     * output. Kept as a figure of its own because it is an observation about what rsync said, not a claim this
+     * program can support: where the two disagree the destination decides, and both numbers stay on the page.
+     */
+    private static int claimedByRsync(ProgressReporter progress) {
+        return Math.max(0, progress.rsyncTransfers());
+    }
+
+    /**
+     * The transfer figures, tallied from the per-file dispositions. They are taken from the disposition map
+     * rather than from the reported rows, because the reported list can be capped by the result limit while
+     * these figures must not be.
+     */
+    private record TransferTally(int copied, int wouldCopy, int uncertain, int notTransferred) {
+        static final TransferTally NONE = new TransferTally(0, 0, 0, 0);
+
+        static TransferTally of(Map<String, TransferDisposition> transfers) {
+            int copied = 0;
+            int would = 0;
+            int unresolved = 0;
+            int notMoved = 0;
+            for (TransferDisposition disposition : transfers.values()) {
+                switch (disposition) {
+                    case COPIED -> copied++;
+                    case WOULD_COPY -> would++;
+                    case UNCERTAIN -> unresolved++;
+                    case NOT_COPIED -> notMoved++;
+                }
+            }
+            return new TransferTally(copied, would, unresolved, notMoved);
+        }
+    }
+
+    /** Whether the per-file list hit the result limit - an incomplete list must not read as a complete one. */
+    private boolean reportTruncated(List<FileOutcome> outcomes) {
+        return outcomes.size() >= resultLimit;
     }
 
     /**
@@ -1632,7 +1713,8 @@ public class FileSyncEngine implements AutoCloseable {
      * A job whose verification was switched off says so here as well as in the warnings: a copy that was
      * never compared has to be readable as that, and not mistaken for a copy that passed.
      */
-    private JobResult completedResult(ProgressReporter progress, List<FileOutcome> outcomes, List<String> errors,
+    private JobResult completedResult(ProgressReporter progress, TransferTally tally,
+                                      List<FileOutcome> outcomes, List<String> errors,
                                       List<String> warnings, int rsyncExitCode, boolean dryRun, JobType jobType) {
         if (dryRun && jobType.copies()) {
             warnings.add(0, "Dry run: rsync ran with --dry-run, so no file was written or changed.");
@@ -1641,12 +1723,15 @@ public class FileSyncEngine implements AutoCloseable {
             warnings.add("Verification was turned off: no file was hashed or compared. This job reports what"
                     + " was copied, not whether the copies are correct.");
         }
-        return new JobResult(JobStatus.COMPLETED, completionMessage(progress, dryRun, jobType),
-                progress.processed(), progress.matched(), progress.mismatched(), progress.missing(),
-                progress.extra(), progress.copied(), rsyncExitCode, outcomes, errors, warnings);
+        return new JobResult(JobStatus.COMPLETED, completionMessage(progress, tally, dryRun, jobType),
+                progress.matched(), progress.mismatched(), progress.missing(), progress.extra(),
+                tally.copied(), tally.wouldCopy(), tally.uncertain(), tally.notTransferred(),
+                progress.copied(), claimedByRsync(progress), progress.processed(), rsyncExitCode, outcomes,
+                errors, warnings, reportTruncated(outcomes), AbortCause.NONE);
     }
 
-    private static String completionMessage(ProgressReporter progress, boolean dryRun, JobType jobType) {
+    private static String completionMessage(ProgressReporter progress, TransferTally tally, boolean dryRun,
+                                            JobType jobType) {
         if (!jobType.verifies()) {
             return dryRun
                 ? "Dry run - nothing was written: " + progress.copied()
@@ -1687,7 +1772,8 @@ public class FileSyncEngine implements AutoCloseable {
      * failure returned zeroed counters, so a job that had already written files reported "0 copied" while
      * those files sat in the destination. A cut-short job gets the same accounting as a cancelled one.
      */
-    private JobResult rsyncFailedDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
+    private JobResult rsyncFailedDuringCopy(ProgressReporter progress, TransferTally tally,
+                                            List<FileOutcome> outcomes,
                                             int exitCode, List<String> errors, List<String> warnings,
                                             List<Path> destinationTargets, boolean dryRun, boolean verifies) {
         int announced = progress.copied();
@@ -1698,9 +1784,10 @@ public class FileSyncEngine implements AutoCloseable {
                 + "; files already in the destination were left as they are.";
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(interruptedTempFiles(destinationTargets)));
-        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
-                progress.mismatched(), progress.missing(), progress.extra(), completed, exitCode,
-                outcomes, errors, extended);
+        return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
+                progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
+                tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
+                outcomes, errors, extended, reportTruncated(outcomes), AbortCause.NONE);
     }
 
     /**
@@ -1764,7 +1851,7 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
-    private JobResult cancelledDuringCopy(JobControl control, ProgressReporter progress,
+    private JobResult cancelledDuringCopy(JobControl control, ProgressReporter progress, TransferTally tally,
                                           List<FileOutcome> outcomes, int exitCode, List<String> errors,
                                           List<String> warnings,
                                           List<Path> destinationTargets, boolean dryRun, boolean verifies) {
@@ -1780,9 +1867,10 @@ public class FileSyncEngine implements AutoCloseable {
         List<String> leftovers = interruptedTempFiles(destinationTargets);
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(leftovers));
-        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
-                progress.mismatched(), progress.missing(), progress.extra(), completed, exitCode,
-                outcomes, errors, extended, control.cause());
+        return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
+                progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
+                tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
+                outcomes, errors, extended, reportTruncated(outcomes), control.cause());
     }
 
     /**
@@ -1820,17 +1908,19 @@ public class FileSyncEngine implements AutoCloseable {
                 + " file(s) for copy; it reported no progress, so how many finished is unknown";
     }
 
-    private JobResult cancelledDuringVerify(JobControl control, ProgressReporter progress,
+    private JobResult cancelledDuringVerify(JobControl control, ProgressReporter progress, TransferTally tally,
                                             List<FileOutcome> outcomes, List<String> errors,
                                             List<String> warnings) {
         String message = "Job " + abortWords(control.cause()) + " during verification after "
                 + progress.processed() + " of " + progress.workTotal() + " file(s) were checked.";
-        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
-                progress.mismatched(), progress.missing(), progress.extra(), progress.copied(), 0,
-                outcomes, errors, warnings, control.cause());
+        return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
+                progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
+                tally.notTransferred(), progress.copied(), claimedByRsync(progress), progress.processed(), 0,
+                outcomes, errors, warnings, reportTruncated(outcomes), control.cause());
     }
 
-    private JobResult timeoutResult(JobControl control, ProgressReporter progress, List<FileOutcome> outcomes,
+    private JobResult timeoutResult(JobControl control, ProgressReporter progress, TransferTally tally,
+                                    List<FileOutcome> outcomes,
                                     List<String> errors, List<String> warnings, List<Path> destinationTargets,
                                     boolean dryRun, boolean verifies) {
         int announced = progress.copied();
@@ -1848,9 +1938,10 @@ public class FileSyncEngine implements AutoCloseable {
         if (!destinationTargets.isEmpty()) {
             extended.add(leftoverWarning(interruptedTempFiles(destinationTargets)));
         }
-        return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
-                progress.mismatched(), progress.missing(), progress.extra(), completed, 0,
-                outcomes, errors, extended, AbortCause.TIMED_OUT);
+        return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
+                progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
+                tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), 0,
+                outcomes, errors, extended, reportTruncated(outcomes), AbortCause.TIMED_OUT);
     }
 
     /**
@@ -2796,12 +2887,12 @@ public class FileSyncEngine implements AutoCloseable {
                 + " and its own thread had not finished within " + seconds
                 + " s of its process being stopped. The figures below are as far as that thread had got;"
                 + " the process it was running is gone, so nothing more is being written.";
-        JobResult forced = new JobResult(JobStatus.FAILED, message, counters.processed(), counters.matched(),
-                counters.mismatched(), counters.missing(), counters.extra(), counters.copied(), 0,
-                List.of(), List.of(),
+        JobResult forced = new JobResult(JobStatus.FAILED, message, counters.matched(),
+                counters.mismatched(), counters.missing(), counters.extra(), 0, 0, 0, 0, counters.copied(),
+                Math.max(0, counters.rsyncTransfers()), counters.processed(), 0, List.of(), List.of(),
                 List.of("the job's own thread was still finishing when this was reported; per-file results"
                         + " from it are not included"),
-                why);
+                false, why);
         finishJob(forced, control, control.listener(), delivery);
     }
 
@@ -2922,12 +3013,13 @@ public class FileSyncEngine implements AutoCloseable {
     private JobResult abortedBeforeTransfer(String message, List<FileOutcome> outcomes, List<String> errors,
                                             List<String> warnings, boolean verifies, AbortCause cause) {
         String full = verifies ? message : message + " Verification was off, so nothing was compared.";
-        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, outcomes, errors, warnings, cause);
+        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, outcomes, errors,
+                warnings, reportTruncated(outcomes), cause);
     }
 
     private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode) {
-        return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, 0, exitCode, List.of(), errors,
-                warnings);
+        return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, exitCode, List.of(),
+                errors, warnings, false, AbortCause.NONE);
     }
 
     /**
@@ -2967,6 +3059,7 @@ public class FileSyncEngine implements AutoCloseable {
         int mismatched;
         int missing;
         int extra;
+        /** Transfers rsync announced: an observation about what started, never about what finished. */
         int copied;
         private int rsyncPercent = -1;
         /** The file rsync is writing right now, and how big it is. */
@@ -2988,22 +3081,27 @@ public class FileSyncEngine implements AutoCloseable {
          * reader pick up six separate fields is what keeps a half-updated set of figures out of a report.
          */
         private record Counters(int processed, int matched, int mismatched, int missing, int extra,
-                                int copied) {
+                                int copied, int rsyncTransfers) {
+
+            /** The verdict tally, kept in one place so no consumer has to add three figures itself. */
+            int checked() {
+                return matched + mismatched + missing;
+            }
         }
 
-        private volatile Counters snapshot = new Counters(0, 0, 0, 0, 0, 0);
+        private volatile Counters snapshot = new Counters(0, 0, 0, 0, 0, 0, -1);
 
         Counters snapshot() {
             return snapshot;
         }
 
         private void publish() {
-            snapshot = new Counters(processed, matched, mismatched, missing, extra, copied);
+            snapshot = new Counters(processed, matched, mismatched, missing, extra, copied, rsyncTransfers);
         }
 
         /** For a job stopped before it had anything to count. */
         static Counters emptyCounters() {
-            return new Counters(0, 0, 0, 0, 0, 0);
+            return new Counters(0, 0, 0, 0, 0, 0, -1);
         }
 
         ProgressReporter(int workTotal, ProgressListener listener) {
@@ -3058,6 +3156,10 @@ public class FileSyncEngine implements AutoCloseable {
             publish();
         }
 
+        /**
+         * Tally one file's transfer disposition. Kept beside the row rather than derived from the row list,
+         * because the list can be capped while the figures must not be.
+         */
         void countMatched() {
             processed++;
             matched++;

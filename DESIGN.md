@@ -704,6 +704,50 @@ fourth mutation tried - releasing the destination before the gate - is *not* obs
 reservation now lives in the job's own controller and is cleared by whoever releases it first; that is the
 stronger invariant, and the outsider-refusal fixture locks the consequence.
 
+## 20. What each figure counts
+
+A report figure is a tally of one kind of event. Three families are kept apart, because they answer three
+different questions, and a number that mixes them cannot be acted on.
+
+**Verdicts.** `matched`, `mismatched` and `missing` are the verdicts about files the job compared. `checked` is
+their sum — a derived figure rather than a fourth counter, so it cannot drift away from them. An `extra` (a file
+found in the destination that the job was not asked to handle) was **reported**, not compared against anything:
+it counts in `extra` and in `processed`, never in `checked`. A job that found three extras and compared nothing
+checked nothing.
+
+**Transfers.** `copied` counts the files whose transfer this job can show (disposition `COPIED`), `wouldCopy` the
+files a dry run would have written, `uncertain` the files rsync started that the destination cannot account for,
+and `notTransferred` the rows the job knows about that were not transferred. Section 18 is what decides which of
+those a file is. The tally is taken from the per-file dispositions rather than from the reported rows, so capping
+the row list cannot change the figures.
+
+**rsync's own observations.** `transfersAnnounced` (the itemize lines seen: a transfer started) and
+`transfersCompletedByRsync` (rsync's `(xfr#N)`: it says it finished N) are kept as what rsync said, and are
+reported beside this program's figures instead of being merged into them. Where the two disagree — a transfer
+that died, a receiver error, or a stand-in that prints without writing — the destination decides what `copied`
+says, and the disagreement stays on the page instead of being averaged away.
+
+**Progress unit.** `processed` counts the rows the job reported on, extras included. That is what the progress bar
+counts. It is not `checked`.
+
+The equations the exports state and the fixtures assert:
+
+```
+checked   = matched + mismatched + missing
+processed = checked + extra            (for a job that reports every file it handled)
+a file that was copied and then verified contributes to copied and to checked, once each
+```
+
+### What this changes for someone reading the numbers
+
+Earlier releases derived `filesCopied` by capping rsync's announcement count with its `xfr#` figure, and used the
+reported-row count as `filesChecked`. Both meanings changed deliberately. `copied` is now the figure this program
+can support, and `checked` is the verdict sum. A cut-short copy that used to report `copied=1` on rsync's word now
+reports `copied=0`, `uncertain=1`, `rsync-said-completed=1` where the destination cannot show which file arrived —
+and still reports `copied=1` where a file really was created and is the size it should be. Anyone reading exports
+should use the new JSON fields (`wouldCopy`, `uncertain`, `notTransferred`, `transfersAnnounced`,
+`transfersCompletedByRsync`, `processed`) instead of assuming `copied` means "files rsync mentioned".
+
 ## 18. What rsync's output can and cannot prove about a transfer
 
 Completion evidence was the audit's hardest requirement: a transfer that was cut short must never be reported as

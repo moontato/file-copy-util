@@ -80,7 +80,12 @@ class RobustnessTest {
 
     /** A failed copy is a partial copy. The counts must say so. */
     @Test
-    void anRsyncFailureMidCopyReportsWhatItActuallyCopied(@org.junit.jupiter.api.io.TempDir Path tmp) throws Exception {
+    /**
+     * The 1.2.1 lesson, restated now that the copied figure counts provable transfers: what rsync claimed is
+     * still reported, what this program can prove is reported separately, and the files in between are named.
+     */
+    void anRsyncFailureMidCopyKeepsRsyncsClaimAndNamesWhatCannotBeProven(
+            @org.junit.jupiter.api.io.TempDir Path tmp) throws Exception {
         Path src = Files.createDirectory(tmp.resolve("src"));
         Path dst = Files.createDirectory(tmp.resolve("dst"));
         TestSupport.write(src.resolve("a.txt"), "a");
@@ -97,8 +102,14 @@ class RobustnessTest {
                     TestSupport.selection("a.txt", "b.txt"), FileSyncEngine.Selection.none()), SILENT);
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
-            assertEquals(1, result.filesCopied(),
-                "rsync completed one transfer; saying 0 hides a file that is now in the destination: "
+            // rsync's own completion claim stays visible as a claim of its own. The copied figure counts the
+            // transfers this job can show arrived, and this stand-in printed output without writing a file.
+            assertEquals(1, result.transfersCompletedByRsync(),
+                "what rsync said it completed must not be hidden: " + result.message());
+            assertEquals(0, result.filesCopied(),
+                "and nothing may be claimed as copied, because nothing arrived: " + result.message());
+            assertEquals(1, result.filesUncertain(),
+                "a transfer that started and cannot be accounted for is reported as uncertain: "
                     + result.message());
             assertTrue(result.message().contains("completed 1"), result.message());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial")

@@ -539,14 +539,20 @@ class FileSyncEngineTest {
                 TestSupport.selection("a.txt"), TestSupport.selection("a.txt"), true);
 
         assertTrue(result.isSuccess(), result.message());
-        assertEquals(2, result.filesChecked());
+        // The destination-only file was reported, not compared: it counts in extras and in the
+        // progress unit, never in checked.
+        assertEquals(1, result.filesChecked());
+        assertEquals(2, result.filesProcessed());
         assertEquals(1, result.filesMatched());
         assertEquals(1, result.filesExtra());
         assertEquals("EXTRA", rec.eventFor("orphan.txt").status());
         assertTrue(rec.eventFor("orphan.txt").srcHash() == null, "an extra file has no source hash");
         assertTrue(result.message().contains("destination-only"), result.message());
-        assertEquals(result.filesChecked(), result.filesMatched() + result.filesMismatched()
-                + result.filesMissing() + result.filesExtra());
+        // The equation this program reports by: checked is the sum of the verdict figures, and a reported
+        // extra is not a verdict. The unit that counted both rows is filesProcessed.
+        assertEquals(result.filesChecked(),
+                result.filesMatched() + result.filesMismatched() + result.filesMissing());
+        assertEquals(result.filesProcessed(), result.filesChecked() + result.filesExtra());
     }
 
     @Test
@@ -961,7 +967,10 @@ class FileSyncEngineTest {
         assertTrue(result.isSuccess(), result.message());
         assertTrue(result.message().startsWith("Dry run - nothing was written:"), result.message());
         assertTrue(result.message().contains("2 would be copied"), result.message());
-        assertEquals(2, result.filesCopied(), "the count is what rsync says it would transfer");
+        assertEquals(2, result.filesWouldCopy(),
+                "a dry run's figure is intent: these are the files it would have copied");
+        assertEquals(0, result.filesCopied(),
+                "and it copied none of them, whatever its count said");
         assertEquals(2, result.filesMissing(), "nothing is at the destination yet");
         try (var walk = Files.walk(dest)) {
             assertTrue(walk.noneMatch(Files::isRegularFile), "a dry run must not write anything");
@@ -1033,7 +1042,12 @@ class FileSyncEngineTest {
             // count is 1, not 3.
             assertTrue(result.message().contains("announced 3"), result.message());
             assertTrue(result.message().contains("completed 1 of them"), result.message());
-            assertEquals(1, result.filesCopied(), result.message());
+            // Three announced, and rsync's own count claims one completed - both figures stay
+            // visible. The copied figure counts only what this job can show arrived, and this
+            // stand-in wrote nothing, so that figure is 0.
+            assertEquals(3, result.transfersAnnounced(), result.message());
+            assertEquals(1, result.transfersCompletedByRsync(), result.message());
+            assertEquals(0, result.filesCopied(), result.message());
 
             String leftover = result.warnings().stream()
                     .filter(w -> w.contains("partial rsync file")).findFirst().orElse("");
@@ -1090,7 +1104,10 @@ class FileSyncEngineTest {
                     ScanOptions.DEFAULTS, false, true), new TestSupport.Recorder());
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status(), "a cancelled dry run did not complete");
-        assertEquals(2, result.filesCopied(), result.message());
+            // A dry run cut short still names its intent: two files would have been copied, and
+            // none were, because a dry run writes nothing.
+            assertEquals(2, result.filesWouldCopy(), result.message());
+            assertEquals(0, result.filesCopied(), result.message());
             assertTrue(result.message().contains("would have been copied"), result.message());        }
 
     }
@@ -1111,8 +1128,12 @@ class FileSyncEngineTest {
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("No partial rsync file")),
                     String.valueOf(result.warnings()));
-            assertEquals(1, result.filesCopied(), result.message());        }
+            // rsync said it completed the transfer; the copied figure stays at 0 because the
+            // stand-in printed output without writing the file, and nothing arrived.
+            assertEquals(1, result.transfersCompletedByRsync(), result.message());
+            assertEquals(0, result.filesCopied(), result.message());
 
+        }
     }
 
     @Test

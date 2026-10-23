@@ -617,12 +617,22 @@ public final class Cli {
         if (!options.request().jobType().verifies()) {
             // The usual totals would read "checked=0 matched=0 mismatched=0" for a job that compared
             // nothing on purpose, which looks like a report of a problem rather than an absence of one.
-            out.printf("totals: copied=%d (verification was off: nothing was hashed or compared)%n",
-                result.filesCopied());
+            out.printf("totals: copied=%d would-copy=%d uncertain=%d"
+                    + " (verification was off: nothing was hashed or compared)%n",
+                result.filesCopied(), result.filesWouldCopy(), result.filesUncertain());
         } else {
             out.printf("totals: checked=%d copied=%d matched=%d mismatched=%d missing=%d destination-only=%d%n",
                     result.filesChecked(), result.filesCopied(), result.filesMatched(),
                     result.filesMismatched(), result.filesMissing(), result.filesExtra());
+            // The second line keeps the two kinds of figure apart. "checked" counts verdicts, so a
+            // destination-only file - reported, never compared - is not in it. "copied" counts the transfers
+            // this run can show arrived; what rsync announced and what it claimed to complete are its own
+            // observations, reported beside them rather than merged into the same number.
+            out.printf("transfers: copied=%d would-copy=%d uncertain=%d not-transferred=%d,"
+                    + " rsync-announced=%d rsync-said-completed=%d; rows reported=%d%n",
+                    result.filesCopied(), result.filesWouldCopy(), result.filesUncertain(),
+                    result.filesNotTransferred(), result.transfersAnnounced(),
+                    result.transfersCompletedByRsync(), result.filesProcessed());
         }
 
         int exit = exitCode(result);

@@ -1,12 +1,14 @@
-# Audit remediation plan — File Copy Util (revision 11)
+# Audit remediation plan — File Copy Util (revision 12)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 11 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
+**Status:** approved and under way, revision 12 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
 `33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
-under way**: §2.13's symlink-verdict rule is implemented and green (item 1 of five). Items 2–5 (truthful counters
-across every consumer, partial/capped report completeness, CSV formula neutralisation, `--strict` and invalid-pattern
-warnings) follow. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
+green. Items 3–5 (partial/capped report completeness, CSV formula neutralisation, `--strict` and invalid-pattern
+warnings) follow. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
+DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
+ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
 report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
 correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
@@ -571,7 +573,59 @@ something in a pinned run); SpotBugs `BugInstance size is 0`; `javac -Xlint:all 
 
 ---
 
-## Phase 5 — truthful verdicts and counts (under way, item 1 green)
+## Phase 5 — truthful verdicts and counts (items 1–2 green)
+
+**Item 2, the `checked` equation and the separation of transfer figures (§2.13) — implemented, green,
+`CounterTruthTest` (5 fixtures) plus the equation asserted in the existing engine, CLI and export fixtures.**
+
+What was still broken: `filesCopied` was rsync's announcement count capped by `xfr#`, and `filesChecked` was the
+reported-row count, extras included — so the extra that audit A14 counted as checked was still counted as checked
+in the headline figure, and a cut-short job claimed copies it could not support.
+
+| Figure | What it counts now |
+|---|---|
+| `checked` | `matched + mismatched + missing`, **derived**, so it cannot disagree with the verdicts |
+| `extra` | destination-only rows: reported, never compared, therefore not in `checked` |
+| `processed` | rows the job reported on (extras included) — the progress unit, reported beside the rest |
+| `copied` | files whose transfer this job can show: disposition `COPIED`, tallied per file from the disposition map, so the `--max-results` cap on the row list cannot change the figure |
+| `wouldCopy` | dry-run intent; a dry run's `copied` is 0 |
+| `uncertain` | transfers rsync started that the destination cannot account for |
+| `notTransferred` | rows the job knows about that were not transferred |
+| `transfersAnnounced` | itemize lines seen — rsync started N transfers |
+| `transfersCompletedByRsync` | rsync's own `(xfr#N)` claim, kept as an observation instead of becoming the copied figure |
+
+Consumers now state the same figures: the CLI prints a second totals line (`transfers: …`), the window logs the same
+line under its Totals, and the JSON export carries `checked`, `matched`, `mismatched`, `missing`, `extra`, `copied`,
+`wouldCopy`, `uncertain`, `notTransferred`, `transfersAnnounced`, `transfersCompletedByRsync` and `processed`, plus
+`truncated` (item 3's flag, needed by the same fixtures).
+
+**The contract change, stated rather than buried.** A cut-short copy that used to report `copied=1` on rsync's word
+now reports `copied=0` with `uncertain=1` and `rsync-said-completed=1` when the destination cannot show which file
+arrived. Where a file really was created at the size its source had, it is still counted — that case is now proven
+by a fixture with a stand-in that writes one file for real and then fails the way rsync does on a bad write
+(`TestSupport.copyingThenFailingRsync`).
+
+Six expectations encoded the old meanings and were rewritten to the approved ones, each with a comment saying why:
+`destinationOnlyFilesAreReportedAsExtraWhenDetectionIsOn` (checked excludes the extra, processed counts both rows,
+and the equation assertion no longer adds `extra` to `checked`), `dryRunReportsWhatWouldCopyAndWritesNothing` and
+`aDryRunCutShortStillReportsWhatItWouldHaveCopied` (would-copy, and copied 0),
+`aCutShortCopyReportsTransfersRsyncFinishedNotOnesItAnnounced` and
+`aCutShortCopyThatCleanedUpAfterItselfSaysSoInsteadOfWarning` (rsync's claim and announcement kept as their own
+figures; copied 0 because the stand-in wrote nothing), and the renamed
+`anRsyncFailureMidCopyKeepsRsyncsClaimAndNamesWhatCannotBeProven` plus
+`aFailedCopyNamesTheHalfWrittenFileItLeft` (the 1.2.1 lesson — rsync's claim is not hidden, leftovers are named —
+asserted without claiming an unsupported copy). No assertion was deleted or weakened to make a new code path pass.
+
+Suite after item 2: **274 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0.
+Pinned single-binary runs: **268 tests green** pinned to 3.1.3; pinned to 3.4.0, **268 green in four full runs and
+four targeted repeats** — but one earlier pinned-3.4.0 run reported **1 failure whose identity was not captured**
+and which has not reproduced in the seven runs since. Recorded here as an open loose end rather than smoothed over:
+it will be caught by the release-gate run, and if it recurs the fixture gets fixed or re-specified.
+
+Still to do in Phase 5: item 3 (partial/capped reports — the `truncated` flag exists and is in the JSON; the CSV
+metadata block and the GUI/CLI prominence are still to be done), item 4 (CSV formula neutralisation, documented as a
+CSV-only transformation, JSON keeping raw identity), item 5 (`--strict` and invalid-pattern warnings that never
+invent a verdict).
 
 **Item 1, symlink verdicts (§2.13) — implemented, green, `SymlinkVerdictTest` (8 fixtures).**
 

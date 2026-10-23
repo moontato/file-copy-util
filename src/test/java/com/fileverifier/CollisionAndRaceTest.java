@@ -157,7 +157,11 @@ class CollisionAndRaceTest {
                     TestSupport.selection("data", "later"), FileSyncEngine.Selection.none()), SILENT);
 
             assertEquals(FileSyncEngine.JobStatus.FAILED, result.status());
-            assertEquals(1, result.filesCopied(), result.message());
+            // The half-written file and rsync's own reason are the point of this fixture. The copied figure
+            // stays 0: the stand-in announced the transfer and left a partial file, and the destination cannot
+            // show that any complete file arrived.
+            assertEquals(0, result.filesCopied(), result.message());
+            assertEquals(1, result.filesUncertain(), result.message());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains(".data.AAAAAA")),
                 "the half-written file rsync left behind has to be named: " + result.warnings());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("No space left")),

@@ -374,12 +374,25 @@ public final class ReportExporter {
         json.append("{\n");
         json.append("  \"status\": ").append(field(result.status().name())).append(",\n");
         json.append("  \"message\": ").append(field(result.message())).append(",\n");
+        // Whether this list is the whole list. A capped result has to say so, or 40 rows read as the lot.
+        json.append("  \"truncated\": ").append(result.truncated() ? "true" : "false").append(",\n");
+        // Every figure here is the tally of the rows it is reported beside. "checked" counts verdicts, so an
+        // extra file - reported, but not compared against anything - is not one of them. The transfer figures
+        // are kept apart from the verdict figures because they answer different questions, and the count of
+        // transfers rsync announced is kept apart from both: an announcement is not a completion.
         json.append("  \"totals\": {\"checked\": ").append(result.filesChecked())
-                .append(", \"copied\": ").append(result.filesCopied())
                 .append(", \"matched\": ").append(result.filesMatched())
                 .append(", \"mismatched\": ").append(result.filesMismatched())
                 .append(", \"missing\": ").append(result.filesMissing())
-                .append(", \"extra\": ").append(result.filesExtra()).append("},\n");
+                .append(", \"extra\": ").append(result.filesExtra())
+                .append(", \"copied\": ").append(result.filesCopied())
+                .append(", \"wouldCopy\": ").append(result.filesWouldCopy())
+                .append(", \"uncertain\": ").append(result.filesUncertain())
+                .append(", \"notTransferred\": ").append(result.filesNotTransferred())
+                .append(", \"transfersAnnounced\": ").append(result.transfersAnnounced())
+                .append(", \"transfersCompletedByRsync\": ").append(result.transfersCompletedByRsync())
+                .append(", \"processed\": ").append(result.filesProcessed())
+                .append("},\n");
         json.append("  \"rsyncExitCode\": ").append(result.rsyncExitCode()).append(",\n");
         json.append("  \"errors\": ").append(array(result.errors())).append(",\n");
         json.append("  \"warnings\": ").append(array(result.warnings())).append(",\n");

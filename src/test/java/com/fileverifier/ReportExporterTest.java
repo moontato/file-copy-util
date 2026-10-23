@@ -65,8 +65,12 @@ class ReportExporterTest {
         String json = ReportExporter.toJson(sample());
 
         assertTrue(json.contains("\"status\": \"COMPLETED\""), json);
-        assertTrue(json.contains("\"checked\": 4"), json);
+        // Three verdicts and one extra: the extra was reported, not compared, so checked counts 3 while the
+        // progress unit counts 4.
+        assertTrue(json.contains("\"checked\": 3"), json);
+        assertTrue(json.contains("\"processed\": 4"), json);
         assertTrue(json.contains("\"copied\": 2"), json);
+        assertTrue(json.contains("\"transfersCompletedByRsync\": 2"), json);
         assertTrue(json.contains("\"extra\": 1"), json);
         assertTrue(json.contains("\"rsyncExitCode\": 0"), json);
         assertTrue(json.contains("\"errors\": [\"rsync error: something (code 23)\"]"), json);

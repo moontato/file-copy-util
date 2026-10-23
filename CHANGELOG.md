@@ -2,6 +2,25 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Changed — the figures count what their names say
+
+- `checked` is now the sum of `matched + mismatched + missing`. A destination-only file was **reported**, not
+  compared against anything, so it no longer counts as a check: a job that found three extras and compared nothing
+  checked nothing. The row count that does include extras is reported separately, as `processed`.
+- `copied` counts the transfers this job can **show** arrived, tallied per file by the rules in DESIGN §18, instead
+  of being rsync's announcement count capped by its `xfr#`. What rsync announced (`transfersAnnounced`) and what it
+  claimed to have completed (`transfersCompletedByRsync`) are reported beside it as observations of their own. A
+  cut-short copy that used to claim `copied=1` on rsync's word now says `copied=0, uncertain=1,
+  rsync-said-completed=1` when the destination cannot show which file arrived — and still counts a file that
+  really was created at the size the source had.
+- Dry runs report `wouldCopy` and report `copied=0`: an export saying a file was copied would record an event that
+  never happened.
+- A file that was copied and then verified contributes to both families, once each — `copied=1, checked=1,
+  matched=1` is one file, not two.
+- The command line prints a second totals line (`transfers: …`), the window logs the same figures, and both exports
+  carry them, so whatever a reader adds up is what the report states. `JobStatus` per-file rows are unchanged: the
+  verdict column answers the comparison question, the transfer column the copying one.
+
 ### Fixed — symbolic links are judged as the objects they are
 
 - Under **LINK**, a link is compared by its **kind and its link text**, never by hashing: no digest is taken of a

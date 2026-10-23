@@ -1364,6 +1364,17 @@ public final class FileVerifierView extends JPanel {
         log(String.format("Totals: checked=%d copied=%d matched=%d mismatched=%d missing=%d extra=%d",
             result.filesChecked(), result.filesCopied(), result.filesMatched(),
             result.filesMismatched(), result.filesMissing(), result.filesExtra()));
+        if (result.transfersAnnounced() > 0 || result.filesCopied() > 0 || result.filesWouldCopy() > 0
+                || result.filesUncertain() > 0) {
+            // Checked counts verdicts, so an extra file - reported without being compared - is not in it. The
+            // transfer figures answer a different question, and rsync's own counts stay beside them rather
+            // than being merged into the figure this program can support.
+            log(String.format("  transfers: copied=%d would-copy=%d uncertain=%d not-transferred=%d,"
+                            + " rsync announced=%d, rsync said it completed=%d; rows reported=%d",
+                    result.filesCopied(), result.filesWouldCopy(), result.filesUncertain(),
+                    result.filesNotTransferred(), result.transfersAnnounced(),
+                    result.transfersCompletedByRsync(), result.filesProcessed()));
+        }
         for (String warning : result.warnings()) {
             log("  warning: " + warning);
         }

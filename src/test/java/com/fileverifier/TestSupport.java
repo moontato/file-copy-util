@@ -133,6 +133,22 @@ final class TestSupport {
      * Writes a stand-in rsync that prints the given lines and exits with the given code, so the
      * engine's failure handling can be tested without a real transfer.
      */
+    /**
+     * Wait for a condition instead of guessing how long to sleep. Fixtures use this to act at a particular
+     * moment in a job - after a transfer has started, for instance.
+     */
+    static boolean waitFor(java.util.function.BooleanSupplier condition, long millis)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + millis;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            Thread.sleep(50L);
+        }
+        return condition.getAsBoolean();
+    }
+
     static Path fakeRsync(Path dir, String output, int exitCode) throws IOException {
         Path script = dir.resolve("fake-rsync");
         Files.writeString(script, "#!/bin/sh\nprintf '%s\\n' " + shellQuote(output) + "\nexit " + exitCode + "\n",
@@ -177,6 +193,32 @@ final class TestSupport {
      * (the hidden file a killed transfer leaves), and then hangs so a timeout or a cancellation can cut
      * it off. Pass null for {@code partialFile} to model a run that cleaned up after itself.
      */
+    /**
+     * A stand-in for rsync that copies one file for real, announces a second one, and then fails the way
+     * rsync fails when a write goes wrong partway through. The file it wrote is proof: it was not in the
+     * destination before the job and is afterwards, at the size the source was.
+     */
+    static Path copyingThenFailingRsync(Path dir, String copiedName, String failingName) throws IOException {
+        Path script = dir.resolve("fake-copying-then-failing-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("src=$(eval echo \"\\${$(($#-1))}\")\n");
+        body.append("dst=$(eval echo \"\\${$#}\")\n");
+        body.append("printf '%s\\n' '>f+++++++++|").append(copiedName).append("'\n");
+        body.append("cp \"$src/").append(copiedName).append("\" \"$dst/").append(copiedName).append("\"\n");
+        body.append("printf '%s\\n' '     100   0%   1.23MB/s   00:00:00 (xfr#1, to-chk=1/2)'\n");
+        body.append("printf '%s\\n' '>f+++++++++|").append(failingName).append("'\n");
+        body.append("printf '%s\\n' 'rsync: [receiver] write failed on ").append(failingName)
+                .append(": Input/output error (code 30)'\n");
+        body.append("exit 23\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
     static Path hangingFakeRsync(Path dir, String output, String partialFile) throws IOException {
         Path script = dir.resolve("fake-hanging-rsync");
         StringBuilder body = new StringBuilder();

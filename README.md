@@ -140,11 +140,24 @@ An empty selection is refused rather than treated as "all files": use **Select A
 
 ```
 Copy & Verify Complete: 512 file(s) checked, 3 copied, 509 matched, 0 mismatched, 0 missing
-Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0
+Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0 extra=0
+  transfers: copied=3 would-copy=0 uncertain=0 not-transferred=0, rsync announced=3, rsync said it completed=3; rows reported=512
 ```
 
-- **checked** — the selected files that were verified (`checked = matched + mismatched + missing`, extras counted separately)
-- **copied** — items `rsync` created or changed at the destination (a copied symbolic link counts, an unchanged file does not). rsync announces a file before its data has moved, so on a job that was cut short this is capped by rsync's own completed-transfer count (`xfr#`) and the message says "announced N, of which at most M finished"
+- **checked** — the files a verdict answered something about: `checked = matched + mismatched + missing`. A
+  destination-only file was reported, not compared against anything, so it is not one of them; the rows the job
+  reported on, extras included, are counted separately as *rows reported*
+- **copied** — files this run can **show** it wrote: a file that was not at the destination before and is
+  afterwards, at the size its source had, or one rsync replaced outright (a copied symbolic link counts, an
+  unchanged file does not)
+- **uncertain** — transfers `rsync` started that the destination cannot account for. A file that was already there,
+  of the same size, looks the same whether the copy finished or never did, so those transfers are reported as
+  uncertain rather than claimed as copies. Re-run with verification to settle them
+- **would-copy** — files a `--dry-run` would have written. A dry run never reports `copied`
+- **rsync announced / rsync said it completed** — `rsync`'s own counts (the itemize lines, and its `xfr#` figure).
+  They are reported beside this program's figures, never merged into them: an announcement says a transfer started.
+  Where they disagree with what the destination shows, the message says so — "announced 3, completed 1 of them" —
+  and the files in between are listed as uncertain
 - **mismatch** — present at both ends with different SHA-256 (`src=` / `dst=` prefixes are shown)
 - **missing** — selected in the source, not present at the destination
 - **destination-only** (`EXTRA`) — present at the destination, not in the source selection (Verify Only, when *Report destination-only files* is on)
@@ -203,7 +216,10 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-269 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
+274 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
+family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
+copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
 and directory links are carried as objects, FOLLOW compares bytes and says so, and a link in the destination is
 never followed), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
