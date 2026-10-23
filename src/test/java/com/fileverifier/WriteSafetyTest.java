@@ -521,6 +521,31 @@ class WriteSafetyTest {
             "no temporary report file left behind: " + namesIn(dest));
     }
 
+    /**
+     * Two findings in one run: a name it was given that was not there, which {@code --strict} fails for, and a
+     * report that could not be written. The second is the worse of the two - a run that cannot record itself
+     * leaves nothing to check afterwards - so it is the code the run reports.
+     */
+    @Test
+    void aReportThatCouldNotBeWrittenOutranksAStrictFinding() throws Exception {
+        Path base = Files.createDirectories(root.resolve("strict-report-race"));
+        PrintCapture out = new PrintCapture();
+        Path src = Files.createDirectories(base.resolve("src"));
+        Path dest = Files.createDirectories(base.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "1");
+        TestSupport.write(src.resolve("report.csv"), "a file that happens to be called report.csv");
+        Path target = dest.resolve("report.csv");
+
+        int exit = Cli.run(List.of("--cli", "--quiet", "--strict", "--source", src.toString(),
+            "--dest", dest.toString(), "--files", "a.txt,report.csv,not-there.txt", "--no-verify",
+            "--allow-report-in-tree", "--csv", target.toString()).toArray(String[]::new),
+            out.outStream, out.errStream);
+
+        assertEquals(Cli.EXIT_REPORT_FAILED, exit,
+            "the strict finding is real, but the missing record is worse: " + out.out() + out.err());
+        assertTrue(out.out().contains("not-there.txt"), out.out());
+    }
+
     @Test
     void twoFormatsNamingOnePathAreRefusedBeforeTheTransferRuns() throws Exception {
         PrintCapture out = new PrintCapture();
