@@ -2,6 +2,19 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Added — `--strict`, and an ignore pattern that does not compile says so
+
+- `--strict` makes a run nobody is watching fail when it did not do everything it was named for. It fails for one
+  case: a name this run was given (`--files`, `--files-from`, …) had no file behind it when the work set was built
+  — **exit 5**. The other things in the documented list (a refused name, a missing or vanished file, a report that
+  could not be written) already failed the run without the switch. It does not fail a run for an observation: a file
+  that needed no transfer, and a destination-only file, stay observations.
+- Those names are now a figure rather than only a sentence: `selectedButAbsent` in JSON, `# selectedAbsent,N` in the
+  CSV metadata block. `--strict` changes the exit code and nothing else — same job, same copies.
+- An ignore pattern with invalid glob syntax used to be dropped silently, which turned a typo into a directory being
+  copied when the reader believed it was excluded. The job now warns and names the pattern; the other patterns still
+  apply, and the file the broken one would have excluded is judged on what it is — a broken rule is not a verdict.
+
 ### Changed — a CSV cell that a spreadsheet would evaluate is disarmed
 
 - A CSV field whose first character is `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading

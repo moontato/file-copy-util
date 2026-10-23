@@ -92,6 +92,7 @@ files are used exactly as written; a file that is not valid UTF-8 is refused rat
 | 2 | bad command line — **including a report path that is already taken, in a directory that does not exist, named by both `--csv` and `--json`, or inside the copied files without `--allow-report-in-tree`**. Report paths are checked before the job starts, so these runs copy nothing |
 | 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
 | 4 | the job succeeded, but a report could not be written (refused, or the write failed) — the copies happened, the record of them did not |
+| 5 | only with `--strict`: the job completed and found nothing wrong, but a name this run was given had no file behind it |
 
 Other CLI options: `--verify-only`, `--no-verify` (copy without comparing; the two flags contradict each
 other and using both is a usage error), `--dry-run`, `--exclude a.txt,...` (with `--all`),
@@ -102,7 +103,36 @@ other and using both is a usage error), `--dry-run`, `--exclude a.txt,...` (with
 overwriting anything, and a report path that is no good is refused **before the copy starts**),
 `--allow-collision-names` (accept colliding names and copy them; without it a copy that finds collisions refuses
 and writes nothing — in the window, accepting covers the names you were shown, so a different pair in a later job
-is asked about again).
+is asked about again), `--strict`.
+
+### What `--strict` changes
+
+`--strict` is for a run nobody is watching. It changes the exit code and nothing else — same copies, same
+verdicts, same output. It fails the run for one more thing:
+
+| Situation | Without `--strict` | With `--strict` |
+| --- | --- | --- |
+| a name in `--files`/`--files-from` had no file behind it when the work set was built | warns, exit 0 | warns, **exit 5** |
+| a name was refused (it points outside the directory it belongs to) | exit 1 | exit 1 |
+| a file was missing at the destination, or vanished mid-job | exit 3 | exit 3 |
+| a report could not be written | exit 4 | exit 4 |
+
+It does **not** fail a run for an observation: a file that needed no transfer because it was already identical, and
+a file reported as destination-only, are reported and leave the exit code alone. The names that were asked for and
+not found are in the report as well as the terminal: JSON `selectedButAbsent`, CSV `# selectedAbsent,N`.
+
+### An ignore pattern that does not compile says so
+
+An `--ignore` (or window Ignore-field) pattern with bad glob syntax cannot protect anything. It used to be dropped
+in silence, so a typo meant a directory was copied when the reader believed it had been left out. The job now
+warns and names the pattern:
+
+```
+warning: Ignore pattern not applied because it is not valid syntax: [bad - a file this pattern was meant to leave out may be in this job after all.
+```
+
+The rest of the ignore list still applies, and nothing is invented about the files: the file the broken pattern
+would have excluded is handled normally and judged on what it is, because a broken rule is not evidence.
 
 ### Workflow
 
@@ -216,7 +246,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-283 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+289 tests, headless (no display needed): counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
 copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling

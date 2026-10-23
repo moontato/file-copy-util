@@ -1,13 +1,13 @@
-# Audit remediation plan — File Copy Util (revision 14)
+# Audit remediation plan — File Copy Util (revision 15)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
 **Status:** approved and under way, revision 12 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
 `33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
 under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
-green, item 3 (report completeness) is implemented and green, and item 4 (CSV formula neutralisation) is
-implemented and green — which closes the one hardening item the changelog had been carrying as "not done". Item 5
-(`--strict` and invalid-pattern warnings) follows. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
+green, item 4 (CSV formula neutralisation) is implemented and green — which closes the one hardening item the
+changelog had been carrying as "not done" — and item 5 (`--strict`, and invalid ignore patterns) is implemented and
+green. **Phase 5 is complete.** Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
 DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
 ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
@@ -588,7 +588,29 @@ before and after, because the table was never the format at risk.
 - The class comment that told the next reader "do not describe this format as safe to open in a spreadsheet until
   it is" is replaced by what the rule now is.
 
-## Phase 5 — truthful verdicts and counts (items 1–4 green)
+## Phase 5 — truthful verdicts and counts (items 1–5 complete)
+
+**Item 5, `--strict` and ignore patterns that do not compile (§2.12, §2.13) — implemented, green.**
+
+Red first: the six new fixtures were written before the API existed, so the red evidence here is a compile failure
+naming exactly the three new contracts — `Cli.EXIT_STRICT`, `ScanOptions.CompiledRules`, `ScanOptions.compile()`.
+Once the API landed, the fixtures ran, and two of them corrected my own assumptions rather than the code's:
+destination-only reporting belongs to verify-only jobs (a copying job's destination extras may be its own writes),
+and a file that needed no transfer records no transfer fact at all, so it is `copied=0`, not `not-transferred=1`. The
+fixture asserts the figures that are actually produced, and still asserts the point it was written for: an
+observation is not a failure.
+
+| Change | Why |
+|---|---|
+| `JobResult.selectedButAbsent`, carried on `JobControl` from the moment the work set is fixed | the names a run was given and could not find have to outlive the sentence in the warning list, and belong to the job that was asked, not to the engine |
+| `--strict`, exit 5 for an unanswered request only | §2.12's list, kept to the one case that was not already a failure; a refused name (1), a missing/vanished file (3) and an unwritable report (4) already fail the run |
+| JSON `selectedButAbsent`, CSV `# selectedAbsent,N` | a scheduled run's evidence is its report, not its terminal |
+| report-write failure outranks a strict finding | a run that cannot record itself is a worse failure than one that did not do everything |
+| `ScanOptions.compile()` → `CompiledRules(rules, notApplied)`; the scanner warns per pattern | an ignore rule is a protection; a rule that cannot compile protects nothing, and silence turns a typo into a copy the reader believed was excluded |
+| one bad rule cannot drop the good ones; no verdict is invented | the file a broken rule would have excluded is handled normally and judged on what it is |
+
+Suite: **289 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **283 green** pinned
+to 3.1.3.
 
 **Item 3, a report that cannot look complete when it is not (§2.8, §2.13) — implemented, green.**
 

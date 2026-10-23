@@ -361,6 +361,7 @@ public final class ReportExporter {
         csv.append("# transfersAnnounced,").append(result.transfersAnnounced()).append('\n');
         csv.append("# transfersCompletedByRsync,").append(result.transfersCompletedByRsync()).append('\n');
         csv.append("# rsyncExitCode,").append(result.rsyncExitCode()).append('\n');
+        csv.append("# selectedAbsent,").append(result.selectedButAbsent().size()).append('\n');
         csv.append("# errors,").append(result.errors().size()).append('\n');
         csv.append("# warnings,").append(result.warnings().size()).append('\n');
         csv.append("status,path,source_sha256,destination_sha256,transfer,verification\n");
@@ -422,6 +423,7 @@ public final class ReportExporter {
                 .append(", \"processed\": ").append(result.filesProcessed())
                 .append("},\n");
         json.append("  \"rsyncExitCode\": ").append(result.rsyncExitCode()).append(",\n");
+        json.append("  \"selectedButAbsent\": ").append(array(result.selectedButAbsent())).append(",\n");
         json.append("  \"errors\": ").append(array(result.errors())).append(",\n");
         json.append("  \"warnings\": ").append(array(result.warnings())).append(",\n");
         json.append("  \"results\": [\n");

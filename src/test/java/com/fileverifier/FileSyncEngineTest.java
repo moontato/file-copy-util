@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -87,6 +88,33 @@ class FileSyncEngineTest {
 
     private static void assumeRsync() {
         assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
+    }
+
+    /**
+     * A pattern that cannot compile was meant to keep a file out of the job. The file is in the job after
+     * all, and the job has to say so. What it must not do is make the situation worse by inventing a result:
+     * the file is compared honestly, and the pattern is named in a warning.
+     */
+    @Test
+    void anIgnorePatternThatDoesNotCompileWarnsAndDoesNotInventAVerdict() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("keep.txt"), "same\n");
+        TestSupport.write(dest.resolve("keep.txt"), "same\n");
+
+        ScanOptions broken = new ScanOptions(List.of("[bad"), true, ScanOptions.SymlinkPolicy.SKIP);
+        FileSyncEngine.JobResult result = runExpectingUntouchedSource(FileSyncEngine.JobType.COPY_AND_VERIFY,
+                TestSupport.selection("keep.txt"), TestSupport.none(), broken, false, false);
+
+        assertAll(
+                // The file is in the job, and its verdict is the honest one: it is there and it matches.
+                () -> assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message()),
+                () -> assertEquals(1, result.filesMatched(), result.message()),
+                () -> assertEquals(0, result.filesMissing(), "no verdict was invented for the broken pattern"),
+                () -> assertEquals(0, result.filesMismatched(), "no verdict was invented for the broken pattern"),
+                // The protection that failed says which one it was.
+                () -> assertTrue(result.warnings().stream().anyMatch(w -> w.contains("[bad")
+                                && w.toLowerCase().contains("not applied")),
+                        "a warning names the pattern that was not applied: " + result.warnings()));
     }
 
     // ---------------------------------------------------------------- B1

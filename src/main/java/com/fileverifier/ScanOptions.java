@@ -69,18 +69,39 @@ public record ScanOptions(List<String> ignorePatterns, boolean includeHidden, Sy
         }
     }
 
-    /** Compiles the patterns once per scan. Malformed patterns are dropped and reported by callers. */
-    public List<IgnoreRule> compileRules() {
+    /**
+     * The rules a scan can apply, and the patterns it was asked for that it could not compile.
+     *
+     * <p>An ignore pattern is a protection: the only reason to write one is to keep something out of the job.
+     * A pattern with bad glob syntax cannot protect anything, and dropping it in silence turns a typo into a
+     * directory being copied when the reader believed it would be left alone. So the pattern that was not
+     * applied is named, by both frontends, in a warning - and nothing else changes: the file is handled
+     * normally and judged on what it is, because a broken rule is not evidence about any file.
+     */
+    public record CompiledRules(List<IgnoreRule> rules, List<String> notApplied) {
+        public CompiledRules {
+            rules = List.copyOf(rules);
+            notApplied = List.copyOf(notApplied);
+        }
+    }
+
+    /** Compile every pattern once per scan, keeping the ones that did not compile as a named list. */
+    public CompiledRules compile() {
         List<IgnoreRule> rules = new ArrayList<>();
+        List<String> notApplied = new ArrayList<>();
         for (String pattern : ignorePatterns) {
             try {
                 rules.add(IgnoreRule.compile(pattern));
             } catch (IllegalArgumentException e) {
-                // Invalid glob syntax: the frame validates the field; a bad pattern is skipped here
-                // rather than failing the whole scan.
+                notApplied.add(pattern);
             }
         }
-        return rules;
+        return new CompiledRules(rules, notApplied);
+    }
+
+    /** The rules alone, for a caller that has nowhere to report the patterns it had to drop. */
+    public List<IgnoreRule> compileRules() {
+        return compile().rules();
     }
 
     /** Compilers kept for the scanner: one per scan, reused for every entry. */

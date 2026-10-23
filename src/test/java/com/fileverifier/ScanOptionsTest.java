@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -23,6 +24,26 @@ class ScanOptionsTest {
 
     private List<String> paths(DirectoryScanner.ScanResult result) {
         return result.files().stream().map(FileEntry::relPath).toList();
+    }
+
+    /**
+     * An ignore pattern is a protection: it keeps a file out of a job on purpose. If the pattern cannot
+     * compile and says nothing about itself, the protection quietly stops protecting, and the only clue is
+     * that a file appeared in the job that the reader expected not to see.
+     */
+    @Test
+    void anIgnorePatternThatCannotCompileIsNamedRatherThanVanishing() {
+        ScanOptions options = new ScanOptions(
+                List.of("[bad", "*.log", "*[unclosed"), true, ScanOptions.SymlinkPolicy.SKIP);
+        ScanOptions.CompiledRules rules = options.compile();
+        assertAll(
+                // The pattern that does compile still protects the job: one bad rule cannot take the good ones
+                // down with it.
+                () -> assertEquals(1, rules.rules().size(), "the compilable rule survives: " + rules.rules()),
+                () -> assertEquals(List.of("[bad", "*[unclosed"), rules.notApplied(),
+                        "both bad patterns are named, in the order they were given"),
+                // The pattern is reported as it was typed, not as a guess at what it meant.
+                () -> assertEquals("[bad", rules.notApplied().get(0)));
     }
 
     @Test

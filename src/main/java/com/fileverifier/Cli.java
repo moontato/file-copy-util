@@ -36,6 +36,12 @@ public final class Cli {
      * has not been recorded, so it is not exit 0.
      */
     public static final int EXIT_REPORT_FAILED = 4;
+    /**
+     * With <code>--strict</code>: the job finished and reported no problem with the files it handled, but it
+     * did not handle everything it was asked to. Nothing was wrong with the copies; something the caller named
+     * was simply not there to copy.
+     */
+    public static final int EXIT_STRICT = 5;
 
     private static final String USAGE = """
         File Copy Util - copy and verify files between directories (window title: File Verifier & Copier)
@@ -87,6 +93,8 @@ public final class Cli {
           --allow-report-in-tree    allow a new report file inside the source or destination tree. It never
                                     allows overwriting anything that is already there
           --quiet                   no progress output
+          --strict                  a run nobody is watching: exit non-zero when the job did not do
+                                    everything it was named for (see "What --strict fails for")
           --help                    this text
 
         An empty selection is never treated as "all files": either --files, --files-from(0) or --all is
@@ -95,6 +103,19 @@ public final class Cli {
         Which rsync is used is the one on PATH, or the one FCU_RSYNC names. Pin it when you need the run to
         mean something: the itemize lines, the progress stats and the hidden temporary files are rsync
         behaviour, and behaviour differs between versions.
+
+        What --strict fails for, and nothing else:
+          - a name this run was given (--files, --files-from, --exclude-from-style lists) had no file behind
+            it when the work set was built: exit 5. The same run without --strict copies what was there and
+            warns, with exit 0.
+          - a name was refused because it points outside the directory it belongs to: exit 1, with or
+            without --strict - a refusal already fails the job.
+          - a file the job was handling disappeared, or verification found it missing at the destination:
+            exit 3, with or without --strict.
+          - a report could not be written: exit 4, with or without --strict.
+        --strict changes the exit code and nothing else. It does not fail a job for an observation: a file that
+        needed no transfer because it was already identical, and a file reported as extra in the destination,
+        are both reported and both leave the exit code alone.
 
         Name syntax. --files/--exclude/--exclude-dest are comma separated and each name is trimmed, which
         cannot express a name with a comma in it, a leading or trailing space, or a name starting with '#'
@@ -142,7 +163,7 @@ public final class Cli {
     public record Options(JobRequest request, long timeoutMillis, long bandwidthLimitKbps,
                           int maxResults, Path csvPath, Path jsonPath, boolean quiet,
                           List<String> destinationExcluded, boolean allowReportInTree,
-                          boolean allowCollisionNames) {
+                          boolean allowCollisionNames, boolean strict) {
 
         public Options {
             destinationExcluded = List.copyOf(destinationExcluded);
@@ -202,6 +223,7 @@ public final class Cli {
         boolean quiet = false;
         boolean allowReportInTree = false;
         boolean allowCollisionNames = false;
+        boolean strict = false;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -292,6 +314,7 @@ public final class Cli {
                 case "--dry-run" -> dryRun = true;
                 case "--allow-report-in-tree" -> allowReportInTree = true;
                 case "--allow-collision-names" -> allowCollisionNames = true;
+                case "--strict" -> strict = true;
                 case "--bwlimit" -> {
                     String value = value(args, i, arg);
                     i++;
@@ -411,7 +434,7 @@ public final class Cli {
         return new Options(request, timeoutMillis, bandwidthLimitKbps, maxResults,
                 csvPath == null ? null : Path.of(csvPath),
                 jsonPath == null ? null : Path.of(jsonPath), quiet,
-                List.copyOf(excludedAtDestination), allowReportInTree, allowCollisionNames);
+                List.copyOf(excludedAtDestination), allowReportInTree, allowCollisionNames, strict);
     }
 
     /**
@@ -647,20 +670,46 @@ public final class Cli {
                     result.rowsListed(), result.rowsListed() + result.rowsOmitted());
         }
 
-        int exit = exitCode(result);
-        if (!writeReports(options, result, out, err) && exit == EXIT_OK) {
+        int exit = exitCode(result, options.strict());
+        if (exit == EXIT_STRICT) {
+            // The warning above named the names; this says why the run is now a non-zero run, so that the
+            // exit code of a scheduled job can be read without scrolling through its output.
+            out.printf("strict: exit %d because %d name(s) this run was given had no file behind them"
+                    + " when the work set was built.%n", EXIT_STRICT, result.selectedButAbsent().size());
+        }
+        if (!writeReports(options, result, out, err) && (exit == EXIT_OK || exit == EXIT_STRICT)) {
             // The copies happened; the record of them did not survive. A run whose report could not be
-            // written is not a clean run.
+            // written is not a clean run, and that outranks a strictness finding.
             exit = EXIT_REPORT_FAILED;
         }
         return exit;
     }
 
     static int exitCode(JobResult result) {
+        return exitCode(result, false);
+    }
+
+    /**
+     * What the run's exit code means. Without {@code --strict} this is the documented behaviour of every
+     * earlier version: a completed job that asked for a name and did not find it warns, and exits 0.
+     *
+     * <p>With it, one more case is a failure: a name this run was given that had no file behind it. The other
+     * cases in the documented list - a refused name, a vanished or missing file, a report that could not be
+     * written - already fail the run, with or without the switch. Nothing here turns an observation (a file
+     * that needed no transfer, a file extra in the destination) into a failure: that would punish the switch
+     * for telling the truth, and people would stop using it.
+     */
+    static int exitCode(JobResult result, boolean strict) {
         if (result.status() != FileSyncEngine.JobStatus.COMPLETED) {
             return EXIT_JOB_FAILED;
         }
-        return result.filesMismatched() + result.filesMissing() > 0 ? EXIT_VERIFICATION_PROBLEMS : EXIT_OK;
+        if (result.filesMismatched() + result.filesMissing() > 0) {
+            return EXIT_VERIFICATION_PROBLEMS;
+        }
+        if (strict && !result.selectedButAbsent().isEmpty()) {
+            return EXIT_STRICT;
+        }
+        return EXIT_OK;
     }
 
     /**

@@ -731,6 +731,25 @@ says, and the disagreement stays on the page instead of being averaged away.
 **Progress unit.** `processed` counts the rows the job reported on, extras included. That is what the progress bar
 counts. It is not `checked`.
 
+### Requests that went unanswered, and rules that could not be applied
+
+Two silences that both read as success.
+
+**A name the job was given and did not find.** The work set is built from what the source has, so a name in
+`--files` that is not there is simply not in it. The job warns and carries on; the names are kept on the job
+(`JobControl.selectedButAbsent`) and reported as a figure — `selectedButAbsent` in JSON, `# selectedAbsent,N` in the
+CSV — so a scheduled run can decide that "did without" is not "did what was asked". That decision is `--strict`, and
+it is deliberately narrow: exit 5 for the unanswered request and nothing else, because a switch that punished
+harmless observations (an already-identical file needing no transfer, a destination-only file) would get switched
+off. Refused names, missing/vanished files and an unwritable report already fail the run by themselves.
+
+**An ignore pattern that cannot compile.** An ignore rule exists to keep something out; a rule with bad glob syntax
+keeps nothing out, and dropping it quietly makes a typo look like a successful exclusion. `ScanOptions.compile()`
+returns the rules it could build *and* the patterns it could not, and the scanner turns the second list into warnings
+naming each pattern as it was typed (escaped only so it cannot forge a log line). One bad rule cannot take the good
+ones down. Nothing is invented about the files: the file the broken rule would have excluded is scanned, copied and
+compared like any other, and judged on what it is.
+
 ### A CSV cell that a spreadsheet would evaluate
 
 A copied folder can contain a file named `=HYPERLINK("http://attacker")`. Quoting it is not enough: a spreadsheet

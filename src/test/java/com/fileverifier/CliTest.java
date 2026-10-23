@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -426,6 +427,95 @@ class CliTest {
         assertEquals(Cli.EXIT_USAGE, run(o, "--cli", "--source", source.toString(), "--dest", dest.toString(),
                 "--all", "--bwlimit", "fast"));
         assertTrue(o.err().contains("--bwlimit must be KB/s"), o.err());
+    }
+
+    /**
+     * {@code --strict} is for runs nobody is watching: the exit code has to say that the job did not do
+     * everything it was asked to do, rather than only mentioning it in a line of output that scrolls away.
+     * The switch changes the exit code and nothing else - the same job, the same copies, the same verdicts.
+     */
+    @Test
+    void strictTurnsAnAbsentRequestedNameIntoANonZeroExitAndChangesNothingElse() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha\n");
+
+        Output plain = new Output();
+        int plainExit = run(plain, "--cli", "--quiet", "--source", source.toString(), "--dest", dest.toString(),
+                "--files", "a.txt,not-there.txt", "--no-verify");
+        Output strict = new Output();
+        int strictExit = run(strict, "--cli", "--quiet", "--strict", "--source", source.toString(),
+                "--dest", dest.toString(), "--files", "a.txt,not-there.txt", "--no-verify");
+
+        assertAll(
+                () -> assertEquals(Cli.EXIT_OK, plainExit,
+                        "without the switch this stays the documented behaviour: " + plain.out()),
+                () -> assertEquals(Cli.EXIT_STRICT, strictExit, strict.out()),
+                // Same job either way: the file that was there was copied, and both runs say which one was not.
+                () -> assertTrue(Files.exists(dest.resolve("a.txt")), plain.out()),
+                () -> assertTrue(Files.exists(dest.resolve("a.txt")), strict.out()),
+                () -> assertTrue(plain.out().contains("not-there.txt"), plain.out()),
+                () -> assertTrue(strict.out().contains("not-there.txt"), strict.out()),
+                () -> assertTrue(plain.out().contains("were not found in the source"), plain.out()),
+                () -> assertTrue(strict.out().contains("were not found in the source"), strict.out()));
+    }
+
+    /** The names have to be in the report as well as the terminal, or a scheduled run loses them. */
+    @Test
+    void theReportNamesTheRequestedFilesThatWereNotThere() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha\n");
+        Path csv = reports.resolve("report.csv");
+        Path json = reports.resolve("report.json");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--quiet", "--source", source.toString(), "--dest", dest.toString(),
+                "--files", "a.txt,not-there.txt", "--no-verify", "--csv", csv.toString(),
+                "--json", json.toString());
+        assertEquals(Cli.EXIT_OK, exit, o.out());
+
+        String csvText = Files.readString(csv);
+        String jsonText = Files.readString(json);
+        assertAll(
+                () -> assertTrue(csvText.contains("# selectedAbsent,1"), csvText),
+                () -> assertTrue(jsonText.contains("\"selectedButAbsent\": [\"not-there.txt\"]"), jsonText));
+    }
+
+    /**
+     * Strict means "did the job do what it was asked", not "did anything interesting happen". A file that
+     * needed no transfer, and a file reported as extra in the destination, are observations: turning them
+     * into a failure would push people away from the switch that reports the real gaps.
+     */
+    @Test
+    void strictDoesNotTurnAnObservationIntoAFailure() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "same\n");
+        TestSupport.write(dest.resolve("a.txt"), "same\n");
+        TestSupport.write(dest.resolve("extra.txt"), "left over\n");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--quiet", "--strict", "--verify-only", "--source", source.toString(),
+                "--dest", dest.toString(), "--all");
+
+        // The two observations the switch must not punish: a file that needed no transfer at all (nothing was
+        // copied, and that is the good outcome), and a file reported as extra in the destination.
+        assertEquals(Cli.EXIT_OK, exit, o.out());
+        assertTrue(o.out().contains("copied=0"), o.out());
+        assertTrue(o.out().contains("matched=1"), o.out());
+        assertTrue(o.out().contains("destination-only=1"), o.out());
+    }
+
+    /** A refusal is already a failed job; --strict does not invent a second way to fail it. */
+    @Test
+    void strictLeavesARefusedNameFailingTheWayItAlreadyDoes() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "alpha\n");
+
+        Output o = new Output();
+        int exit = run(o, "--cli", "--quiet", "--strict", "--source", source.toString(), "--dest", dest.toString(),
+                "--files", "a.txt,../escape");
+
+        assertEquals(Cli.EXIT_JOB_FAILED, exit, o.out());
+        assertTrue(o.out().contains("outside the directory"), o.out());
     }
 
     @Test

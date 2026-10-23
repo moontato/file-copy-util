@@ -110,7 +110,15 @@ public final class DirectoryScanner {
         Collector(Path base, ScanOptions options) {
             this.base = base;
             this.options = options;
-            this.rules = options.compileRules();
+            ScanOptions.CompiledRules compiled = options.compile();
+            this.rules = compiled.rules();
+            for (String dropped : compiled.notApplied()) {
+                // Named as it was typed, escaped only so it cannot forge a log line. The reader has to be
+                // able to see which rule stopped working, and that a file it meant to exclude is in the job.
+                warnings.add("Ignore pattern not applied because it is not valid syntax: "
+                        + RsyncNameCodec.forDisplay(dropped)
+                        + " - a file this pattern was meant to leave out may be in this job after all.");
+            }
             this.policy = options.symlinkPolicy();
         }
 

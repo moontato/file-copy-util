@@ -360,13 +360,29 @@ public class FileSyncEngine implements AutoCloseable {
                             int filesNotTransferred, int transfersAnnounced, int transfersCompletedByRsync,
                             int filesProcessed,
                             int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
-                            List<String> warnings, int rowsOmitted, AbortCause abortCause) {
+                            List<String> warnings, int rowsOmitted, AbortCause abortCause,
+                            List<String> selectedButAbsent) {
 
         public JobResult {
             outcomes = List.copyOf(outcomes);
             errors = List.copyOf(errors);
             warnings = List.copyOf(warnings);
+            selectedButAbsent = List.copyOf(selectedButAbsent);
             abortCause = abortCause == null ? AbortCause.NONE : abortCause;
+        }
+
+        /** The shape from before the unanswered requests were kept as a figure: nothing known about them. */
+        public JobResult(JobStatus status, String message,
+                         int filesMatched, int filesMismatched, int filesMissing, int filesExtra,
+                         int filesCopied, int filesWouldCopy, int filesUncertain,
+                         int filesNotTransferred, int transfersAnnounced, int transfersCompletedByRsync,
+                         int filesProcessed, int rsyncExitCode, List<FileOutcome> outcomes,
+                         List<String> errors, List<String> warnings, int rowsOmitted,
+                         AbortCause abortCause) {
+            this(status, message, filesMatched, filesMismatched, filesMissing, filesExtra, filesCopied,
+                    filesWouldCopy, filesUncertain, filesNotTransferred, transfersAnnounced,
+                    transfersCompletedByRsync, filesProcessed, rsyncExitCode, outcomes, errors, warnings,
+                    rowsOmitted, abortCause, List.of());
         }
 
         /**
@@ -394,6 +410,16 @@ public class FileSyncEngine implements AutoCloseable {
          */
         public int filesChecked() {
             return filesMatched + filesMismatched + filesMissing;
+        }
+
+        /**
+         * Names the job was asked to handle that had no file behind them when the work set was built - a
+         * typo in a list, or a file deleted after the lists were made. The job warns about them and does
+         * without them; keeping them as a figure rather than only a sentence is what lets a run nobody is
+         * watching decide that "did without" is not "did what was asked".
+         */
+        public List<String> selectedButAbsent() {
+            return selectedButAbsent;
         }
 
         /** How many per-file rows the report holds. */
@@ -504,6 +530,12 @@ public class FileSyncEngine implements AutoCloseable {
         private final AtomicBoolean cancelRequested = new AtomicBoolean();
         private final AtomicReference<AbortCause> cause = new AtomicReference<>(AbortCause.NONE);
         /**
+         * Names this job was asked for that had no file behind them at scan time. Per job, not per engine:
+         * the report and the {@code --strict} exit code both have to say, afterwards, which run left a
+         * request unanswered.
+         */
+        private volatile List<String> selectedButAbsent = List.of();
+        /**
          * The rsync this job started, and every process it had spawned, snapshotted while the parent was
          * still alive. A local rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only
          * the one Java started leaves the other two reading the source after this program has exited.
@@ -550,6 +582,14 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         /** The counters as this job last published them, or none if it never got that far. */
+        void setSelectedButAbsent(List<String> names) {
+            this.selectedButAbsent = List.copyOf(names);
+        }
+
+        List<String> selectedButAbsent() {
+            return selectedButAbsent;
+        }
+
         ProgressReporter.Counters counters() {
             ProgressReporter reporter = progress.get();
             return reporter == null ? ProgressReporter.emptyCounters() : reporter.snapshot();
@@ -1410,6 +1450,9 @@ public class FileSyncEngine implements AutoCloseable {
         // lot of memory to carry through a transfer for a lookup that is already finished.
         sourceRels = null;
         String notFoundText = describeNames(notFound);
+        // Kept on the job from here on: every report this job can produce, including one written after the
+        // thread was abandoned, should be able to say which requests went unanswered.
+        control.setSelectedButAbsent(notFound);
 
         // §2.2: containment in both trees, before anything is written or read. A name carrying ".." escapes
         // on its own; a name that looks contained escapes through a linked directory on the way. Both are
@@ -1608,7 +1651,7 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
-                    return rsyncFailedDuringCopy(progress, tally, outcomes, rsyncExitCode, errors, warnings,
+                    return rsyncFailedDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
                 if (rsyncExitCode == 24) {
@@ -1641,7 +1684,7 @@ public class FileSyncEngine implements AutoCloseable {
             }
             progress.finish(dryRun ? "Dry run complete" : "Copy complete");
             listener.onPhase("done");
-            return completedResult(progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun,
+            return completedResult(control, progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun,
                     request.jobType());
         }
 
@@ -1680,7 +1723,8 @@ public class FileSyncEngine implements AutoCloseable {
 
         progress.finish("Verification complete");
         listener.onPhase("done");
-        return completedResult(progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun, request.jobType());
+        return completedResult(control, progress, tally, outcomes, errors, warnings, rsyncExitCode, dryRun,
+                request.jobType());
     }
 
     /**
@@ -1731,7 +1775,7 @@ public class FileSyncEngine implements AutoCloseable {
      * A job whose verification was switched off says so here as well as in the warnings: a copy that was
      * never compared has to be readable as that, and not mistaken for a copy that passed.
      */
-    private JobResult completedResult(ProgressReporter progress, TransferTally tally,
+    private JobResult completedResult(JobControl control, ProgressReporter progress, TransferTally tally,
                                       List<FileOutcome> outcomes, List<String> errors,
                                       List<String> warnings, int rsyncExitCode, boolean dryRun, JobType jobType) {
         if (dryRun && jobType.copies()) {
@@ -1745,7 +1789,7 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.matched(), progress.mismatched(), progress.missing(), progress.extra(),
                 tally.copied(), tally.wouldCopy(), tally.uncertain(), tally.notTransferred(),
                 progress.copied(), claimedByRsync(progress), progress.processed(), rsyncExitCode, outcomes,
-                errors, warnings, rowsOmitted(progress, outcomes), AbortCause.NONE);
+                errors, warnings, rowsOmitted(progress, outcomes), AbortCause.NONE, control.selectedButAbsent());
     }
 
     private static String completionMessage(ProgressReporter progress, TransferTally tally, boolean dryRun,
@@ -1792,7 +1836,7 @@ public class FileSyncEngine implements AutoCloseable {
      * failure returned zeroed counters, so a job that had already written files reported "0 copied" while
      * those files sat in the destination. A cut-short job gets the same accounting as a cancelled one.
      */
-    private JobResult rsyncFailedDuringCopy(ProgressReporter progress, TransferTally tally,
+    private JobResult rsyncFailedDuringCopy(JobControl control, ProgressReporter progress, TransferTally tally,
                                             List<FileOutcome> outcomes,
                                             int exitCode, List<String> errors, List<String> warnings,
                                             List<Path> destinationTargets, boolean dryRun, boolean verifies) {
@@ -1807,7 +1851,8 @@ public class FileSyncEngine implements AutoCloseable {
         return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
-                outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.NONE);
+                outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.NONE,
+                control.selectedButAbsent());
     }
 
     /**
@@ -1892,7 +1937,8 @@ public class FileSyncEngine implements AutoCloseable {
         return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
-                outcomes, errors, extended, rowsOmitted(progress, outcomes), control.cause());
+                outcomes, errors, extended, rowsOmitted(progress, outcomes), control.cause(),
+                control.selectedButAbsent());
     }
 
     /**
@@ -1938,7 +1984,8 @@ public class FileSyncEngine implements AutoCloseable {
         return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), progress.copied(), claimedByRsync(progress), progress.processed(), 0,
-                outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause());
+                outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause(),
+                control.selectedButAbsent());
     }
 
     private JobResult timeoutResult(JobControl control, ProgressReporter progress, TransferTally tally,
@@ -1963,7 +2010,8 @@ public class FileSyncEngine implements AutoCloseable {
         return new JobResult(JobStatus.FAILED, message, progress.matched(), progress.mismatched(),
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), 0,
-                outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.TIMED_OUT);
+                outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.TIMED_OUT,
+                control.selectedButAbsent());
     }
 
     /**
@@ -2917,7 +2965,7 @@ public class FileSyncEngine implements AutoCloseable {
                 Math.max(0, counters.rsyncTransfers()), counters.processed(), 0, List.of(), List.of(),
                 List.of("the job's own thread was still finishing when this was reported; per-file results"
                         + " from it are not included"),
-                counters.rowCount(), why);
+                counters.rowCount(), why, control.selectedButAbsent());
         finishJob(forced, control, control.listener(), delivery);
     }
 
