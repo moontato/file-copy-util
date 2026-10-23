@@ -93,8 +93,11 @@ class ScanOptionsTest {
         DirectoryScanner.ScanResult result = DirectoryScanner.scanFiles(root,
                 options(List.of(), true, ScanOptions.SymlinkPolicy.LINK));
 
-        assertEquals(List.of("dir/a.txt", "real.txt"), paths(result));
-        assertEquals(1, result.skippedLinks());
+        // Under LINK a link to a directory is an object of its own: it is listed (so it is copied as a
+        // link and judged by its text), and the walk does not descend through it into another tree.
+        assertEquals(List.of("dir/a.txt", "mirror", "real.txt"), paths(result));
+        assertTrue(!paths(result).contains("mirror/a.txt"), paths(result).toString());
+        assertEquals(0, result.skippedLinks());
     }
 
     @Test

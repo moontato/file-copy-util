@@ -2,6 +2,24 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Fixed — symbolic links are judged as the objects they are
+
+- Under **LINK**, a link is compared by its **kind and its link text**, never by hashing: no digest is taken of a
+  link or of anything at the end of one, because the target is not the link. A link whose text differs is
+  reported as a mismatch with a warning naming what each side says.
+- A link that reached the destination as a regular file, and a regular file whose destination is a link, are
+  mismatches **in kind** - the warning says which object became which, and nothing is read through the link.
+- Under **LINK** the scanner now carries a link to a directory (listed, never descended into) and a **dangling**
+  link (an object with no target) instead of dropping both. They are copied as links and judged by their text, so
+  a dangling link that arrived dangling is no longer reported as missing, and a directory link is no longer
+  silently left out of the job.
+- Under **FOLLOW** the verdict is about bytes at the end of a source link, and the report says so: the warning
+  names the files whose comparison ran through a link, including a link that points outside the two directories.
+- A link standing in the destination is never followed, under any policy. A copy replaces it (measured), and
+  reading through it would compare a file that belongs to neither of the directories the job was given.
+- Where the destination already held a different kind of object than the source has, the job now says so **before**
+  transferring, because after a copy there is nothing left in the destination that shows what it replaced.
+
 ### Fixed — closing the program can no longer miss a job that was being admitted
 
 `execute()` used to ask "is the engine closed?" outside the lock that admits a job, and closing did not enter that

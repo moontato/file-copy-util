@@ -1,8 +1,12 @@
-# Audit remediation plan — File Copy Util (revision 10)
+# Audit remediation plan — File Copy Util (revision 11)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 10 — Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+**Status:** approved and under way, revision 11 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
+`33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
+under way**: §2.13's symlink-verdict rule is implemented and green (item 1 of five). Items 2–5 (truthful counters
+across every consumer, partial/capped report completeness, CSV formula neutralisation, `--strict` and invalid-pattern
+warnings) follow. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
 report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
 correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
@@ -566,6 +570,40 @@ something in a pinned run); SpotBugs `BugInstance size is 0`; `javac -Xlint:all 
 **245 green** against 3.1.3 and **245 green** against 3.4.0.
 
 ---
+
+## Phase 5 — truthful verdicts and counts (under way, item 1 green)
+
+**Item 1, symlink verdicts (§2.13) — implemented, green, `SymlinkVerdictTest` (8 fixtures).**
+
+- **LINK judges the object:** kind first, then link text via `readLink`, **no digest of anything**. Different link
+  texts are a `MISMATCH` with a warning quoting both sides.
+- **Kind changes are named:** a source link whose destination is a regular file, and a source file whose destination
+  is a link, are mismatches *in kind*; the warning says which object became which, and no hash appears on the row.
+- **The scanner carries what it used to drop** (under LINK): a link to a directory — listed, never descended
+  through — and a **dangling** link. `linkPolicyCarriesADirectoryLinkAndCopiesItAsALink` and
+  `linkPolicyCarriesADanglingLinkAndJudgesItByItsText` lock both; the dangling one also asserts it is *not* reported
+  missing, and that its verdict row carries no hashes.
+- **Nothing is read through a link at the destination, under any policy.**
+  `aRegularFileWhoseDestinationIsALinkIsJudgedWithoutReadingThroughTheLink` runs the same fixture under LINK and SKIP
+  with the link pointing at a file outside both roots, and requires `sourceHash == destHash == null`.
+- **FOLLOW says what it did:** bytes through a source link, with a warning naming the files whose comparison ran
+  through a link (`followPolicyComparesBytesThroughTheLinkAndSaysSo`).
+- **A kind change is reported before the transfer**, from the pre-copy ledger (`TransferLedger.kindChanges()`),
+  because a copy erases the evidence — `aLinkChangedUnderTheJobIsReportedAsAKindChangeNotAsUnreadable` also asserts
+  the `copied=1, checked=1, matched=1` triple that Phase 5 item 2 generalises.
+- **SKIP is unchanged** (`aLinkUnderSkipIsNotInTheJobAtAll`).
+
+One committed behaviour changed, deliberately and per §2.13: `ScanOptionsTest.linkPolicyDoesNotDescendIntoSymlinkedDirectories`
+used to expect a directory link to be *skipped* (`skippedLinks=1`); it now expects it to be **carried as an object**
+(`skippedLinks=0`) while still not being descended into. The "does not descend" half of that promise is still asserted.
+
+Red-first, as required: all 7 behaviour fixtures failed before the code changed (the SKIP fixture passed, being the
+unchanged case), and pass after. Suite: **269 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0.
+
+Still to do in Phase 5: item 2 (the `checked` equation asserted in engine, GUI, CLI and exports, with transfer
+dispositions kept separate), item 3 (partial/capped reports: status, truncation, counters and errors exposed), item 4
+(CSV formula neutralisation, documented as a CSV-only transformation, JSON keeping raw identity), item 5
+(`--strict` and invalid-pattern warnings that never invent a verdict).
 
 ## Phase 4 checkpoint — who owns a running job (implemented, green, awaiting your acceptance)
 

@@ -174,18 +174,29 @@ public final class DirectoryScanner {
         private void lookAtFile(Path file, BasicFileAttributes attrs) {
             boolean link = Files.isSymbolicLink(file);
             if (link) {
-                // Without FOLLOW_LINKS a symlinked directory arrives here rather than in
-                // preVisitDirectory. Under LINK it is still copied (as a link) but there is nothing
-                // to list under it and nothing meaningful to hash, so it is reported as skipped.
-                if (policy == ScanOptions.SymlinkPolicy.SKIP || Files.isDirectory(file)) {
+                if (policy == ScanOptions.SymlinkPolicy.SKIP) {
+                    skippedLinks++;
+                    return;
+                }
+                if (policy == ScanOptions.SymlinkPolicy.FOLLOW && Files.isDirectory(file)) {
+                    // Under FOLLOW the walk descends through a linked directory and lists what is inside
+                    // it; the link itself is not listed as an object.
                     skippedLinks++;
                     return;
                 }
                 if (!Files.exists(file)) {
                     warnings.add("Dangling symlink: " + relativize(base, file));
-                    skippedLinks++;
-                    return;
+                    if (policy == ScanOptions.SymlinkPolicy.FOLLOW) {
+                        // FOLLOW's verdict is about bytes, and a dangling link has no bytes to compare.
+                        skippedLinks++;
+                        return;
+                    }
+                    // Under LINK the link is the object. It is carried, so it is copied as a link and its
+                    // text is compared; whether anything stands at its target changes nothing about that.
                 }
+                // Without FOLLOW_LINKS a link to a directory reaches visitFile rather than
+                // preVisitDirectory, which is what LINK wants: the link is listed, and the walk does not
+                // descend through it into somebody else's directory tree.
             }
             String rel = relativize(base, file);
             if (options.ignores(rel, rules)) {

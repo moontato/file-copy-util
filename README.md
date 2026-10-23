@@ -203,7 +203,9 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-261 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+269 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
+and directory links are carried as objects, FOLLOW compares bytes and says so, and a link in the destination is
+never followed), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to

@@ -128,6 +128,44 @@ final class TransferLedger {
     }
 
     /**
+     * Names where the object standing in the destination before the copy was not the kind the source has: a
+     * link where a file belongs, or a file where a link belongs.
+     *
+     * <p>Said before the transfer, because a copy erases the evidence: after replacing a link with a file the
+     * destination shows a file, and nothing there says what it replaced.
+     */
+    List<String> kindChanges() {
+        List<String> found = new ArrayList<>();
+        for (Map.Entry<String, Expected> entry : expected.entrySet()) {
+            Expected intent = entry.getValue();
+            Before previous = before.get(entry.getKey());
+            if (previous == null || previous == Before.ABSENT || intent == null
+                    || intent == Expected.UNKNOWN) {
+                continue;
+            }
+            if (previous.link() == intent.link() && previous.regular() == intent.regular()) {
+                continue;
+            }
+            found.add(RsyncNameCodec.forDisplay(entry.getKey()) + ": the destination held " + kind(previous)
+                    + " where this job's source has " + kind(intent) + ". A copy replaces the object at that"
+                    + " path, so what stands there afterwards is what this job wrote, not what was there"
+                    + " before it.");
+        }
+        java.util.Collections.sort(found);
+        return found;
+    }
+
+    private static String kind(Before state) {
+        return state.link() ? "a symbolic link"
+                : (state.regular() ? "a regular file" : "an object of another kind");
+    }
+
+    private static String kind(Expected intent) {
+        return intent.link() ? "a symbolic link"
+                : (intent.regular() ? "a regular file" : "an object of another kind");
+    }
+
+    /**
      * What the destination can prove about one file rsync announced.
      *
      * @param rel             the file's path relative to the source directory

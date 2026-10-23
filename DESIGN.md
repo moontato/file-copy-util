@@ -57,10 +57,15 @@ each unit of work.
 - Only the work set is hashed, in both modes.
 - Copy & Verify hashes the source **before** `rsync` runs and reuses those digests for the comparison
   afterwards: one hash per selected file per side.
-- Symlinks: `SKIP` leaves them out of the scan; `LINK` copies them as links (`rsync -a`) and hashes
-  follow the target on both sides; `FOLLOW` hands over the target's contents (`rsync --copy-links`).
-  Hashing a link target while copying the link as a link would compare unlike things, so the policy is
-  explicit and applies to both sides of one job.
+- Symlinks are judged as the objects they are, and one policy applies to both sides of one job.
+  `SKIP` leaves them out of the scan entirely. `LINK` carries the link as an object — a link to a directory
+  included (listed, never descended through) and a dangling link included (an object with no target) — copies
+  it as a link, and compares **kind first, then link text** via `readLink`, taking **no digest of anything**:
+  a link's target is not the link. A link that stands in the destination as a regular file, or a regular file
+  whose destination is a link, is a `MISMATCH` **in kind**, with a warning naming which object became which.
+  `FOLLOW` hands over the target's contents (`rsync --copy-links`) and compares bytes, and says so in the
+  warnings: that verdict is about the contents at the end of a link, and a link pointing outside the two
+  directories takes the read outside them.
 
 ## 4. rsync, and how its output is read
 
@@ -171,6 +176,9 @@ and `(dev, ino)` identity before the copy, and afterwards calls a transfer:
   The expected kind and size come from the source read **before** the transfer: a source that changed
   mid-job must not be matched against its own new size. A symlink is compared by its target text, never by
   a size or by opening it.
+  Where the object already standing in the destination is not the kind the source has — a link where a file
+  belongs, or a file where a link belongs — the job says so **before** the transfer, because a copy erases that
+  evidence: afterwards the destination shows what the job wrote, and nothing there reports what it replaced.
 - `UNCERTAIN` — rsync started the file and the destination cannot show what happened. A change of object
   kind alone is not accepted as evidence: without a changed file identity the claim is dropped. The case this exists
   for is an interrupted overwrite of a file that was already the same size as the source: the destination
@@ -348,10 +356,11 @@ path returned zeroed counters, so a job that had already written files reported 
 carriage return or NUL in a name is refused before the transfer, named in the warnings, and counted as a file
 that was not transferred. An error message that says only "rsync exit 23" is not a diagnosis.
 
-**Nothing outside the destination is read.** The scanner refuses to list symbolic links; the destination side
-is reached by resolving a relative path, so a link can still appear during verification. It is reported as
-MISMATCH with "not compared, this tool does not follow links" instead of hashing the file behind it and
-passing its digest off as the destination's.
+**Nothing outside the destination is read.** A destination side is reached by resolving a relative path, so a
+link can appear during verification under any policy. It is judged as the link it is — kind, then text — and is
+never followed under any policy, including `FOLLOW`: its target may sit outside the destination, and a digest of
+a file belonging to neither directory is not the destination's verdict. A copy replaces a link at that path
+(measured), which is why `FOLLOW` follows the *source* link and still refuses to follow a destination one.
 
 **An unreadable locale is a warning with a fix.** File-name encoding comes from the locale, so under `LANG=C`
 non-ASCII names are unrepresentable. The scan skips those entries and says which encoding was in force and

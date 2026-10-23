@@ -1596,8 +1596,13 @@ public class FileSyncEngine implements AutoCloseable {
         if (!copies) {
             sourceHashes = Map.of();
         }
+        if (ledger != null && !dryRun) {
+            // Told before anything moves, because a copy erases the evidence: after replacing a link with a
+            // file the destination shows a file, and a verdict taken afterwards cannot say what it replaced.
+            warnings.addAll(ledger.kindChanges());
+        }
         verifyEntries(control, workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
-                warnings, !copies, transfers);
+                warnings, !copies, transfers, options.symlinkPolicy());
         if (control.timedOut()) {
             return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
@@ -1954,7 +1959,8 @@ public class FileSyncEngine implements AutoCloseable {
                                Map<String, String> knownSourceHashes, ProgressReporter progress,
                                List<FileOutcome> outcomes, ProgressListener listener,
                                List<String> warnings, boolean verifyOnly,
-                               Map<String, TransferDisposition> transfers)
+                               Map<String, TransferDisposition> transfers,
+                               ScanOptions.SymlinkPolicy linkPolicy)
             throws NoSuchAlgorithmException, InterruptedException {
         int total = workSet.size() + extras.size();
         if (total == 0) {
@@ -1969,7 +1975,8 @@ public class FileSyncEngine implements AutoCloseable {
         control.adopt(pool);
         List<Future<Verdict>> futures = new ArrayList<>(Math.min(total, 1024));
         Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        Set<String> unfollowedLinks = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> kindChanges = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> comparedByBytes = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> sourceMoved = java.util.concurrent.ConcurrentHashMap.newKeySet();
         try {
             for (int index = 0; index < total; index++) {
@@ -1978,7 +1985,8 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 final int i = index;
                 Future<Verdict> task = pool.submit(() -> verdict(control, i, workSet, extras, destDir,
-                        knownSourceHashes, readProblems, unfollowedLinks, sourceMoved));
+                        knownSourceHashes, readProblems, kindChanges, comparedByBytes, sourceMoved,
+                        linkPolicy));
                 control.adopt(task);
                 futures.add(task);
             }
@@ -2039,11 +2047,18 @@ public class FileSyncEngine implements AutoCloseable {
                     + " started, so the difference here is a file that moved during the job rather than one"
                     + " the copy damaged.");
         }
-        for (String rel : unfollowedLinks) {
-            warnings.add("Not compared: the destination holds a symbolic link at " + rel
-                    + " where a file was expected, and this tool does not follow links, so the contents "
-                    + "behind it were not read.");
+        for (String change : kindChanges) {
+            warnings.add("Object kind differs: " + change);
         }
+        for (String rel : comparedByBytes) {
+            warnings.add("Compared by bytes reached through a symbolic link (FOLLOW): " + rel
+                    + ". Under FOLLOW the verdict is about the contents at the end of the link, not about the"
+                    + " link itself; a link pointing outside the two directories takes that read outside them.");
+        }
+    }
+
+    private static String quoted(String value) {
+        return value == null ? "(unreadable)" : "\"" + RsyncNameCodec.forDisplay(value) + "\"";
     }
 
     /** A file's verdict. {@code kind} is OK, MISMATCH, MISSING or EXTRA; hashes are null where absent. */
@@ -2053,7 +2068,8 @@ public class FileSyncEngine implements AutoCloseable {
     private Verdict verdict(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
                             Path destDir,
                             Map<String, String> knownSourceHashes, Set<String> readProblems,
-                            Set<String> unfollowedLinks, Set<String> sourceMoved)
+                            Set<String> kindChanges, Set<String> comparedByBytes, Set<String> sourceMoved,
+                            ScanOptions.SymlinkPolicy linkPolicy)
             throws NoSuchAlgorithmException {
         if (control.abortRequested()) {
             return null;
@@ -2062,25 +2078,51 @@ public class FileSyncEngine implements AutoCloseable {
         FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
         String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
 
-        // The scanner refuses to list symbolic links; the destination side is reached by resolving a
-        // relative path, so a link can appear here even though it never appears in a list. Two cases are
-        // not the same thing: a link the job created under the LINK policy, and a link that was already
-        // sitting where a file was expected. The first is comparable by its target. The second would
-        // mean reading a file outside the destination and calling the digest a comparison.
+        // The object is judged before any content is. A link's own properties are its kind and its text: under
+        // LINK that is the whole comparison, and nothing is read through a link, because its target may sit
+        // outside the two directories this job was given. Under FOLLOW the verdict is about the bytes at the end
+        // of a source link, and the report says so. A link standing in the destination is never followed under
+        // any policy: a copy replaces it (measured), and reading through it would compare an object that belongs
+        // to neither directory.
         Path destPath = destDir.resolve(rel);
-        if (Files.isSymbolicLink(destPath)) {
-            Path sourcePath = destinationOnly ? null : sourceEntry.absolutePath();
-            if (sourcePath != null && Files.isSymbolicLink(sourcePath)) {
-                String sourceLink = readLink(sourcePath);
-                String destLink = readLink(destPath);
-                return new Verdict(sourceLink != null && sourceLink.equals(destLink) ? "OK" : "MISMATCH",
-                    rel, null, null);
+        Path sourcePath = destinationOnly ? null : sourceEntry.absolutePath();
+        boolean destLink = Files.isSymbolicLink(destPath);
+        boolean sourceLink = sourcePath != null && Files.isSymbolicLink(sourcePath);
+
+        if (destLink) {
+            if (destinationOnly) {
+                kindChanges.add(rel + ": the destination holds a symbolic link that the source does not have."
+                        + " It is reported as an extra object, and nothing was read through it.");
+                return new Verdict("EXTRA", rel, null, null);
             }
-            unfollowedLinks.add(rel);
-            String linkedSource = knownSourceHashes.get(rel);
-            return destinationOnly
-                ? new Verdict("EXTRA", rel, null, null)
-                : new Verdict("MISMATCH", rel, linkedSource, null);
+            if (sourceLink) {
+                String sourceText = readLink(sourcePath);
+                String destText = readLink(destPath);
+                if (sourceText != null && sourceText.equals(destText)) {
+                    return new Verdict("OK", rel, null, null);
+                }
+                kindChanges.add(rel + ": both sides are symbolic links but they carry different link text - the"
+                        + " source says " + quoted(sourceText) + ", the destination says " + quoted(destText)
+                        + ". Under LINK a link is judged by its text, and nothing was read through either one.");
+                return new Verdict("MISMATCH", rel, null, null);
+            }
+            kindChanges.add(rel + ": the source has a regular file and the destination holds a symbolic link."
+                    + " These are different objects, so this is a mismatch in kind rather than in content, and"
+                    + " nothing was read through the link.");
+            return new Verdict("MISMATCH", rel, null, null);
+        }
+
+        if (sourceLink && linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
+            // A link in the source, and something that is not a link (or nothing) where it should be.
+            if (!Files.exists(destPath, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return new Verdict("MISSING", rel, null, null);
+            }
+            kindChanges.add(rel + ": the source has a symbolic link and the destination holds a regular file."
+                    + " These are different objects, so this is a mismatch in kind rather than in content.");
+            return new Verdict("MISMATCH", rel, null, null);
+        }
+        if (sourceLink) {
+            comparedByBytes.add(rel);
         }
 
         String destHash = hashFile(destDir.resolve(rel), rel, readProblems);
