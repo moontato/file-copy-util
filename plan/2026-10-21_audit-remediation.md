@@ -680,11 +680,13 @@ Mutation coverage for this round, with the honest result of each:
 | pre-fix admission ordering restored, window widened | yes — `anAdmittedJobIsNeverLeftDescribingItselfAsIdleByAnEarlierJob`, first round |
 | abort guard in `verdict()` removed | **not observable** — the futures are cancelled before their results could be collected, so that guard is defence in depth, not a tested branch; recorded rather than counted |
 
-Two coverage limits stated plainly: the forced-report path for a job with no progress reporter is covered at the
-outcome level (a job cancelled mid-listing reports zero figures and the right cause) rather than by forcing the
-grace branch, because every stage before the reporter finishes well inside the grace in this container; and the
-admission fixture is a contention invariant — the natural window is nanoseconds, so it is a guard against
-re-ordering, not a schedule-forcing test.
+Two coverage limits stated plainly:
+
+- the forced-report path for a job with no progress reporter is covered at the outcome level (a job cancelled
+  mid-listing reports zero figures and the right cause) rather than by forcing the grace branch, because every
+  stage before the reporter finishes well inside the grace in this container;
+- the admission fixture is a contention invariant — the natural window is nanoseconds, so it is a guard against
+  re-ordering, not a schedule-forcing test.
 
 **Suite now:** **257 tests, 0 failures, 0 errors, 1 skipped**; SpotBugs `BugInstance size is 0`; build success.
 Whole suite pinned to one binary with `FCU_RSYNC_BINARIES` cleared: **251 green** against 3.1.3 and **251 green**
@@ -721,7 +723,7 @@ Fixtures (4 new; `JobOwnershipTest` 17 → 21):
 | `closingTakesItsTurnAtTheSameLockThatAdmitsAJob` | the mechanism: with the lifecycle section held elsewhere, `close()` is found `BLOCKED` behind it — a close that walked past the section fails here, deterministically |
 | `aCloseMarkedBeforeAJobIsAskedForRefusesThatJob` | close-wins outcome for both `execute()` and `start()`, with nothing written |
 | `aCloseAfterAJobIsRunningStopsThatJobInsteadOfMissingIt` | admission-wins outcome: `ENGINE_CLOSED`, file not written, no `rsync` survives, **and the same destination is usable by the next engine** (claim handed back) |
-| `aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped` | 40 rounds of the reproduced race with a real `rsync`: every round ends refused or stopped, never copied-after-close, never with a stranded destination claim (`destinationClaimsInUse()`, a package seam added for exactly this) |
+| `aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped` | 40 rounds of the reproduced race, with a **fake-`rsync` stand-in**: every round ends refused or stopped, never admitted behind a returned close, never with a stranded destination claim (`destinationClaimsInUse()`, a package seam added for exactly this). What it does **not** do is physically copy a file - see the coverage note below |
 
 Mutation results for this round, disclosed:
 
@@ -732,6 +734,14 @@ Mutation results for this round, disclosed:
 | the stop-check before claiming the destination reservation, removed | not observable on its own — the other guard alone suffices |
 | the dropped-result destination release, removed | not observable on its own — the same |
 | **both** of those guards removed together | **yes** — "the job in round 0 left its destination claim behind" |
+
+Coverage of this round, stated plainly: the 40-round close-versus-admission fixture runs against a
+**fake-`rsync` stand-in**, so it evidences admission, result status and claim cleanup only. Its stand-in never
+writes a destination file, so it is **not** 40 rounds of real destination-write evidence — the evidence that no
+copy happens after `close()` returned is the source correction plus the reviewer's independent real-`rsync`
+scheduling probe (`copied after close=false`). The other two limits from the previous round stand unchanged: the
+forced-report path for a job with no progress reporter is covered at outcome level only, and contention fixtures
+are guards against re-ordering rather than schedule-forcing tests.
 
 Counts: matrix `clean verify` **261 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs **0**; whole suite pinned to
 3.1.3 **255 green**, pinned to 3.4.0 **255 green** (251 → 255 pinned, 257 → 261 in the matrix run with the four new
