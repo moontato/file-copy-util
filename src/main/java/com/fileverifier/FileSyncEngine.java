@@ -1386,7 +1386,7 @@ public class FileSyncEngine implements AutoCloseable {
             // likely. It must not touch the destination, and it must not claim a reservation that the terminal
             // result already published past: that claim would outlive the job that made it.
             return abortedBeforeTransfer("Job " + abortWords(control.cause())
-                    + " before rsync started: no file was transferred.",
+                    + " before rsync started: no file was transferred." + limitPhrase(control),
                     List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause());
         }
         if (!DESTINATIONS_IN_USE.add(destinationKey)) {
@@ -1596,7 +1596,7 @@ public class FileSyncEngine implements AutoCloseable {
                 // source disk that nothing in this program is watching any more.
                 if (control.cancelRequested()) {
                     return abortedBeforeTransfer("Job " + abortWords(control.cause())
-                            + " before rsync started: no file was transferred.",
+                            + " before rsync started: no file was transferred." + limitPhrase(control),
                             outcomes, errors, warnings, verifies, control.cause());
                 }
                 if (control.timedOut()) {
@@ -3114,6 +3114,17 @@ public class FileSyncEngine implements AutoCloseable {
      * The reason a job stopped, in the words used in its own message. "cancelled" is kept for both kinds of
      * cancellation and "timeout" for the limit, so someone searching a log for the reason finds it.
      */
+    /**
+     * The limit a timed-out job passed, said once. Which internal check noticed the deadline is not something
+     * the reader should have to care about: a message that names the limit in one phase and not in another
+     * leaves someone who set 250 ms guessing which 250 ms expired.
+     */
+    private String limitPhrase(JobControl control) {
+        return control.cause() == AbortCause.TIMED_OUT && jobTimeoutMillis > 0
+                ? " The limit this job was given was " + humanDuration(jobTimeoutMillis) + "."
+                : "";
+    }
+
     static String abortWords(AbortCause cause) {
         return switch (cause) {
             case USER_CANCELLED -> "cancelled by the user";

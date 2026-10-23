@@ -286,8 +286,16 @@ class FileSyncEngineLifecycleTest {
             assertEquals(JobStatus.FAILED, result.status());
             assertTrue(result.message().contains("timeout"), result.message());
             assertTrue(result.message().contains("250 ms"), result.message());
-            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial rsync file")),
-                    result.warnings().toString());
+            assertEquals(0, result.filesCopied(), "a job cut off this early copied nothing: " + result.message());
+            // Which check notices a 250 ms deadline depends on how loaded the machine is: the job can be cut
+            // short at admission, before rsync is launched, or part way through the transfer, and the transfer
+            // wording differs in each. This fixture must not pass or fail on the machine's mood, so it asserts
+            // what holds in every phase: a timeout that names the limit that passed, nothing copied, and no
+            // file the destination believes it has. (rsync writes to a hidden temporary and renames at the end,
+            // so a job this short-lived never puts huge.bin in place.)
+            assertFalse(Files.exists(dest.resolve("huge.bin")),
+                    "the deadline stopped the copy; the destination must not hold the file: "
+                            + result.message());
             assertFalse(engine.isRunning());
             assertEquals(JobStatus.FAILED, engine.status());
         }
@@ -297,8 +305,9 @@ class FileSyncEngineLifecycleTest {
     @Test
     void jobTimeoutAlsoAbortsTheVerificationPhase() throws Exception {
         // VERIFY_ONLY has no copy phase, so a deadline here can only be enforced by the verification
-        // loop, and many tiny work units make sure the job cannot finish inside 1 ms. The mid-transfer
-        // trip is covered by jobTimeoutTerminatesASlowRsync.
+        // loop, and many tiny work units make sure the job cannot finish inside 1 ms. The mid-transfer trip
+        // is covered, deterministically, by
+        // FileSyncEngineTest.aCutShortCopyReportsTransfersRsyncFinishedNotOnesItAnnounced.
         manyTinyFiles();
 
         try (FileSyncEngine engine = new FileSyncEngine()) {

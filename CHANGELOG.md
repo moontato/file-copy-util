@@ -16,6 +16,8 @@
   apply, and the file the broken one would have excluded is judged on what it is — a broken rule is not a verdict.
 - When one run has both a strict finding and a report that could not be written, the report failure is the exit code:
   a run that cannot record itself is the worse of the two failures.
+- A job stopped by its time limit names the limit that passed whatever phase noticed it. Two of the three wording
+  paths did already; the one at admission did not, which left someone who set 250 ms guessing which 250 ms expired.
 
 ### Changed — a CSV cell that a spreadsheet would evaluate is disarmed
 
