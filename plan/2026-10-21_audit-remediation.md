@@ -7,7 +7,8 @@
 under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
 green, item 4 (CSV formula neutralisation) is implemented and green — which closes the one hardening item the
 changelog had been carrying as "not done" — and item 5 (`--strict`, and invalid ignore patterns) is implemented and
-green. **Phase 5 is complete.** Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
+green. **Phase 5 is complete and awaits acceptance** (the checkpoint below). Earlier: Phase 4 remains
+awaiting acceptance for the reviewed scope. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
 DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
 ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
@@ -587,6 +588,43 @@ before and after, because the table was never the format at risk.
   apostrophe in a filename would be a different file. A non-leading `=` is ordinary text.
 - The class comment that told the next reader "do not describe this format as safe to open in a spreadsheet until
   it is" is replaced by what the rule now is.
+
+## Phase 5 checkpoint — awaiting acceptance
+
+Five items, each red-first where the behaviour was new, each followed by a mutation run in a disposable `git
+worktree`, each recorded in the plan. Nothing here is merged to `main`, pushed, tagged, or released.
+
+| Commit | Item |
+|---|---|
+| `079ab44` | item 1 — a symbolic link is judged as the link it is; nothing is read through it |
+| `bd33373` | item 1's mutation record (5 mutations, all caught; mutation testing moved into a worktree) |
+| `ab122a9` | item 2 — every figure counts what its name says; `rsync`'s claims stay `rsync`'s |
+| `dff1450` | item 2 follow-up — the figures stay exact when the row list is capped (a live defect a fixture caught) |
+| `62288fa` | item 2's mutation record (7 mutations: 6 caught, 1 not observable and labelled as defence-in-depth) |
+| `d420419` | item 3 — a report introduces itself and says how many rows it left out |
+| `66c6650` | a forced report has to name the rows it left out (closes the one gap item 3's mutations found) |
+| `999d166` | item 3's mutation record (6 mutations: 5 caught, 1 gap found and then closed) |
+| `e2c75ef` | item 4 — a CSV cell a spreadsheet would evaluate is disarmed, and nowhere else |
+| `ddc86b0` | item 5 — `--strict`, and an ignore rule that cannot apply says so |
+| `e94aa64`, `d4cc98a` | the fixture that pins "a missing report outranks a strict finding", and its changelog line |
+| `272fcc6` | a timeout fixture that was deciding the suite on machine load, and the wording gap it exposed |
+| `fd2e14e` | item 5's mutation record (6 mutations, all caught) and the load-sensitive fixture's record |
+
+**What a user of a released build would notice changing** (all of it documented in README and CHANGELOG, not only in
+code): the CSV begins with a `#` metadata block, so the columns row is no longer the first line; CSV fields that begin
+with `=`, `+`, `-`, `@`, tab or CR carry a leading apostrophe; `copied` and `checked` mean what their names say, and
+`transfersAnnounced` / `transfersCompletedByRsync` are reported beside them rather than merged in; a symlink is
+compared as a link under `LINK`, so a link and a regular file of the same content are no longer a match; `--strict`
+and exit code 5 exist; an invalid ignore pattern produces a warning naming it.
+
+**Validation.** 290 tests, 0 failures, 0 errors, 1 skipped (matrix over local 3.1.3 and 3.4.0), SpotBugs `BugInstance
+size is 0`, `-Werror` clean; 284 green pinned to 3.1.3. GitHub-side execution of `validate.yml`/`release.yml` remains
+pending — no authorized push has happened, so 3.2.7 and 3.3.0 still have no local evidence either.
+
+**Still open, unchanged in status:** the ledger's pre-copy destination `stat` cost has no automatic size threshold (by
+your decision, on measurement); the GUI's collision/report/export *dialogs* are exercised through seams, not rendered;
+the cross-process race between the containment check and `rsync` stays documented and deliberately not closed;
+`3.2.7`/`3.3.0` local matrix evidence is missing; the §2.5A Option-B protocol switch stays unadopted.
 
 ## Phase 5 — truthful verdicts and counts (items 1–5 complete)
 
