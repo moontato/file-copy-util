@@ -302,6 +302,9 @@ class CliTest {
         assertEquals(Cli.EXIT_OK, exit);
         assertTrue(o.out().contains("Job complete"), o.out());
         assertTrue(o.out().contains("totals: checked=2 copied=2 matched=2 mismatched=0 missing=0"), o.out());
+        assertTrue(o.out().contains("transfers: copied=2 would-copy=0 uncertain=0 not-transferred=0,"
+                        + " rsync-announced=2 rsync-said-completed=2"),
+                "the transfer figures are stated beside the verdict figures, not merged into them: " + o.out());
         assertTrue(Files.isRegularFile(dest.resolve("a.txt")) && Files.isRegularFile(dest.resolve("sub/b.txt")),
                 o.out());
 

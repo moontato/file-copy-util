@@ -2522,7 +2522,10 @@ public class FileSyncEngine implements AutoCloseable {
                             // answerable, and the xfr# count on the stats line is what says a file finished.
                             progress.announcing(rel, sizeOfSourceFile(sourceDir, rel));
                             listener.onFileProcessed(rel, "TRANSFERRING", null, null);
-                            if (copiedNames != null && copiedNames.size() < resultLimit) {
+                            if (copiedNames != null) {
+                                // Every announced name is kept, whatever the results cap is: this list is what
+                                // the per-file transfer dispositions are decided from, and a figure tallied from
+                                // a capped list would be a capped figure. The row list is capped elsewhere.
                                 copiedNames.add(rel);
                             }
                         }

@@ -159,6 +159,31 @@ class CounterTruthTest {
     }
 
     @Test
+    void aCappedResultListStillReportsTheFiguresForTheWholeJob(@TempDir Path tmp) throws Exception {
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        TestSupport.write(src.resolve("b.txt"), "b\n");
+        TestSupport.write(src.resolve("c.txt"), "c\n");
+
+        FileSyncEngine engine = new FileSyncEngine();
+        engine.setResultLimit(1);
+        try {
+            JobResult result = engine.execute(request(src, dst, COPY_ONLY, "a.txt", "b.txt", "c.txt"), null);
+            assertTrue(result.isSuccess(), result.message());
+            // The list was capped; the figures were not. A reader who counts rows sees one and is told the
+            // list is short, and the totals still describe all three files.
+            assertEquals(1, result.outcomes().size(), result.outcomes().toString());
+            assertTrue(result.truncated(), result.toString());
+            assertEquals(3, result.filesCopied(), result.toString());
+            assertEquals(3, result.transfersAnnounced(), result.toString());
+            assertEquals(0, result.filesUncertain(), result.toString());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
     void theJsonReportCarriesTheSameFiguresAsTheResultItDescribes() throws Exception {
         assumeRealRsync();
         Path src = Files.createDirectories(tmp.resolve("src"));
