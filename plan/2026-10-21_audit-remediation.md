@@ -1,4 +1,4 @@
-# Audit remediation plan — File Copy Util (revision 15)
+# Audit remediation plan — File Copy Util (revision 16)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
@@ -609,8 +609,30 @@ observation is not a failure.
 | `ScanOptions.compile()` → `CompiledRules(rules, notApplied)`; the scanner warns per pattern | an ignore rule is a protection; a rule that cannot compile protects nothing, and silence turns a typo into a copy the reader believed was excluded |
 | one bad rule cannot drop the good ones; no verdict is invented | the file a broken rule would have excluded is handled normally and judged on what it is |
 
-Suite: **289 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **283 green** pinned
+Suite: **290 tests, 0 failures, 0 errors, 1 skipped** (matrix over 3.1.3 and 3.4.0), SpotBugs 0; **284 green** pinned
 to 3.1.3.
+
+Mutation coverage for item 5, in a disposable `git worktree` at `d4cc98a` (both trees verified clean before it was
+removed):
+
+| Mutation | Caught? |
+|---|---|
+| the scanner stops warning about a pattern it could not apply | yes — the engine fixture, by itself |
+| one uncompilable pattern drops the whole rule set | yes — the `ScanOptions` unit fixture, by itself |
+| `--strict` ignored in the exit-code decision | yes — the strict exit-code fixture |
+| `--strict` also fails a job for a destination-only file | yes — the "an observation is not a failure" fixture (and, incidentally, a lifecycle fixture that was already load-sensitive — see below) |
+| the absent-requested names never recorded on the job | yes — the strict fixture and the report fixture (`# selectedAbsent` / `selectedButAbsent`) |
+| a report failure stops outranking a strict finding | yes — `aReportThatCouldNotBeWrittenOutranksAStrictFinding` (`e94aa64`), added for the rule and proved necessary by this mutation |
+
+**A fixture that decided the suite on machine load, found by these runs.** `jobTimeoutTerminatesASlowRsync` failed in
+3 of the 6 mutation runs — in mutations that touch code its path never reaches. The cause was not the code: a 250 ms
+deadline can be noticed at admission, before `rsync` is launched, or part way through the transfer, and the fixture
+asserted wording that exists only in the last two. Under 14 competing busy loops on 16 cores the same selection
+failed 4 of 6 runs. It is fixed in `272fcc6`: the fixture now asserts what holds in every phase (a timeout naming the
+limit, nothing copied, no `huge.bin` in the destination — `rsync` writes a hidden temporary and renames at the end),
+and the mid-transfer wording stays pinned where it is deterministic (`aCutShortCopyReportsTransfersRsyncFinishedNotOnesItAnnounced`,
+scripted `rsync`). The flake exposed one real engine gap: of the three timeout wordings, the admission path did not
+name the limit that had passed; it does now. Stress check after the change: 8 of 8 under the same load.
 
 **Item 3, a report that cannot look complete when it is not (§2.8, §2.13) — implemented, green.**
 
