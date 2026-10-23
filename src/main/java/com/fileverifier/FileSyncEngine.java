@@ -23,6 +23,8 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Predicate;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -139,6 +141,13 @@ public class FileSyncEngine implements AutoCloseable {
      * engine reports the job as stopped rather than describing it as running indefinitely.
      */
     private static final long TERMINAL_GRACE_MILLIS = 5_000L;
+
+    /** Closing does not wait the watchdog's grace: the program is going away. */
+    private static final long CLOSE_TERMINATION_MILLIS = 1_000L;
+    /** How long a closing program waits for a completion callback that may never return. */
+    private static final long CLOSE_DELIVERY_MILLIS = 1_000L;
+    /** How long an interrupted hash gets to prove it stopped before the report says a read may continue. */
+    private static final long HASH_DRAIN_GRACE_MILLIS = 2_000L;
     /** Deadline enforcement granularity. */
     static final long WATCHDOG_PERIOD_MS = 250;
     /** No deadline (default). */
@@ -346,6 +355,16 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * Serializes job admission with terminal publication.
+     *
+     * <p>The controller's compare-and-set decides <i>which</i> finisher wins; it does not make the winner's
+     * remaining writes atomic with somebody else's decision to admit a new job. Without this lock, a thread
+     * finishing an old job could set the status after a new job had been admitted and set it to RUNNING, and
+     * the window would then show a job that had already ended - or show a running job as idle. The lock covers
+     * only the state changes: no listener callback and no process operation happens inside it.
+     */
+    private final Object lifecycleLock = new Object();
     private final AtomicReference<JobStatus> status = new AtomicReference<>(JobStatus.IDLE);
     private final AtomicBoolean jobRunning = new AtomicBoolean(false);
     /**
@@ -434,6 +453,44 @@ public class FileSyncEngine implements AutoCloseable {
         private final AtomicReference<ProgressReporter> progress = new AtomicReference<>();
         /** The thread running this job, named for the job, so a stuck one can be identified in a dump. */
         private final AtomicReference<Thread> worker = new AtomicReference<>();
+        /**
+         * The hash pools and futures this job started. Cancellation has to reach them from wherever it was
+         * asked for - a button, a time limit, a closing program - and not only from the loop that happened to
+         * be submitting work. Without this, cancelling a job stops the job and leaves a thread reading a
+         * 40 GiB file for nobody.
+         */
+        private final ConcurrentLinkedQueue<ExecutorService> hashPools = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<Future<?>> hashFutures = new ConcurrentLinkedQueue<>();
+
+        /** Take ownership of a hash pool so a stop can shut it down. */
+        void adopt(ExecutorService pool) {
+            hashPools.add(pool);
+        }
+
+        /** Take ownership of a queued hash task so a stop can drop or interrupt it. */
+        void adopt(Future<?> future) {
+            hashFutures.add(future);
+        }
+
+        /**
+         * Stop the hashing this job started: queued work is dropped, running tasks are interrupted. A local
+         * read checks for interruption between buffers, so this ends it; a read that the kernel will not
+         * interrupt keeps going, which the caller reports as a warning rather than as a completed stop.
+         */
+        void stopHashing() {
+            for (Future<?> future : hashFutures) {
+                future.cancel(true);
+            }
+            for (ExecutorService pool : hashPools) {
+                pool.shutdownNow();
+            }
+        }
+
+        /** The counters as this job last published them, or none if it never got that far. */
+        ProgressReporter.Counters counters() {
+            ProgressReporter reporter = progress.get();
+            return reporter == null ? ProgressReporter.emptyCounters() : reporter.snapshot();
+        }
         /** When termination was first asked for; 0 until it was. */
         private volatile long terminateRequestedAtNanos;
         /** Set by the job thread; read by the watchdog to tell a live transfer from a hung engine. */
@@ -516,6 +573,9 @@ public class FileSyncEngine implements AutoCloseable {
             if (terminateRequestedAtNanos == 0L) {
                 terminateRequestedAtNanos = System.nanoTime();
             }
+            // Hashing first: a job cancelled while it was reading the source has no process to kill, and the
+            // only thing still doing work is a hash thread.
+            stopHashing();
             Process spawned = process.get();
             if (spawned == null) {
                 return;
@@ -618,7 +678,15 @@ public class FileSyncEngine implements AutoCloseable {
         if (closed || !jobRunning.compareAndSet(false, true)) {
             return false;
         }
-        final JobControl control = beginJob(request, progressListener);
+        // The claim is taken here, outside the lock, and released inside it - see finishJob.
+        final JobControl control;
+        synchronized (lifecycleLock) {
+            if (closed) {
+                jobRunning.set(false);
+                return false;
+            }
+            control = beginJob(request, progressListener);
+        }
         try {
             Thread worker = new Thread(() -> {
                 JobResult result;
@@ -652,7 +720,10 @@ public class FileSyncEngine implements AutoCloseable {
         if (!jobRunning.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is busy: a job is already running");
         }
-        final JobControl control = beginJob(request, listener);
+        final JobControl control;
+        synchronized (lifecycleLock) {
+            control = beginJob(request, listener);
+        }
         return finishJob(runGuarded(request, control, listener), control, listener);
     }
 
@@ -713,21 +784,27 @@ public class FileSyncEngine implements AutoCloseable {
         if (control != null) {
             control.requestCancel(AbortCause.ENGINE_CLOSED);
             control.terminate();
-        }
-        watchdog.shutdownNow();
-        // Give the job's own thread a bounded moment to publish what it knows while its process is dying. If
-        // it does not, the watchdog's terminal guard has already reported the job as stopped, and this thread
-        // is a daemon: waiting longer for it would mean a program that will not exit.
-        Thread worker = control == null ? null : control.worker.get();
-        if (worker != null && worker != Thread.currentThread()) {
-            try {
-                worker.join(1_000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            // Give the job's own thread a bounded moment to publish what it knows while its process dies...
+            Thread worker = control.worker.get();
+            if (worker != null && worker != Thread.currentThread()) {
+                try {
+                    worker.join(1_000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            // ...and if it could not, finish the job here, before the watchdog is retired. The watchdog is the
+            // only other thing that would have done it, so closing used to leave a job that was blocked in a
+            // caller's callback reported as running forever, with no result at all - and a command-line run
+            // that printed no summary. The delivery gets its own bounded wait, because the callback may block.
+            if (currentControl.get() == control) {
+                publishTerminalResult(control, CLOSE_TERMINATION_MILLIS, Delivery.ELSEWHERE_BRIEFLY);
             }
         }
+        watchdog.shutdownNow();
     }
 
+    /** Admit a job. Called with {@link #lifecycleLock} held, so no finisher can interleave with it. */
     private JobControl beginJob(JobRequest request, ProgressListener listener) {
         long timeout = jobTimeoutMillis;
         JobControl control = new JobControl(jobGeneration.incrementAndGet(),
@@ -752,21 +829,87 @@ public class FileSyncEngine implements AutoCloseable {
      * result from a job that is no longer current is counted and dropped - it does not rewrite the status, the
      * result or the reservation of the job that replaced it.
      */
+    /** Where a completion callback may be run, and whether anyone may wait for it. */
+    private enum Delivery {
+        /** Run it here. Right for the job's own thread, which has nowhere else to be. */
+        ON_THIS_THREAD,
+        /** Run it elsewhere and do not wait. Right for the watchdog: a listener is entitled to block, and the
+         *  watchdog has the next job's deadline to enforce. */
+        ELSEWHERE_WITHOUT_WAITING,
+        /** Run it elsewhere, waiting only briefly. Right for a program on its way out, which wants the summary
+         *  printed but must not be held by a callback that never returns. */
+        ELSEWHERE_BRIEFLY
+    }
+
     private JobResult finishJob(JobResult result, JobControl control, ProgressListener listener) {
-        if (!currentControl.compareAndSet(control, null)) {
+        return finishJob(result, control, listener, Delivery.ON_THIS_THREAD);
+    }
+
+    /**
+     * Publish a job's result, unless the engine has already let that job go.
+     *
+     * <p>The engine is marked idle and the destination reservation released <b>before</b> the listener is
+     * called, so a caller whose completion callback blocks cannot leave this engine reporting RUNNING. The
+     * completed state is published while admission is closed, and admission reopens last: a new job admitted
+     * by another thread cannot have its RUNNING status overwritten by a finisher that won the race a moment
+     * earlier. A result from a job that is no longer current is counted and dropped.
+     *
+     * @param delivery where the completion callback runs. It is never run on the watchdog thread: doing that
+     *     used to leave the watchdog inside a caller's blocked callback, so no later job's time limit was ever
+     *     enforced - the hung {@code rsync} ran until it finished on its own.
+     */
+    private JobResult finishJob(JobResult result, JobControl control, ProgressListener listener,
+                                Delivery delivery) {
+        boolean mine;
+        synchronized (lifecycleLock) {
+            mine = currentControl.compareAndSet(control, null);
+            if (mine) {
+                String reserved = control.reservation.getAndSet(null);
+                if (reserved != null) {
+                    DESTINATIONS_IN_USE.remove(reserved);
+                }
+                control.phase = "idle";
+                lastResult = result;
+                status.set(result.status());
+                jobRunning.set(false);
+            }
+        }
+        if (!mine) {
             lateResultsDropped.incrementAndGet();
             return result;
         }
-        String reserved = control.reservation.getAndSet(null);
-        if (reserved != null) {
-            DESTINATIONS_IN_USE.remove(reserved);
+        switch (delivery) {
+            case ON_THIS_THREAD -> listener.onCompletion(result);
+            case ELSEWHERE_WITHOUT_WAITING -> deliverOffThread(listener, result, -1L);
+            case ELSEWHERE_BRIEFLY -> deliverOffThread(listener, result, CLOSE_DELIVERY_MILLIS);
         }
-        control.phase = "idle";
-        jobRunning.set(false);
-        lastResult = result;
-        status.set(result.status());
-        listener.onCompletion(result);
         return result;
+    }
+
+    /**
+     * Run a completion callback somewhere other than this thread, waiting no longer than {@code joinMillis}.
+     * A listener is somebody else's code, and it is entitled to block; that entitlement cannot be allowed to
+     * occupy the thread that has to enforce the next job's time limit.
+     */
+    private void deliverOffThread(ProgressListener listener, JobResult result, long joinMillis) {
+        Thread delivery = new Thread(() -> {
+            try {
+                listener.onCompletion(result);
+            } catch (RuntimeException | Error e) {
+                // A callback that throws is the caller's bug; it must not reach the engine's own threads.
+                markActivity("completion callback failed: " + e.getClass().getSimpleName());
+            }
+        }, "sync-completion-delivery");
+        delivery.setDaemon(true);
+        delivery.start();
+        if (joinMillis < 0L) {
+            return;      // fire and forget: the caller must not be held by somebody else's callback
+        }
+        try {
+            delivery.join(joinMillis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private JobResult runGuarded(JobRequest request, JobControl control, ProgressListener listener) {
@@ -1769,6 +1912,7 @@ public class FileSyncEngine implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
+        control.adopt(pool);
         List<Future<Verdict>> futures = new ArrayList<>(Math.min(total, 1024));
         Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> unfollowedLinks = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1779,15 +1923,17 @@ public class FileSyncEngine implements AutoCloseable {
                     break;
                 }
                 final int i = index;
-                futures.add(pool.submit(() -> verdict(control, i, workSet, extras, destDir, knownSourceHashes,
-                        readProblems, unfollowedLinks, sourceMoved)));
+                Future<Verdict> task = pool.submit(() -> verdict(control, i, workSet, extras, destDir,
+                        knownSourceHashes, readProblems, unfollowedLinks, sourceMoved));
+                control.adopt(task);
+                futures.add(task);
             }
         } finally {
             pool.shutdown();
             if (control.abortRequested()) {
                 // Queuing hashes for a job that is already stopping wastes the read of every remaining
-                // file; the tasks that had not started yet are dropped.
-                pool.shutdownNow();
+                // file; the tasks that had not started yet are dropped, and the ones that had are interrupted.
+                control.stopHashing();
             }
         }
 
@@ -1798,6 +1944,9 @@ public class FileSyncEngine implements AutoCloseable {
             Verdict verdict;
             try {
                 verdict = future.get();
+            } catch (CancellationException stopped) {
+                // The job stopped this comparison; the file is simply not among the files that were checked.
+                continue;
             } catch (ExecutionException e) {
                 if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
                     throw algorithmException;
@@ -1892,6 +2041,11 @@ public class FileSyncEngine implements AutoCloseable {
         if (destHash != null && sourceHash != null && sourceHash.equals(destHash)) {
             return new Verdict("OK", rel, sourceHash, destHash);
         }
+        if (control.abortRequested()) {
+            // This comparison was interrupted, not decided. A file whose digest was never taken has no
+            // verdict, and answering MISSING or MISMATCH for it would invent a finding out of a cancellation.
+            return null;
+        }
         if (sourceHash == null && !Files.isRegularFile(sourceEntry.absolutePath())) {
             return new Verdict("MISSING", rel, null, destHash);
         }
@@ -1931,6 +2085,10 @@ public class FileSyncEngine implements AutoCloseable {
             return FileHasher.computeHash(path);
         } catch (java.nio.file.NoSuchFileException e) {
             return null;
+        } catch (FileHasher.HashAborted stopped) {
+            // The job let go of this hash. Reporting it as a read problem would blame a file that was never
+            // the problem.
+            return null;
         } catch (IOException e) {
             readProblems.add(rel + " (" + e + ")");
             return null;
@@ -1957,6 +2115,7 @@ public class FileSyncEngine implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
+        control.adopt(pool);
         Map<String, Future<String>> futures = new LinkedHashMap<>();
         try {
             for (FileEntry entry : entries) {
@@ -1964,12 +2123,14 @@ public class FileSyncEngine implements AutoCloseable {
                     break;
                 }
                 Path path = entry.absolutePath();
-                futures.put(entry.relPath(), pool.submit(() -> {
+                Future<String> task = pool.submit(() -> {
                     if (control.abortRequested()) {
                         return null;
                     }
                     return FileHasher.computeHash(path);
-                }));
+                });
+                control.adopt(task);
+                futures.put(entry.relPath(), task);
             }
         } finally {
             pool.shutdown();
@@ -1977,14 +2138,26 @@ public class FileSyncEngine implements AutoCloseable {
 
         Map<String, String> hashes = new LinkedHashMap<>();
         NoSuchAlgorithmException pending = null;
+        boolean stoppedHashing = false;
         for (Map.Entry<String, Future<String>> future : futures.entrySet()) {
+            if (control.abortRequested()) {
+                // A stopping job does not wait for digests it no longer needs. The pool has been told to stop
+                // as well, so the tasks that had not started are dropped rather than tying up this thread.
+                stoppedHashing = true;
+                break;
+            }
             try {
                 String hash = future.getValue().get();
                 if (hash != null) {
                     hashes.put(future.getKey(), hash);
                 }
+            } catch (CancellationException stopped) {
+                stoppedHashing = true;
             } catch (ExecutionException e) {
-                if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                if (e.getCause() instanceof FileHasher.HashAborted) {
+                    // Not a read problem: this is the job letting go of a hash it no longer wants.
+                    stoppedHashing = true;
+                } else if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
                     pending = algorithmException;
                 } else if (e.getCause() instanceof java.nio.file.NoSuchFileException) {
                     // Absence is not a read error. The caller classifies a file with no hash and no
@@ -1999,10 +2172,33 @@ public class FileSyncEngine implements AutoCloseable {
                 break;
             }
         }
+        if (stoppedHashing) {
+            warnIfAReadRefusesToStop(control, pool, side, warnings);
+            warnings.add("Hashing of the " + side + " was stopped on request, so the figures cover only the "
+                    + hashes.size() + " file(s) that had been read by then.");
+        }
         if (pending != null) {
             throw pending;
         }
         return hashes;
+    }
+
+    /**
+     * Interrupting a hash stops a normal local read, because the digest loop checks between buffers. A read
+     * the kernel will not interrupt - a wedged mount, an unreadable device - is a different animal, and the
+     * honest thing is to say that a read may still be going rather than to claim the stop was total.
+     */
+    private void warnIfAReadRefusesToStop(JobControl control, ExecutorService pool, String side,
+                                         List<String> warnings) {
+        try {
+            if (!pool.awaitTermination(HASH_DRAIN_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
+                warnings.add("A read of a " + side + " file is still running after being asked to stop, and "
+                        + "cannot be interrupted (a stalled mount or an unreadable device). It writes nothing: "
+                        + "hashing only reads; but it may still be holding the disk busy.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -2482,25 +2678,35 @@ public class FileSyncEngine implements AutoCloseable {
         if (!control.terminationRequested() || control.millisSinceTerminationRequested() < TERMINAL_GRACE_MILLIS) {
             return;
         }
-        ProgressReporter progress = control.progress.get();
-        if (progress == null) {
-            return;
-        }
-        // Read from the published snapshot, not from the reporter's own fields: they belong to a thread that
-        // is stuck somewhere, and reading six fields one at a time can pick up a half-finished update.
-        ProgressReporter.Counters counters = progress.snapshot();
+        // Delivered off this thread, and not waited for: a completion callback is allowed to block, and the
+        // watchdog still has a deadline to enforce on whatever job comes next.
+        publishTerminalResult(control, TERMINAL_GRACE_MILLIS, Delivery.ELSEWHERE_WITHOUT_WAITING);
+    }
+
+    /**
+     * Report a job as stopped when its own thread cannot do it.
+     *
+     * <p>The figures come from the snapshot that thread last published, not from its fields, which belong to a
+     * thread that is stuck somewhere and could be read half-updated. A job stopped before it had any counters
+     * - during validation, the directory scan, or the destination snapshot - is reported with none, naming the
+     * phase it was in: there is no honest number for work that had not begun counting, and inventing a
+     * reporter for it would only dress that up.
+     */
+    private void publishTerminalResult(JobControl control, long graceMillis, Delivery delivery) {
+        ProgressReporter.Counters counters = control.counters();
         AbortCause why = control.cause() == AbortCause.NONE ? AbortCause.USER_CANCELLED : control.cause();
-        long seconds = TERMINAL_GRACE_MILLIS / 1000L;
-        String message = "Job stopped (" + abortWords(why) + ") and its own thread had not finished within "
-                + seconds + " s of the transfer being killed. The figures below are as far as that thread had"
-                + " got; the process it was running is gone, so nothing more is being written.";
+        long seconds = Math.max(1L, graceMillis / 1000L);
+        String message = "Job stopped (" + abortWords(why) + ") while " + control.phase
+                + " and its own thread had not finished within " + seconds
+                + " s of its process being stopped. The figures below are as far as that thread had got;"
+                + " the process it was running is gone, so nothing more is being written.";
         JobResult forced = new JobResult(JobStatus.FAILED, message, counters.processed(), counters.matched(),
                 counters.mismatched(), counters.missing(), counters.extra(), counters.copied(), 0,
                 List.of(), List.of(),
                 List.of("the job's own thread was still finishing when this was reported; per-file results"
                         + " from it are not included"),
                 why);
-        finishJob(forced, control, control.listener());
+        finishJob(forced, control, control.listener(), delivery);
     }
 
     /**
@@ -2697,6 +2903,11 @@ public class FileSyncEngine implements AutoCloseable {
 
         private void publish() {
             snapshot = new Counters(processed, matched, mismatched, missing, extra, copied);
+        }
+
+        /** For a job stopped before it had anything to count. */
+        static Counters emptyCounters() {
+            return new Counters(0, 0, 0, 0, 0, 0);
         }
 
         ProgressReporter(int workTotal, ProgressListener listener) {

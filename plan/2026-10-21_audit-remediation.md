@@ -1,8 +1,8 @@
-# Audit remediation plan — File Copy Util (revision 8)
+# Audit remediation plan — File Copy Util (revision 9)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 8. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+**Status:** approved and under way, revision 9 — Phase 4's job-ownership work was corrected after an independent review found four further lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and that cancellation did not stop hashing. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
 report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
 correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
@@ -604,9 +604,11 @@ differ per cause. `ReportExporterTest`'s existing 11-argument constructor calls 
 compatibility constructor, so no test lost its assertion to accommodate the new field.
 
 **Cancellation latency (measured, 300 MB throttled transfer in flight, `cancel()` → completion callback):**
-about **400–500 ms** on rsync 3.4.0 and on 3.1.3 (three runs each: 412/402/403 ms and 413/403/503 ms). A job
-whose own thread never returns is reported stopped about **5.5 s** after its process tree was killed (5 s grace
-+ the watchdog's 500 ms tick).
+**500–610 ms** on rsync 3.4.0 and on 3.1.3 (three runs each after the corrections below: 510/505/502 ms and
+611/504/603 ms; before them, 412/402/403 and 413/403/503 — the wait is dominated by giving `rsync` time to die
+after `SIGTERM`, which the completion-evidence probe showed happens within a second). A job whose own thread never
+returns is reported stopped about **5.5 s** after its process tree was killed (5 s grace + the watchdog's 500 ms
+tick).
 
 **Owned-process cleanup (measured):** a cancelled copy, a closed engine, a completed copy **and now a timed-out
 copy** each leave no `rsync` process running (`TestSupport.assertNoProcessesRunning`, and the timeout case is a
@@ -646,6 +648,48 @@ failures; disabling the terminal guard → 2 failures; collapsing the abort caus
 mutation tried (releasing the destination before the gate) is **not observable** through the suite, because the
 reservation now lives in the job's own controller and is cleared at most once — recorded here rather than hidden,
 with the outsider-refusal fixture as the lock on the consequence.
+
+### What an independent review found in that work, and what it took
+
+All four were real, all four are fixed, and each now has a fixture:
+
+| Hole | How it shows | Closure |
+|---|---|---|
+| Closing disarmed the mechanism that finishes an abandoned job | `closeOnce()` shut the watchdog down before terminalising, so a job parked inside a caller's callback stayed reported `RUNNING` with no result; the CLI exited without printing a summary and without `EXIT_ENGINE` | close terminates the job, gives its own thread a bounded moment, then publishes the stopped job itself before retiring the watchdog — and delivers that completion off its own thread, with a bounded wait |
+| A stopped job with no counters had no report at all | the terminal guard returned early when the progress reporter was null, which is normal during validation, the directory walk and the destination snapshot | the job's controller answers for its counters (`counters()`, zeros before any reporter exists); the forced result names the phase the job was in |
+| Admission raced terminal publication | the winner of the publication compare-and-set reopened admission before writing `lastResult`/`status`, so a job admitted in between could have its `RUNNING` stamped over with the older job's `FAILED` | admission and terminal publication share one `lifecycleLock`; the completed state is written while admission is closed and admission reopens last; no listener callback and no process operation is inside the lock |
+| Forced completion ran the listener on the watchdog | a listener entitled to block occupied the watchdog, so the **next** job's time limit was never enforced — measured before the fix as that job's hung `rsync` running to its own `exit 137` with cause `NONE` | delivery is chosen per publisher: on the job's own thread normally, fire-and-forget from the watchdog, briefly waited from a program on its way out |
+
+The same review found that **cancellation did not stop hashing**: the pools, futures and open reads belonged to
+nobody, `hashFiles` waited on an unbounded `Future.get()`, and `FileHasher.computeHash` never looked for a
+cancellation. Fixed by giving the job controller ownership of its hashing (`adopt(...)`, `stopHashing()` reached
+from the one terminate path), checking for interruption between digest buffers, distinguishing a cut short hash
+(`FileHasher.HashAborted`, reported as a warning naming the stopped phase) from an unreadable file, and refusing to
+invent a verdict for a comparison that was interrupted. A read that ignores interruption — a stalled mount, an
+unreadable device — is now reported out loud ("*A read of a source file is still running after being asked to stop,
+and cannot be interrupted*"), and that is the only case where forced reporting remains.
+
+Mutation coverage for this round, with the honest result of each:
+
+| Mutation | Caught? |
+|---|---|
+| `stopHashing()` removed from the terminate path | yes — 2 fixtures (source hashing, verification) |
+| interruption check removed from the digest loop | yes — the same 2, but only after the fixture was resized to a 40 GiB sparse file with a 3 s bound; at 8 GiB the read simply finished first, which is a reminder that a timing fixture has to be sized against the thing it checks |
+| close's terminal publication removed | yes — `closingTheProgramWhileACallbackIsBlockedStillEndsThatJob` |
+| forced completion delivered on the watchdog | yes — `aForcedCompletionWithABlockedCallbackStillEnforcesTheNextJobsDeadline`, which is also the fixture that failed on the first un-fixed run and so found the hole |
+| pre-fix admission ordering restored, window widened | yes — `anAdmittedJobIsNeverLeftDescribingItselfAsIdleByAnEarlierJob`, first round |
+| abort guard in `verdict()` removed | **not observable** — the futures are cancelled before their results could be collected, so that guard is defence in depth, not a tested branch; recorded rather than counted |
+
+Two coverage limits stated plainly: the forced-report path for a job with no progress reporter is covered at the
+outcome level (a job cancelled mid-listing reports zero figures and the right cause) rather than by forcing the
+grace branch, because every stage before the reporter finishes well inside the grace in this container; and the
+admission fixture is a contention invariant — the natural window is nanoseconds, so it is a guard against
+re-ordering, not a schedule-forcing test.
+
+**Suite now:** **257 tests, 0 failures, 0 errors, 1 skipped**; SpotBugs `BugInstance size is 0`; build success.
+Whole suite pinned to one binary with `FCU_RSYNC_BINARIES` cleared: **251 green** against 3.1.3 and **251 green**
+against 3.4.0. The count moved 245 → 251 with the first Phase 4 round and 251 → 257 with these corrections.
+Protocol decision unchanged: **Option A**, with Option B's shape recorded and 3.2.7/3.3.0 still owed by the matrix.
 
 **Still open after this phase**
 

@@ -203,7 +203,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-251 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+257 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
@@ -211,8 +211,10 @@ the job it was given for), scan authority (Run refused before a scan, during a s
 edited, or after the scan options change; a stale scan result discarded and said so; a running job keeping the
 ticks that were on screen when Run was pressed), job ownership (a cancelled, timed-out or closed job says which
 of the three it was; one job's cancel flag cannot be read as another job's; a job whose own thread never returns
-is reported stopped and cannot block, stop, or rewrite the job after it; cleanup runs once and the command line's
-shutdown hook is taken back afterwards), the CLI
+is reported stopped and cannot block, stop, or rewrite the job after it - including when the program closes while
+a callback is blocked, and with a second job's time limit still enforced behind a blocked callback; cancelling a
+large read stops the thread that was doing it, and an interrupted comparison is never reported as a mismatch or a
+missing file; cleanup runs once and the command line's shutdown hook is taken back afterwards), the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
 checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
@@ -412,6 +414,12 @@ don't run two copies into the same destination at once.
 rsync's file list is a line list, so a name containing a newline, a carriage return or a NUL byte cannot be
 passed safely. Such names are refused before anything is written, listed in the warnings, and reported as not
 transferred. Rename them if you need them copied.
+
+### "A read of a source file is still running after being asked to stop"
+
+The file is on something that will not answer an interrupt - a stalled mount, an unreadable device. Hashing only
+reads, so nothing is written and nothing is damaged, but that disk may stay busy until the read finishes or the
+mount comes back. Everything this program can control has been stopped; this is the one thing it cannot promise.
 
 ### "Job stopped: it passed the time limit."
 

@@ -2,6 +2,30 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Fixed — four lifecycle holes an independent review found in that work
+
+- **Closing the program while a progress callback was blocked left the job running with no result.** Closing
+  shut down the watchdog, and the watchdog was the only thing that would ever finish reporting a job whose own
+  thread was stuck in a caller's callback. Closing now stops the job, gives its thread a bounded moment, and
+  publishes the stopped job itself before retiring the watchdog.
+- **A job stopped while it was still listing files had no report at all**, because reporting a stopped job
+  required counters that did not exist yet. It now reports zero figures honestly and names the phase it was in.
+- **A new job could be stamped over by the job that came before it.** Admission reopened before the finished job
+  had written its own status, so a second job's "running" could be replaced by the first job's failure. Admitting
+  a job and publishing a terminal state are now one serialized step: the completed state is written first, and
+  admission reopens last.
+- **A forced completion ran the callback on the watchdog.** A callback that blocks therefore stopped the *next*
+  job's time limit from ever being enforced, and its hung rsync ran on to completion by itself. Completion is
+  delivered on another thread whenever the publisher is the watchdog or a program on its way out.
+- **Cancelling a job did not stop a hash that was reading.** The hash pools and futures belonged to nobody,
+  waiting on a digest was unbounded, and the digest loop never looked for a cancellation, so cancelling a job
+  during a large read left a thread reading tens of gigabytes for nobody. A job now owns its hashing: a stop
+  drops queued work, interrupts running tasks, and ends the read between buffers. A read that cannot be
+  interrupted is reported out loud - "still running after being asked to stop, and cannot be interrupted" -
+  rather than counted quietly as stopped.
+- **An interrupted comparison could be reported as a mismatch or a missing file.** A file whose digest was never
+  taken gets no verdict, not a finding.
+
 ### Fixed — a job belongs to one owner, and for as long as it takes
 
 - **Cancellation, a time limit and the program closing are three different answers now.** A job result carries

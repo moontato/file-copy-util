@@ -19,6 +19,30 @@ public final class FileHasher {
     private FileHasher() {
     }
 
+    /**
+     * Raised when a hash was stopped because the job that asked for it was stopped.
+     *
+     * <p>It is an {@link IOException} so every existing caller keeps working, and it is its own type so a
+     * caller can tell "this file could not be read" (a problem with the file) from "this program stopped
+     * paying attention" (a problem with the job). A cancelled job must not fill its report with read errors
+     * for files that are perfectly fine.
+     */
+    public static final class HashAborted extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        HashAborted(Path file) {
+            super("hashing of " + file + " was stopped on request");
+        }
+    }
+
+    /**
+     * Hash a file, stopping between reads if the calling thread is interrupted.
+     *
+     * <p>The check sits between reads rather than inside one: a read of a huge local file is otherwise
+     * unbounded, so cancelling a job would leave a thread reading tens of gigabytes for nobody. A read that
+     * the kernel will not interrupt (a wedged mount, for instance) is a different matter, and the engine says
+     * so out loud instead of pretending the read stopped.
+     */
     public static String computeHash(Path file) throws IOException, NoSuchAlgorithmException {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         try (InputStream is = new BufferedInputStream(Files.newInputStream(file), BUFFER_SIZE)) {
@@ -26,6 +50,9 @@ public final class FileHasher {
             int bytesRead;
             while ((bytesRead = is.read(buffer)) != -1) {
                 digest.update(buffer, 0, bytesRead);
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new HashAborted(file);
+                }
             }
         }
         return bytesToHex(digest.digest());

@@ -13,6 +13,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -21,6 +22,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -360,6 +363,313 @@ class JobOwnershipTest {
         }
     }
 
+    @Test
+    void closingTheProgramWhileACallbackIsBlockedStillEndsThatJob(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+
+        CountDownLatch stuck = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        FileSyncEngine engine = new FileSyncEngine();
+        // The hole: the terminal guard lives on the watchdog, and closing retires the watchdog. A job blocked
+        // inside a caller's callback at that moment used to be left reported as running, with no result - the
+        // command-line run exits printing no summary, and the window keeps a job that will never end.
+        ProgressListener blocking = new ProgressListener() {
+            @Override
+            public void onFileProcessed(String relPath, String kind, String sourceHash, String destHash) {
+                stuck.countDown();
+                try {
+                    released.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void onCompletion(JobResult result) {
+            }
+        };
+        try {
+            engine.useRsync(TestSupport.fakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt", 0).toString());
+            assertTrue(engine.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), blocking));
+            assertTrue(stuck.await(30, TimeUnit.SECONDS), "the callback never got as far as being blocked");
+
+            long startedAt = System.nanoTime();
+            engine.close();
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            assertTrue(millis < 5_000L, "closing waited on the blocked callback for " + millis + " ms");
+
+            JobResult result = engine.lastResult();
+            assertNotNull(result, "closing left the job with no result at all");
+            assertEquals(JobStatus.FAILED, result.status());
+            assertEquals(AbortCause.ENGINE_CLOSED, result.abortCause(), result.message());
+            assertFalse(engine.isRunning(), "closing left the engine describing the job as running");
+            assertTrue(result.message().contains("closing"), result.message());
+
+            released.countDown();
+            awaitLateResult(engine, 1);
+            assertEquals(AbortCause.ENGINE_CLOSED, engine.lastResult().abortCause(),
+                    "the abandoned thread's late result replaced the one closing reported");
+            TestSupport.assertNoProcessesRunning("rsync", "after closing over a job with a blocked callback");
+        } finally {
+            released.countDown();
+            engine.close();
+        }
+    }
+
+    @Test
+    void aForcedCompletionWithABlockedCallbackStillEnforcesTheNextJobsDeadline(@TempDir Path tmp)
+            throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path src2 = Files.createDirectories(tmp.resolve("src2"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        TestSupport.write(src2.resolve("a.txt"), "a\n");
+
+        CountDownLatch stuckInCallback = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            // A listener is somebody else's code and may block on completion. That is entitled, and it cannot
+            // be allowed to occupy the watchdog: the watchdog is what enforces the next job's time limit.
+            ProgressListener blocking = new ProgressListener() {
+                @Override
+                public void onFileProcessed(String relPath, String kind, String sourceHash, String destHash) {
+                    try {
+                        released.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                @Override
+                public void onCompletion(JobResult result) {
+                    stuckInCallback.countDown();
+                    try {
+                        released.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            };
+            engine.useRsync(TestSupport.hangingFakeRsync(Files.createDirectories(tmp.resolve("fake1")),
+                    ">f+++++++++|a.txt", "first.marker").toString());
+            assertTrue(engine.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), blocking));
+            awaitMarker(dst.resolve("first.marker"));
+            engine.cancel();
+
+            awaitIdle(engine, 20_000);
+            assertTrue(stuckInCallback.await(20, TimeUnit.SECONDS),
+                    "the forced completion was never delivered at all");
+
+            // The engine must still be able to run a job AND still enforce a limit on it, with a callback
+            // blocked somewhere else. The only thing that ends a hung rsync is the watchdog.
+            engine.setJobTimeoutMillis(1_000L);
+            engine.useRsync(TestSupport.hangingFakeRsync(Files.createDirectories(tmp.resolve("fake2")),
+                    ">f+++++++++|a.txt", "second.marker").toString());
+            Recorder second = new Recorder();
+            assertTrue(engine.start(request(src2, dst, JobType.COPY_ONLY, "a.txt"), second),
+                    "a blocked completion callback stopped the engine taking another job");
+            awaitMarker(dst.resolve("second.marker"));
+            assertTrue(second.awaitCompletion(20_000),
+                    "the watchdog never enforced the next job's time limit - its thread was inside the"
+                            + " blocked completion callback");
+            assertEquals(AbortCause.TIMED_OUT, second.result().abortCause(), second.result().message());
+            TestSupport.assertNoProcessesRunning("rsync", "after the watchdog ended the second job");
+        } finally {
+            released.countDown();
+            engine.close();
+        }
+    }
+
+    @Test
+    void aJobStoppedWhileItWasStillListingTheFilesStillGetsAReport(@TempDir Path tmp) throws Exception {
+        // A job can be stopped while it is still validating a big selection or walking the directory, before
+        // any counter exists. "No counters yet" must not mean "no report": the job is named, the phase it was
+        // in is named, and the figures say nothing was checked instead of leaving the caller with nothing.
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        int names = 60_000;
+        String[] selection = new String[names];
+        for (int i = 0; i < names; i++) {
+            Path file = src.resolve("f" + (i / 1000) + "/file" + i + ".txt");
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, "x\n");
+            selection[i] = src.relativize(file).toString().replace('\'', '/');
+        }
+
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            Recorder recorder = new Recorder();
+            assertTrue(engine.start(TestSupport.request(src, dst, JobType.COPY_AND_VERIFY,
+                    TestSupport.selection(selection), TestSupport.selection()), recorder));
+            Thread.sleep(150L);
+            engine.cancel();
+            assertTrue(recorder.awaitCompletion(30_000), "the stopped job never reported anything");
+            JobResult result = recorder.result();
+            assertEquals(JobStatus.FAILED, result.status());
+            assertEquals(AbortCause.USER_CANCELLED, result.abortCause(), result.message());
+            assertEquals(0, result.filesChecked(),
+                    "a job stopped while listing files checked nothing: " + result.message());
+            assertFalse(engine.isRunning());
+            assertSame(recorder.result(), engine.lastResult(),
+                    "the engine's own account of the last job should be the report that job made");
+        } finally {
+            engine.close();
+        }
+    }
+
+    // ------------------------------------------------------------------ hashing that keeps reading
+
+    @Test
+    void aCancelledSourceHashStopsTheThreadReadingTheFile(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        // Sparse, so the fixture costs a directory entry rather than gigabytes: what matters is that a read of
+        // an enormous file is provably still in progress when the job is cancelled - hashing 40 GiB of holes
+        // takes well over a minute, so a worker that is still named "hash-source" three seconds after the
+        // cancellation was not one that had just finished its work.
+        TestSupport.sparse(src.resolve("huge.bin"), 40L * 1024 * 1024 * 1024);
+
+        CountDownLatch hashing = new CountDownLatch(1);
+        Recorder recorder = new Recorder();
+        ProgressListener watching = new ProgressListener() {
+            @Override
+            public void onPhase(String phase) {
+                if ("hashing source".equals(phase)) {
+                    hashing.countDown();
+                }
+            }
+
+            @Override
+            public void onCompletion(JobResult result) {
+                recorder.onCompletion(result);
+            }
+        };
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            assertTrue(engine.start(request(src, dst, JobType.COPY_AND_VERIFY, "huge.bin"), watching));
+            assertTrue(hashing.await(30, TimeUnit.SECONDS), "the job never reached source hashing");
+            Thread.sleep(400L);
+            engine.cancel();
+            assertTrue(recorder.awaitCompletion(30_000), "the cancelled hashing job never reported");
+
+            JobResult result = recorder.result();
+            assertEquals(AbortCause.USER_CANCELLED, result.abortCause(), result.message());
+            awaitNoThreadNamed("hash-source", 3_000);
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("Hashing of the source was stopped")),
+                    "a hash cut short should be named as such: " + result.warnings());
+            TestSupport.assertNoProcessesRunning("rsync", "after cancelling during source hashing");
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void aCancelledVerificationStopsTheThreadReadingTheFile(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.sparse(src.resolve("huge.bin"), 40L * 1024 * 1024 * 1024);
+
+        CountDownLatch verifying = new CountDownLatch(1);
+        Recorder recorder = new Recorder();
+        ProgressListener watching = new ProgressListener() {
+            @Override
+            public void onPhase(String phase) {
+                if ("verifying".equals(phase)) {
+                    verifying.countDown();
+                }
+            }
+
+            @Override
+            public void onCompletion(JobResult result) {
+                recorder.onCompletion(result);
+            }
+        };
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            // Verify Only reads the source to compare it, so the read that has to stop is the one in the
+            // verification pool, and it starts after the work has been submitted.
+            assertTrue(engine.start(request(src, dst, JobType.VERIFY_ONLY, "huge.bin"), watching));
+            assertTrue(verifying.await(30, TimeUnit.SECONDS), "the job never reached verification");
+            Thread.sleep(400L);
+            engine.cancel();
+            assertTrue(recorder.awaitCompletion(30_000), "the cancelled verification never reported");
+
+            JobResult result = recorder.result();
+            assertEquals(AbortCause.USER_CANCELLED, result.abortCause(), result.message());
+            assertEquals(0, result.filesMismatched(),
+                    "an interrupted comparison is not a mismatch: " + result.message());
+            assertEquals(0, result.filesMissing(),
+                    "an interrupted comparison is not a missing file: " + result.message());
+            awaitNoThreadNamed("verify", 3_000);
+        } finally {
+            engine.close();
+        }
+    }
+
+    // ------------------------------------------------------------------ admission vs finishing
+
+    @Test
+    void anAdmittedJobIsNeverLeftDescribingItselfAsIdleByAnEarlierJob(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        Path fakeDir = Files.createDirectories(tmp.resolve("fake"));
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            // Two threads, one engine: a job being cancelled, and somebody trying to admit the next one. The
+            // invariant is that the engine's own account of itself never contradicts - a finished job used to
+            // reopen admission before it had written its status, so a new job's RUNNING could be stamped over
+            // with the old job's FAILED.
+            for (int round = 0; round < 40; round++) {
+                engine.useRsync(TestSupport.fakeRsync(fakeDir, ">f+++++++++|a.txt", 0).toString());
+                Recorder first = new Recorder();
+                assertTrue(engine.start(request(src, dst, JobType.COPY_ONLY, "a.txt"), first));
+                engine.cancel();
+
+                AtomicReference<JobResult> raced = new AtomicReference<>();
+                JobRequest contenderRequest = request(src, dst, JobType.COPY_ONLY, "a.txt");
+                Thread contender = new Thread(() -> {
+                    for (int attempt = 0; attempt < 200; attempt++) {
+                        Recorder second = new Recorder();
+                        if (engine.start(contenderRequest, second)) {
+                            raced.set(second.awaitResultOrNull());
+                            return;
+                        }
+                    }
+                });
+                contender.start();
+                assertTrue(first.awaitCompletion(30_000), "the cancelled job never reported in round " + round);
+                contender.join(30_000);
+
+                if (engine.isRunning()) {
+                    assertEquals(JobStatus.RUNNING, engine.status(),
+                            "round " + round + ": the engine is running but does not say RUNNING");
+                } else {
+                    assertNotEquals(JobStatus.RUNNING, engine.status(),
+                            "round " + round + ": the engine says RUNNING while admitting nothing");
+                }
+                if (raced.get() != null) {
+                    // Whoever won, the engine's terminal state belongs to the job it admitted last.
+                    assertEquals(JobStatus.COMPLETED, engine.lastResult().status(),
+                            "round " + round + ": an older job's finish overwrote the state of the job that"
+                                    + " was admitted after it");
+                }
+                awaitNotRunning(engine, 30_000);
+            }
+        } finally {
+            engine.close();
+        }
+    }
+
     // ------------------------------------------------------------------ cleanup ownership
 
     @Test
@@ -447,6 +757,36 @@ class JobOwnershipTest {
                 + " applied to the job that ran after it");
     }
 
+    /** Wait until no live thread still carries this name - a stopped job's hashing threads included. */
+    private static void awaitNoThreadNamed(String name, long millis) throws InterruptedException {
+        long until = System.currentTimeMillis() + millis;
+        List<Thread> alive = liveThreadsNamed(name);
+        while (!alive.isEmpty() && System.currentTimeMillis() < until) {
+            Thread.sleep(100L);
+            alive = liveThreadsNamed(name);
+        }
+        assertTrue(alive.isEmpty(), "threads named " + name + " were still working after the job was stopped:"
+                + alive);
+    }
+
+    private static List<Thread> liveThreadsNamed(String name) {
+        List<Thread> found = new java.util.ArrayList<>();
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (thread != null && name.equals(thread.getName()) && thread.isAlive()) {
+                found.add(thread);
+            }
+        }
+        return found;
+    }
+
+    private static void awaitNotRunning(FileSyncEngine engine, long millis) throws InterruptedException {
+        long until = System.currentTimeMillis() + millis;
+        while (engine.isRunning() && System.currentTimeMillis() < until) {
+            Thread.sleep(50L);
+        }
+        assertFalse(engine.isRunning(), "the engine never became idle");
+    }
+
     private static void assertNoRsyncIsLeftBehind(String when) throws Exception {
         TestSupport.assertNoProcessesRunning("rsync", when);
     }
@@ -471,6 +811,15 @@ class JobOwnershipTest {
 
         boolean awaitCompletion(long millis) throws InterruptedException {
             return completion.await(millis, TimeUnit.MILLISECONDS);
+        }
+
+        JobResult awaitResultOrNull() {
+            try {
+                return completion.await(30, TimeUnit.SECONDS) ? result.get() : null;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
         }
 
         JobResult result() {

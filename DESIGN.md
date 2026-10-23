@@ -635,6 +635,44 @@ Now each job owns its state:
   a signal that reaches only the JVM (plain `kill`, a closing terminal, a stopping container) leaves rsync and
   its children reading the source after this program has gone.
 
+Four holes in that design were found by an independent review after the first version of it, and are part of what
+the section now describes:
+
+- **Closing used to disable the mechanism that finishes an abandoned job.** `closeOnce()` shut the watchdog down,
+  and the watchdog was the only thing that would ever report a job whose thread was blocked in a caller's
+  callback: closing left such a job reported as running, with no result, and a command-line run printed no
+  summary. Closing now terminates, gives the job's own thread a bounded moment, and then publishes the stopped
+  job itself before retiring the watchdog.
+- **A job stopped before it had any counters had no report at all**, because terminal publication required a
+  progress reporter, and there is none during validation, the directory walk, or the destination snapshot. It
+  does not now: the figures are zero, named as such, and the message says which phase the job was in.
+- **Terminal publication and admitting the next job were not one atomic step.** The controller's
+  compare-and-set picks the winning finisher, but the winner reopened admission before writing its own status,
+  so a job admitted a moment later could have its RUNNING stamped over with the older job's FAILED. Admission and
+  terminal publication now happen under one lock; the completed state is written while admission is closed, and
+  admission reopens last. No listener callback and no process operation happens inside the lock.
+- **A forced completion used to run the listener on the watchdog thread.** A completion callback is entitled to
+  block; occupying the watchdog with it meant the next job's time limit was never enforced, and its hung rsync
+  ran until it finished by itself. Completion is now delivered off the watchdog - fire-and-forget from the
+  watchdog, with a short bounded wait when a program is closing and wants its summary printed.
+
+## 19. Stopping a hash that is still reading
+
+Cancelling a job used to stop the job and leave a thread reading a 40 GiB file for nobody: the hash pools,
+futures and open reads belonged to no one, source hashing waited on an unbounded `Future.get()`, and the digest
+loop never looked for a cancellation. Now:
+
+- the job's controller **owns the hash pools and futures**; stopping a job drops queued work and interrupts
+  running tasks, from wherever the stop was asked for - a button, a time limit, a closing program;
+- the digest loop checks for interruption **between buffers**, so an ordinary local read ends;
+- a job that is stopping does not wait for digests it no longer needs, and an interrupted comparison produces
+  **no verdict at all** - a file whose digest was never taken is neither mismatched nor missing;
+- a hash cut short is named in the warnings ("Hashing of the source was stopped on request"), and a read that
+  refuses to stop - a stalled mount, an unreadable device - is reported as what it is: "A read of a source file
+  is still running after being asked to stop, and cannot be interrupted... It writes nothing: hashing only
+  reads; but it may still be holding the disk busy." Forced reporting is a last resort, not a substitute for
+  cancelling a cooperative read.
+
 Measured here, on rsync 3.4.0 and 3.1.3, with a 300 MB throttled transfer in flight: `cancel()` to completion
 is about **400-500 ms** on both versions. A job whose thread cannot finish is reported stopped about **5.5 s**
 after its process was killed (the grace period plus the watchdog's 500 ms tick).
