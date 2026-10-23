@@ -1,16 +1,19 @@
-# Audit remediation plan — File Copy Util (revision 7)
+# Audit remediation plan — File Copy Util (revision 8)
 
-**Date:** 2026-10-21, status updated 2026-10-22
+**Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 7. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
+**Status:** approved and under way, revision 8. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
 corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
-report targets) and **Phase 3 (selection authority, with collision acceptance bound to the job)** are implemented and
-green on this machine, along with the part of Phase 4 that gates 1.5.0 (per-file transfer records for interrupted copy
-jobs) and the matrix-isolation follow-up. Phase 0b's workflows are written and reviewed but **have not been run on
+report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
+correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
+ownership, cancellation causality, and the measured completion-evidence protocol)** are implemented and green on this
+machine, along with the part of Phase 4 that gates 1.5.0 (per-file transfer records for interrupted copy jobs) and the
+matrix-isolation follow-up. Phase 0b's workflows are written and reviewed but **have not been run on
 GitHub**, so its gate is specified rather than demonstrated. Matrix status is qualified as agreed: local evidence for
-3.1.3 and 3.4.0, GitHub coverage pending for all four and local for 3.2.7/3.3.0. Next: the Phase 4 remainder, only on
+3.1.3 and 3.4.0, GitHub coverage pending for all four and local for 3.2.7/3.3.0. Next: your review of the Phase 4
+checkpoint below; then Phase 5 (the scheduled §2.13 hardening, including CSV formula-character neutralisation) only on
 go-ahead. Branch `remediation/audit`; `main` is held at the approved baseline commit `0069285`, `pom.xml` is still
-1.4.0, and no tag, push or release is authorised.
+1.4.0, and no merge, push, tag, version bump or release is authorised by this checkpoint.
 
 ## Revision log (v4, from your second review)
 
@@ -557,31 +560,101 @@ Claim kept precise, as you asked: the deterministic seam establishes the **stale
 carrying an older generation is discarded), not every possible `SwingWorker` interleaving. A latch-controlled
 worker integration test is listed as possible follow-up work, and a flaky race test is not a gate.
 
-**Suite now:** **240 tests, 0 failures, 0 errors, 1 skipped** (the `FCU_RSYNC`-specific test, which only means
-something in a pinned run); SpotBugs 0; `-Werror` clean; `mvn -B -ntp clean verify` succeeds. Whole suite pinned to
-one binary with `FCU_RSYNC_BINARIES` cleared: **234 green** against 3.1.3 and **234 green** against 3.4.0.
+**Suite now:** **251 tests, 0 failures, 0 errors, 1 skipped** (the `FCU_RSYNC`-specific test, which only means
+something in a pinned run); SpotBugs `BugInstance size is 0`; `javac -Xlint:all -Werror` clean;
+`mvn -B -ntp clean verify` succeeds. Whole suite pinned to one binary with `FCU_RSYNC_BINARIES` cleared:
+**245 green** against 3.1.3 and **245 green** against 3.4.0.
 
-**Still open from Phase 0b:** the workflows are written and reviewed statically (jobs, step wiring, pinned
-action SHAs, checksum-pinned tarballs), but **no GitHub Actions run has been executed or observed** - that
-needs an authorised push. Until then the validation gate is *specified*, not *demonstrated*.
+---
 
-**Next, in order**
+## Phase 4 checkpoint — who owns a running job (implemented, green, awaiting your acceptance)
 
-1. Phase 4 remainder (approved on this checkpoint): per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
-2. Phase 4 remainder: per-job abort controller, idempotent shutdown hook, bounded cancel latency during a
-   single large hash, channel workers that cannot block termination, and the completion-signal decision
-   (`%b` start header vs `%b` completion line) confirmed on 3.2.7 and 3.3.0 through the matrix.
-3. Old 2. write safety - A01 overlap refusal, §2.6 export protection, A04 containment across the whole
-   path, §2.11 collision acknowledgement - with the source-immutability assertion added to every copy test.
-2. Phase 3: selection authority (§2.3 identity/selection split, one immutable `JobRequest` at Run).
-3. Then propose **1.5.0** (gate green: `remediation/audit` merged to `main`, validate green on the exact
-   commit, your go-ahead per A10).
-4. Phase 4 remainder: per-job `AbortController`, shutdown-hook idempotence, bounded cancel latency during
-   a single large hash, channel workers that cannot block termination, and the §2.5A A/B decision - now
-   measured further: `--progress --out-format='%i|%b|%n'` prints the file name before that file's progress
-   on 3.1.3 and 3.4.0, so Option B keeps the in-flight name without watching temporary files; 3.2.7 and
-   3.3.0 remain to be confirmed by the matrix.
-5. Phase 5 onward as planned.
+The five things the phase asked for, and what each is now:
 
-5. Phase 4: lifecycle plus completion attribution; settle the §2.5A A/B choice by measuring the hidden
-   temporary file as the in-flight signal; turns `InterruptedOverwriteTest` green.
+**1. One abort controller per job.** `FileSyncEngine.JobControl` holds that job's generation, deadline, cancel
+flag, stop reason, its `rsync` process and that process's tree, its destination reservation, its published
+counters and its own thread. Nothing about a job is kept engine-wide any more, and nothing is reset for the next
+job. Every loop (`pumpRsyncOutput`, `verifyEntries`, `verdict`, `hashFiles`, the ledger snapshot, the copy phase)
+holds the controller of the job it is working on.
+
+**2. An old worker cannot see, stop, or rewrite a later job.** Publication goes through
+`currentControl.compareAndSet(control, null)`: a result from a job the engine has let go is counted in
+`lateResultsDropped()` and otherwise discarded — it cannot replace the next job's status, result, or destination
+reservation. The destination reservation lives in the controller and is released at most once, by whoever
+releases it first. A worker can only terminate the process its own controller started, which is what keeps a
+thread that woke up late from killing the job that followed it.
+
+**3. Terminal delivery is bounded.** The engine releases itself (idle, reservation gone) **before** the
+completion callback runs, so a blocked callback cannot leave it reporting `RUNNING`. Jobs run on their own
+thread instead of a shared serial queue — measured: with the queue, a job abandoned inside a caller's callback
+blocked the next job from ever starting. If a job thread does not return within 5 s of its process tree being
+killed, the watchdog publishes that job's own last-published counters as a stopped job, says plainly that the
+per-file rows from that thread are missing, and lets go. Terminating a job also closes `rsync`'s output streams,
+so a reader cannot be held open by a process that left the tree.
+
+**4. Shutdown-hook ownership.** `closeOnce()` is idempotent and bounded; `close()` delegates to it; the window's
+`shutdown()` calls it; `Cli` installs a shutdown hook running the same cleanup and removes it once the job is
+over, and both the install and the removal are exercised by a test (`installEngineCleanup` returns the thread
+because a `Thread` cannot be asked what it was told to run). Without that hook, a signal reaching only the JVM
+left `rsync` and its children reading the source after the program exited.
+
+**5. Causality stays three facts.** `JobResult.abortCause()` is `USER_CANCELLED`, `TIMED_OUT` or
+`ENGINE_CLOSED`; the window's status line, the log heading (`=== JOB STOPPED ===`) and the message wording
+differ per cause. `ReportExporterTest`'s existing 11-argument constructor calls still compile through a
+compatibility constructor, so no test lost its assertion to accommodate the new field.
+
+**Cancellation latency (measured, 300 MB throttled transfer in flight, `cancel()` → completion callback):**
+about **400–500 ms** on rsync 3.4.0 and on 3.1.3 (three runs each: 412/402/403 ms and 413/403/503 ms). A job
+whose own thread never returns is reported stopped about **5.5 s** after its process tree was killed (5 s grace
++ the watchdog's 500 ms tick).
+
+**Owned-process cleanup (measured):** a cancelled copy, a closed engine, a completed copy **and now a timed-out
+copy** each leave no `rsync` process running (`TestSupport.assertNoProcessesRunning`, and the timeout case is a
+new fixture — previously only the other three were checked). A cancelled mid-transfer job also leaves no hidden
+partial file behind, which is `rsync`'s own SIGTERM behaviour.
+
+**Timeout wording:** *"Job stopped on timeout: it passed the 1.5 s limit this job was given, while copying. …
+The files themselves were not reported as different by this stop."* plus the standing warning to raise or clear
+the limit. The word "timeout" is kept so a log can be searched for it; the human duration (`900 ms`, `45.0 s`,
+`5 min 3 s`) replaces the bare millisecond count. The GUI says "Job stopped: it passed the time limit." A
+timeout never says "cancelled", and a cancellation never says "timeout" — asserted in both directions.
+
+**Start/completion output protocol (measured, then decided):** the program keeps
+`--info=progress2` + `--out-format='%i|%n'`, where the itemize line arrives **before** that file's progress, so a
+name proves rsync started the file. The alternative (`--progress` + `'%i|%b|%n'`) was measured on 3.1.3 and 3.4.0:
+the itemize line moves **after** that file's 100% line (a per-file completion record) and the bare file name
+appears on its own line before its progress (a start name). Two assumptions were disproved by measuring: `%b` is
+the bytes put on the wire for that transfer, **not** the file size (a 4-byte file reported 47; 4 MiB reported
+4,194,855), so it cannot be checked against the expected size; and no `--info` variant (`name1`, `name0`,
+`copy1`) produces a per-file start header alongside a whole-transfer progress line, so the whole-transfer bar and
+a per-file start name do not come from one option set. Two measurements keep UNCERTAIN permanent: a SIGTERM'd
+run exits **20**, prints start + progress but no completion line for the cut-short file, and deletes its hidden
+temporary; and **a reader that stops reading does not stop rsync** — it finished every file with no error at all,
+so the absence of a completion line is never evidence nothing was written, and stopping a job must mean
+signalling the process tree rather than closing the reader. Decision: keep protocol A, because per-file completion
+is already decided from the pre-transfer ledger and switching would trade the whole-transfer progress figure, plus
+a protocol change through every fake-rsync fixture, for evidence the ledger already obtains conservatively.
+Option B remains available and its exact shape is written in DESIGN §18; 3.2.7/3.3.0 confirmation is still owed
+by the CI matrix either way.
+
+**Tests, and whether they bite.** `JobOwnershipTest` adds 11 fixtures (three causes, distinguishability,
+reuse-after-cancel on the same destination, engine idle before the completion callback, timeout leaves no
+process, `closeOnce` idempotent and prompt, hook registered/removed and the hook's work, an abandoned thread
+neither blocking nor rewriting the following job, and an abandoned job not handing back a destination another
+job is using). Each deliberately reintroduced defect was checked to fail: removing the publication gate → 2
+failures; disabling the terminal guard → 2 failures; collapsing the abort causes → 4 failures. The fourth
+mutation tried (releasing the destination before the gate) is **not observable** through the suite, because the
+reservation now lives in the job's own controller and is cleared at most once — recorded here rather than hidden,
+with the outsider-refusal fixture as the lock on the consequence.
+
+**Still open after this phase**
+
+1. Phase 0b's workflows have still never run on GitHub: an authorised push is needed before the validation gate
+   can be called demonstrated, and before the four-version matrix is evidenced beyond 3.1.3/3.4.0 locally.
+2. §2.13 hardening, including **CSV formula-character neutralisation** (the exporter still only quotes; the class
+   comments say so).
+3. The §2.5A Option-B protocol switch, if you want per-file completion names instead of ledger-derived ones.
+4. GUI dialogs are exercised through seams, not rendered dialogs; cross-process locking stays declined by you, so
+   the check-then-`rsync` race across processes stays documented rather than closed.
+5. Nothing here is released: `pom.xml` is 1.4.0, `main` is still `0069285`, no tag or push. 1.5.0 needs your
+   separate go-ahead (A10) after the merge gate is green.

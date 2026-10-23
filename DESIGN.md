@@ -594,3 +594,91 @@ three names followed by a job started over thirty would be a lie about what was 
 The question text is built by `collisionCopyQuestion(names)`: it names the files at risk and does not claim they
 are identical, because whether two names become one file is a property of the destination volume — a Windows
 share, an exFAT card, some macOS volumes — which this program cannot see.
+
+## 17. One job, one owner
+
+A copy job outlives the moment it was started: a reader thread on rsync's output, a hashing thread, a thread
+that was building the report, and the window's own callback are all still running when someone presses Cancel,
+when a time limit bites, or when the program is told to exit. Until now the engine kept one cancel flag, one
+deadline and one process reference for itself, and cleared them when the next job began. Anything still running
+from the previous job then read a clean slate that belonged to somebody else - it could run on as though no
+cancel had been asked for, terminate the process of the job that had just started, or release a destination
+another job was using.
+
+Now each job owns its state:
+
+- **`JobControl`** - generation, deadline, cancel flag, cause, the process it started and that process's tree,
+  the destination reservation, the published counters, and the thread running it. Made for one job, never reset.
+  Every loop holds its own controller, so an old worker can only ever see, and only ever stop, the job it
+  belongs to.
+- **A publication gate.** `finishJob` hands the result over only if its controller is still the current one
+  (`compareAndSet`). A late result is counted in `lateResultsDropped()` and otherwise thrown away: it does not
+  rewrite the status, the last result, or the reservation of the job that replaced it.
+- **Release before callback.** The engine marks itself idle and releases its own destination reservation
+  *before* the completion callback runs, so a caller whose callback blocks cannot leave the engine describing
+  itself as running. Measured by asserting `isRunning()` from inside `onCompletion`.
+- **A thread per job, not a queue.** The single-thread executor looked tidy and was wrong: with a blocked
+  listener, the abandoned thread held the queue and the next job never started. Only one job runs at a time
+  because `jobRunning` says so, not because the queue is serial.
+- **A terminal guard.** A thread stuck inside a read, a hash, or somebody else's callback cannot be made to
+  return. Once the job's process tree had been killed and 5 s have passed, the watchdog publishes the job's own
+  last published counters as a stopped job and lets go of it, with a warning that the per-file rows from that
+  thread are not included. The reservation is released there deliberately: the only thing that wrote to the
+  destination was rsync, and that tree is dead by then. What may still be running is Java code that reads and
+  reports, and writes nothing.
+- **Closing the pipes.** Terminating a job also closes rsync's output streams. A reader blocked on a pipe only
+  sees end of file once every writer has gone, and a process that left the tree (a double fork, a `setsid`)
+  cannot be reached by signals.
+- **`closeOnce()`.** Cleanup is idempotent and bounded. The CLI installs a JVM shutdown hook that runs the
+  same cleanup and takes the hook back once the job is over; the window's `shutdown()` calls `closeOnce()` too.
+  Two cleanups waiting on one process tree is how a program hangs on exit instead of exiting. Without the hook,
+  a signal that reaches only the JVM (plain `kill`, a closing terminal, a stopping container) leaves rsync and
+  its children reading the source after this program has gone.
+
+Measured here, on rsync 3.4.0 and 3.1.3, with a 300 MB throttled transfer in flight: `cancel()` to completion
+is about **400-500 ms** on both versions. A job whose thread cannot finish is reported stopped about **5.5 s**
+after its process was killed (the grace period plus the watchdog's 500 ms tick).
+
+The eleven fixtures in `JobOwnershipTest` are checked against deliberately reintroduced defects: removing the
+publication gate, disabling the terminal guard, and collapsing the causes each fail at least two fixtures. The
+fourth mutation tried - releasing the destination before the gate - is *not* observable, because the
+reservation now lives in the job's own controller and is cleared by whoever releases it first; that is the
+stronger invariant, and the outsider-refusal fixture locks the consequence.
+
+## 18. What rsync's output can and cannot prove about a transfer
+
+Completion evidence was the audit's hardest requirement: a transfer that was cut short must never be reported as
+copied, and a report must say which files it cannot vouch for. Two candidate output protocols were measured on
+rsync 3.1.3 and 3.4.0 in this container (3.2.7 and 3.3.0 are left to the CI matrix):
+
+| asked for | where rsync puts the per-file line | what a name in that line proves |
+| --- | --- | --- |
+| `--info=progress2` + `--out-format='%i\|%n'` (what the program uses today) | before that file's progress lines | rsync had started that file - **not** that it finished |
+| `--info=progress2` + `--out-format='%i\|%b\|%n'` | after that file's 100% line | the transfer completed, with the bytes rsync put on the wire for it |
+| `--progress` + `--out-format='%i\|%n'` | before | started |
+| `--progress` + `--out-format='%i\|%b\|%n'` | after; the bare file name also appears on its own line before that file's progress | completed, and a start name as well |
+
+Two assumptions were disproved by measuring:
+
+- **`%b` is not the file's size.** A 4-byte file reported 47; a 4 MiB file reported 4,194,855. It is the bytes
+  transferred for that file, so it can witness a completed transfer but cannot be compared against the size the
+  program expected.
+- **A whole-transfer percentage and a per-file start name do not come together.** `--info=progress2,name1`,
+  `name0` and `copy1` produce no per-file header at all. So the choice is between the whole-transfer bar with
+  start lines (kept), and per-file progress with completion lines (which would mean computing the overall bar in
+  this program, from the sizes of the selected files).
+
+Two further measurements are why "uncertain" stays a permanent category:
+
+- A run interrupted by `SIGTERM` exits with code **20**, prints the start line and progress for the file it was
+  writing, prints **no** completion line for it, and deletes the hidden temporary file it had open.
+- If the reading side stops reading, **rsync does not notice**: it went on to transfer and finish every file with
+  no error message at all. So the absence of a completion line is never evidence that nothing was written.
+  Stopping a job therefore means signalling the process tree, never closing the reader.
+
+Decision: keep the current protocol. Per-file completion is already decided from the pre-transfer ledger
+(what the job intended to write, and what the destination held beforehand), so switching to `%b` would trade
+the whole-transfer progress figure - and a protocol change touching every fake-rsync fixture - for evidence the
+ledger already obtains conservatively. If Option B is adopted later, the pair is `--progress` with
+`--out-format='%i|%b|%n'`, and this program must compute the overall bar itself.
+

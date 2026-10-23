@@ -593,11 +593,18 @@ public final class Cli {
             engine.acceptAnyCollisions();
         }
         ProgressReporter reporter = new ProgressReporter(out, options.quiet(), options.request().jobType());
+        // A shutdown hook owns the same cleanup as the finally below, and both call closeOnce(): whoever
+        // arrives first does the work. Without the hook, a signal that reaches only this JVM (kill, a terminal
+        // closing, a container stopping) leaves rsync and its children reading the source after this program
+        // has gone - which is the complaint the audit's process-tree finding was. The hook is removed as soon
+        // as the job is over, so a finished run does not run cleanup a second time on exit.
+        Thread cleanup = installEngineCleanup(engine);
         JobResult result;
         try {
             result = engine.execute(options.request(), reporter);
         } finally {
-            engine.close();
+            engine.closeOnce();
+            removeEngineCleanup(cleanup);
         }
 
         for (String warning : result.warnings()) {
@@ -671,6 +678,38 @@ public final class Cli {
                     + " it. Give them different paths.");
         }
         return problems;
+    }
+
+    /**
+     * Register the JVM shutdown hook that stops a running job's processes. Package-visible, and returning the
+     * thread, so a test can check that the hook really was registered and really was removed: the failure mode
+     * here is a cleanup that quietly never runs.
+     */
+    /**
+     * The work the shutdown hook does, handed out separately because a {@link Thread} cannot be asked what it
+     * was told to run: a test that checks the hook stops the engine has to be able to run the same thing.
+     */
+    static Runnable engineCleanup(FileSyncEngine engine) {
+        return engine::closeOnce;
+    }
+
+    static Thread installEngineCleanup(FileSyncEngine engine) {
+        Thread hook = new Thread(engineCleanup(engine), "file-copy-util-engine-cleanup");
+        try {
+            Runtime.getRuntime().addShutdownHook(hook);
+        } catch (IllegalStateException alreadyShuttingDown) {
+            // The JVM is going down already; run now what the hook would have run.
+            engine.closeOnce();
+        }
+        return hook;
+    }
+
+    static void removeEngineCleanup(Thread hook) {
+        try {
+            Runtime.getRuntime().removeShutdownHook(hook);
+        } catch (IllegalStateException alreadyShuttingDown) {
+            // The hook will run on the way out, and closeOnce() makes that harmless.
+        }
     }
 
     /**

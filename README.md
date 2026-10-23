@@ -203,13 +203,16 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-240 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
+251 tests, headless (no display needed): scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
 the job it was given for), scan authority (Run refused before a scan, during a scan, after a typed path is
 edited, or after the scan options change; a stale scan result discarded and said so; a running job keeping the
-ticks that were on screen when Run was pressed), the CLI
+ticks that were on screen when Run was pressed), job ownership (a cancelled, timed-out or closed job says which
+of the three it was; one job's cancel flag cannot be read as another job's; a job whose own thread never returns
+is reported stopped and cannot block, stop, or rewrite the job after it; cleanup runs once and the command line's
+shutdown hook is taken back afterwards), the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
 checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
@@ -409,6 +412,21 @@ don't run two copies into the same destination at once.
 rsync's file list is a line list, so a name containing a newline, a carriage return or a NUL byte cannot be
 passed safely. Such names are refused before anything is written, listed in the warnings, and reported as not
 transferred. Rename them if you need them copied.
+
+### "Job stopped: it passed the time limit."
+
+The job ran out of the time it was given, which is a setting rather than a fault in the files: the copies were
+not reported as different by the stop itself. Raise or clear the limit (`--timeout 0` on the command line, or
+the timeout field in the window) and run it again. The log heading says `=== JOB STOPPED ===` rather than
+`=== JOB FAILED ===`, and the totals show how far it got.
+
+### "the job's own thread was still finishing when this was reported"
+
+A job was stopped and its processes were killed, but the thread that had been reading `rsync`'s output or
+hashing files did not come back within five seconds — usually because it is inside a call that is itself
+blocked. The program does not pretend to be still running: it reports the figures that thread had reached,
+marks the job stopped, and lets another job start. The per-file rows from that thread are deliberately absent,
+and anything it tries to report afterwards is ignored rather than mixed into a later job's results.
 
 ### "No display available" error
 

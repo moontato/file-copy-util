@@ -2,6 +2,31 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Fixed — a job belongs to one owner, and for as long as it takes
+
+- **Cancellation, a time limit and the program closing are three different answers now.** A job result carries
+  why it stopped, the window says "Job cancelled.", "Job stopped: it passed the time limit." or
+  "Job stopped: the program was closing." and logs the stopped job as stopped. A timeout message names the
+  limit that was passed ("1.5 s"), the phase it was in, and says plainly that the files were not reported as
+  different by the stop - a limit that was too short is not a fault in anyone's data.
+- **The engine no longer keeps one cancel flag, one deadline and one process for everybody.** They belonged to
+  the engine and were cleared when the next job started, so a leftover reader, hashing thread or reporting
+  thread read a clean slate that belonged to another job: it could run on believing it had never been cancelled,
+  or kill the process of the job that had just started. Each job now owns its own state, and a result from a job
+  the engine had already let go is dropped and counted instead of rewriting the next job's facts.
+- **A job whose own thread cannot finish no longer holds the program open.** The engine marks the job stopped
+  about five seconds after its process tree was killed, reports the counters that thread had published, releases
+  the destination, and can start another job; the abandoned thread's late result reaches nobody. Jobs run on
+  their own thread, so an abandoned one cannot block the next job behind it in a queue.
+- **A timed-out copy leaves no `rsync` reading the source.** Cancellation and closing were checked for this;
+  the time limit was not.
+- **A stopped job's reader is not left waiting forever.** Terminating a job closes `rsync`'s output pipes too,
+  because a process that left the process tree (a double fork, a `setsid`) holds them open and no signal can
+  reach it.
+- **A signalled command line stops the copies it owns.** `--cli` registers a shutdown hook that performs the
+  same cleanup as a normal exit, and removes it once the job is over; the cleanup runs exactly once however
+  many callers ask, and is bounded, so the program exits instead of waiting on itself.
+
 ### Fixed — the file you selected is the file that gets copied
 
 - **A name with leading or trailing spaces selected a different file.** Selection lists were trimmed, so

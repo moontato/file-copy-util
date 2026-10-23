@@ -29,6 +29,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -117,11 +118,27 @@ public class FileSyncEngine implements AutoCloseable {
     }
     public enum JobStatus { IDLE, RUNNING, COMPLETED, FAILED }
 
+    /**
+     * Why a job stopped before it was finished.
+     *
+     * <p>A timeout is a setting, a cancellation is a person pressing a button, and a close is the program
+     * going away. They are three different facts and a reader of a report is entitled to know which one
+     * happened: "FAILED - 12 of 400 checked" tells nobody whether the files are fine and the limit was
+     * short, or the copy was stopped on purpose.
+     */
+    public enum AbortCause { NONE, USER_CANCELLED, TIMED_OUT, ENGINE_CLOSED }
+
     /** Copy phase occupies 0..70% of the bar, verification 70..100%. */
     static final int COPY_PROGRESS_END = 70;
 
     /** How long the tree gets to stop itself before it is killed outright. */
     private static final int TERM_GRACE_SECONDS = 3;
+
+    /**
+     * How long a job thread gets to finish publishing after its process tree had been killed. Beyond this the
+     * engine reports the job as stopped rather than describing it as running indefinitely.
+     */
+    private static final long TERMINAL_GRACE_MILLIS = 5_000L;
     /** Deadline enforcement granularity. */
     static final long WATCHDOG_PERIOD_MS = 250;
     /** No deadline (default). */
@@ -301,12 +318,27 @@ public class FileSyncEngine implements AutoCloseable {
                             int filesChecked, int filesMatched, int filesMismatched,
                             int filesMissing, int filesExtra, int filesCopied,
                             int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
-                            List<String> warnings) {
+                            List<String> warnings, AbortCause abortCause) {
 
         public JobResult {
             outcomes = List.copyOf(outcomes);
             errors = List.copyOf(errors);
             warnings = List.copyOf(warnings);
+            abortCause = abortCause == null ? AbortCause.NONE : abortCause;
+        }
+
+        /** A result that does not name a cause did not stop early; it simply ended. */
+        public JobResult(JobStatus status, String message,
+                         int filesChecked, int filesMatched, int filesMismatched,
+                         int filesMissing, int filesExtra, int filesCopied,
+                         int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
+                         List<String> warnings) {
+            this(status, message, filesChecked, filesMatched, filesMismatched, filesMissing, filesExtra,
+                    filesCopied, rsyncExitCode, outcomes, errors, warnings, AbortCause.NONE);
+        }
+
+        public boolean wasAborted() {
+            return abortCause != AbortCause.NONE;
         }
 
         public boolean isSuccess() {
@@ -316,8 +348,16 @@ public class FileSyncEngine implements AutoCloseable {
 
     private final AtomicReference<JobStatus> status = new AtomicReference<>(JobStatus.IDLE);
     private final AtomicBoolean jobRunning = new AtomicBoolean(false);
-    private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
-    private final AtomicBoolean timeoutTriggered = new AtomicBoolean(false);
+    /**
+     * The job running now, or null between jobs. Every loop working on a job holds its own controller rather
+     * than reading this, and the engine publishes state only for the controller it still regards as current.
+     */
+    private final AtomicReference<JobControl> currentControl = new AtomicReference<>();
+    private final AtomicLong jobGeneration = new AtomicLong();
+    /** Results published by a job the engine had already let go. Counted, never applied. */
+    private final AtomicInteger lateResultsDropped = new AtomicInteger();
+    /** Cleanup runs once, however many callers ask for it. */
+    private final AtomicBoolean closeStarted = new AtomicBoolean(false);
     private volatile boolean closed;
     /** The one collision answer on record: that set, for that job. */
     private volatile CollisionAcceptance collisionAcceptance;
@@ -338,15 +378,6 @@ public class FileSyncEngine implements AutoCloseable {
 
     /** The identity an acceptance is not tied to any one job - for a caller that accepts by name. */
     private static final String ANY_JOB = "*";
-    private final AtomicReference<Process> liveProcess = new AtomicReference<>();
-    /**
-     * Every process the live rsync had spawned, snapshotted while the parent was still alive. A local
-     * rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only the one Java started
-     * leaves the other two reading the source after this program has exited. The snapshot is refreshed
-     * when the job ends, because a child forked after the first snapshot would otherwise never be seen.
-     */
-    private final AtomicReference<List<ProcessHandle>> spawnedTree = new AtomicReference<>(List.of());
-    private final AtomicLong deadline = new AtomicLong(0L);
     private final AtomicLong startedAt = new AtomicLong(0L);
     private final AtomicLong lastActivityAt = new AtomicLong(0L);
     private final AtomicReference<String> lastActivity = new AtomicReference<>("");
@@ -356,18 +387,162 @@ public class FileSyncEngine implements AutoCloseable {
         thread.setDaemon(true);
         return thread;
     });
-    private final ExecutorService jobWorker = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "sync-job");
-        thread.setDaemon(true);
-        return thread;
-    });
+    /**
+     * The job's own thread, one per job rather than one queue for the engine.
+     *
+     * <p>A single-thread executor looked tidy and was wrong: a job thread stuck inside somebody else's
+     * callback blocks every later job as well. The engine had already given up on that thread, published a
+     * stopped result for it, released the destination - and still could not start the next job, because the
+     * queue was serial. Only one job runs at a time because {@code jobRunning} says so, not because the
+     * executor is serial, so an abandoned thread is now simply an abandoned thread: it cannot publish into a
+     * later job and it cannot stop one.
+     */
 
     private volatile JobResult lastResult;
     private volatile long jobTimeoutMillis = NO_TIMEOUT;
     private volatile long bandwidthLimitKbps;
     private volatile int resultLimit = MAX_OUTCOMES;
-    /** Set by the job thread; read by the watchdog to tell a live transfer from a hung engine. */
-    private volatile String jobPhase = "idle";
+
+    /**
+     * The abort state of one job: made when that job starts, held by every loop working on it, and never reset.
+     *
+     * <p>The engine used to keep one cancel flag, one deadline and one process reference for itself and clear
+     * them when the next job began. Anything still running from the previous job - a reader on a pipe, a
+     * hashing thread, a thread that was slow publishing its result - then read a clean slate that belonged to
+     * somebody else: it could run on as though no cancel had ever been asked for, or terminate the process of
+     * the job that had just started. A controller belongs to exactly one job, so an old worker can only ever
+     * see (and only ever stop) the job that was asked about.
+     */
+    private static final class JobControl {
+
+        private final long generation;
+        /** Deadline in {@link System#nanoTime()} terms; 0 when no time limit was set. */
+        private final long deadlineNanos;
+        private final AtomicReference<ProgressListener> listener;
+        private final AtomicBoolean cancelRequested = new AtomicBoolean();
+        private final AtomicReference<AbortCause> cause = new AtomicReference<>(AbortCause.NONE);
+        /**
+         * The rsync this job started, and every process it had spawned, snapshotted while the parent was
+         * still alive. A local rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only
+         * the one Java started leaves the other two reading the source after this program has exited.
+         */
+        private final AtomicReference<Process> process = new AtomicReference<>();
+        private final AtomicReference<List<ProcessHandle>> tree = new AtomicReference<>(List.of());
+        /** The destination reservation this job holds, or null if it never got one. */
+        private final AtomicReference<String> reservation = new AtomicReference<>();
+        /** The running job's counters, so a stop forced from outside can still report what was done. */
+        private final AtomicReference<ProgressReporter> progress = new AtomicReference<>();
+        /** The thread running this job, named for the job, so a stuck one can be identified in a dump. */
+        private final AtomicReference<Thread> worker = new AtomicReference<>();
+        /** When termination was first asked for; 0 until it was. */
+        private volatile long terminateRequestedAtNanos;
+        /** Set by the job thread; read by the watchdog to tell a live transfer from a hung engine. */
+        private volatile String phase = "idle";
+
+        JobControl(long generation, long deadlineNanos, ProgressListener listener) {
+            this.generation = generation;
+            this.deadlineNanos = deadlineNanos;
+            this.listener = new AtomicReference<>(listener);
+        }
+
+        long generation() {
+            return generation;
+        }
+
+        ProgressListener listener() {
+            return listener.get();
+        }
+
+        /** Ask this job to stop, and say who asked. The first reason given is the one recorded. */
+        void requestCancel(AbortCause why) {
+            cause.compareAndSet(AbortCause.NONE, why);
+            cancelRequested.set(true);
+        }
+
+        AbortCause cause() {
+            return cause.get();
+        }
+
+        boolean cancelRequested() {
+            return cancelRequested.get();
+        }
+
+        /** True when this job is past the time limit set for it. Asking is what records the reason. */
+        boolean deadlineExceeded() {
+            if (deadlineNanos == 0L || System.nanoTime() - deadlineNanos < 0) {
+                return false;
+            }
+            cause.compareAndSet(AbortCause.NONE, AbortCause.TIMED_OUT);
+            return true;
+        }
+
+        boolean timedOut() {
+            return cause.get() == AbortCause.TIMED_OUT;
+        }
+
+        /** True when this job should stop at its next safe point. Never blocks, and never stops anything. */
+        boolean abortRequested() {
+            return cancelRequested.get() || deadlineExceeded();
+        }
+
+        /** Record the process this job started, and stop it at once if the job was already cancelled. */
+        void spawn(Process spawned) {
+            process.set(spawned);
+            tree.set(snapshotTree(spawned));
+            if (cancelRequested.get()) {
+                terminate();
+            }
+        }
+
+        Process process() {
+            return process.get();
+        }
+
+        boolean terminationRequested() {
+            return terminateRequestedAtNanos != 0L;
+        }
+
+        long millisSinceTerminationRequested() {
+            long at = terminateRequestedAtNanos;
+            return at == 0L ? 0L : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at);
+        }
+
+        /**
+         * Stop this job's process and everything it spawned: TERM first, then KILL for whatever ignores it.
+         * Only ever called for this job's own process, which is what keeps an old worker from killing the
+         * process of a job that started after it.
+         */
+        void terminate() {
+            if (terminateRequestedAtNanos == 0L) {
+                terminateRequestedAtNanos = System.nanoTime();
+            }
+            Process spawned = process.get();
+            if (spawned == null) {
+                return;
+            }
+            List<ProcessHandle> snapshot = snapshotTree(spawned);
+            tree.set(snapshot);
+            signalTree(spawned, snapshot, false);
+            if (!awaitTree(spawned, snapshot, TERM_GRACE_SECONDS)) {
+                signalTree(spawned, snapshot, true);
+                awaitTree(spawned, snapshot, TERM_GRACE_SECONDS);
+            }
+            // Close the pipes too. A reader blocked on rsync's output only sees end of file once every
+            // writer has gone, and a process that left the tree (a double fork, a setsid) is not reachable
+            // by the signals above. Closing the stream here is what keeps a stopped job's reader from
+            // waiting forever for output that will never come.
+            closeQuietly(spawned.getInputStream());
+            closeQuietly(spawned.getErrorStream());
+        }
+
+        private static void closeQuietly(java.io.Closeable closeable) {
+            try {
+                closeable.close();
+            } catch (IOException | RuntimeException e) {
+                // Nothing to do: the reader is being stopped, not served.
+            }
+        }
+    }
 
     public FileSyncEngine() {
         watchdog.scheduleAtFixedRate(this::watchdogLoop,
@@ -378,6 +553,11 @@ public class FileSyncEngine implements AutoCloseable {
 
     public JobStatus status() {
         return status.get();
+    }
+
+    /** How many results arrived from a job the engine had already let go. Never zero in a healthy run. */
+    public int lateResultsDropped() {
+        return lateResultsDropped.get();
     }
 
     public boolean isRunning() {
@@ -438,24 +618,27 @@ public class FileSyncEngine implements AutoCloseable {
         if (closed || !jobRunning.compareAndSet(false, true)) {
             return false;
         }
-        beginJob(request, progressListener);
+        final JobControl control = beginJob(request, progressListener);
         try {
-            jobWorker.submit(() -> {
+            Thread worker = new Thread(() -> {
                 JobResult result;
                 try {
-                    result = runGuarded(request, progressListener);
+                    result = runGuarded(request, control, progressListener);
                 } catch (Throwable t) {
                     // An Error that escaped the guard (usually an OutOfMemoryError while building its own
                     // message) must still release the engine: a job thread that dies quietly would leave
                     // it reporting RUNNING forever with no way to start another job.
                     result = failure("Job aborted: " + t, List.of(String.valueOf(t)), List.of(), 0);
                 }
-                finishJob(result, progressListener);
-            });
+                finishJob(result, control, progressListener);
+            }, "sync-job-" + control.generation());
+            worker.setDaemon(true);
+            control.worker.set(worker);
+            worker.start();
             return true;
         } catch (RuntimeException e) {
-            jobRunning.set(false);
-            status.set(JobStatus.FAILED);
+            finishJob(failure("Job could not be started: " + e, List.of(), List.of(), 0), control,
+                    progressListener);
             throw e;
         }
     }
@@ -469,8 +652,8 @@ public class FileSyncEngine implements AutoCloseable {
         if (!jobRunning.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is busy: a job is already running");
         }
-        beginJob(request, listener);
-        return finishJob(runGuarded(request, listener), listener);
+        final JobControl control = beginJob(request, listener);
+        return finishJob(runGuarded(request, control, listener), control, listener);
     }
 
     /** A caller that does not want progress callbacks gets silence, not a job that fails on a null. */
@@ -496,56 +679,99 @@ public class FileSyncEngine implements AutoCloseable {
      * Returns true when a job was actually running.
      */
     public boolean cancel() {
-        if (!isRunning()) {
+        JobControl control = currentControl.get();
+        if (control == null) {
             return false;
         }
-        cancelRequested.set(true);
-        markActivity("cancel requested");
-        terminateRsync();
+        control.requestCancel(AbortCause.USER_CANCELLED);
+        markActivity(control, "cancel requested");
+        control.terminate();
         return true;
     }
 
     @Override
     public void close() {
+        closeOnce();
+    }
+
+    /**
+     * Shut the engine down exactly once, however many callers ask.
+     *
+     * <p>The CLI closes the engine in a finally block and also has a JVM shutdown hook; the GUI closes it when
+     * the window closes. Whoever arrives first does the work and the rest return at once. Two cleanup passes
+     * waiting on the same process tree is how a program hangs on exit instead of exiting, so this is bounded:
+     * the tree is terminated, the workers are interrupted, and the wait for the job thread is capped. A job
+     * thread that ignores all of that is left behind - it cannot publish into a later job, because its
+     * controller is no longer the current one.
+     */
+    public void closeOnce() {
+        if (!closeStarted.compareAndSet(false, true)) {
+            return;
+        }
         closed = true;
-        cancel();
+        JobControl control = currentControl.get();
+        if (control != null) {
+            control.requestCancel(AbortCause.ENGINE_CLOSED);
+            control.terminate();
+        }
         watchdog.shutdownNow();
-        jobWorker.shutdownNow();
-        try {
-            jobWorker.awaitTermination(5, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // Give the job's own thread a bounded moment to publish what it knows while its process is dying. If
+        // it does not, the watchdog's terminal guard has already reported the job as stopped, and this thread
+        // is a daemon: waiting longer for it would mean a program that will not exit.
+        Thread worker = control == null ? null : control.worker.get();
+        if (worker != null && worker != Thread.currentThread()) {
+            try {
+                worker.join(1_000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
-    private void beginJob(JobRequest request, ProgressListener listener) {
+    private JobControl beginJob(JobRequest request, ProgressListener listener) {
+        long timeout = jobTimeoutMillis;
+        JobControl control = new JobControl(jobGeneration.incrementAndGet(),
+                timeout > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout) : 0L, listener);
+        currentControl.set(control);
         status.set(JobStatus.RUNNING);
-        cancelRequested.set(false);
-        timeoutTriggered.set(false);
         startedAt.set(System.nanoTime());
-        deadline.set(jobTimeoutMillis > 0
-                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(jobTimeoutMillis) : 0L);
-        markActivity("starting: " + request.jobType());
+        markActivity(control, "starting: " + request.jobType());
+        return control;
     }
 
-    private JobResult finishJob(JobResult result, ProgressListener listener) {
-        String reserved = reservedDestination.getAndSet(null);
+    /** True while {@code control} is still the job the engine is answering for. */
+    private boolean isCurrent(JobControl control) {
+        return currentControl.get() == control;
+    }
+
+    /**
+     * Publish a job's result, unless the engine has already let that job go.
+     *
+     * <p>The engine is marked idle, and the destination reservation released, before the listener is called:
+     * a caller whose completion callback blocks must not be able to leave this engine reporting RUNNING. A
+     * result from a job that is no longer current is counted and dropped - it does not rewrite the status, the
+     * result or the reservation of the job that replaced it.
+     */
+    private JobResult finishJob(JobResult result, JobControl control, ProgressListener listener) {
+        if (!currentControl.compareAndSet(control, null)) {
+            lateResultsDropped.incrementAndGet();
+            return result;
+        }
+        String reserved = control.reservation.getAndSet(null);
         if (reserved != null) {
             DESTINATIONS_IN_USE.remove(reserved);
         }
+        control.phase = "idle";
+        jobRunning.set(false);
         lastResult = result;
         status.set(result.status());
-        deadline.set(0L);
-        liveProcess.set(null);
-        jobPhase = "idle";
-        jobRunning.set(false);
         listener.onCompletion(result);
         return result;
     }
 
-    private JobResult runGuarded(JobRequest request, ProgressListener listener) {
+    private JobResult runGuarded(JobRequest request, JobControl control, ProgressListener listener) {
         try {
-            return doExecute(request, listener);
+            return doExecute(request, control, listener);
         } catch (OutOfMemoryError e) {
             // A selection too large for this JVM is a job failure with a fixable cause, not a crash. By
             // the time it gets here doExecute's own lists are unreachable, so there is heap left to
@@ -557,8 +783,9 @@ public class FileSyncEngine implements AutoCloseable {
         } catch (Exception e) {
             return failure("Job aborted: " + e.getMessage(), List.of(String.valueOf(e)), List.of(), 0);
         } finally {
-            liveProcess.set(null);
-            jobPhase = "idle";
+            if (isCurrent(control)) {
+                control.phase = "idle";
+            }
         }
     }
 
@@ -855,7 +1082,7 @@ public class FileSyncEngine implements AutoCloseable {
 
     // ---------------------------------------------------------------- job body
 
-    private JobResult doExecute(JobRequest request, ProgressListener listener)
+    private JobResult doExecute(JobRequest request, JobControl control, ProgressListener listener)
             throws IOException, NoSuchAlgorithmException, InterruptedException {
 
         Path sourceDir = request.sourceDir().toAbsolutePath();
@@ -877,7 +1104,7 @@ public class FileSyncEngine implements AutoCloseable {
                     + " one directory produce numbers neither of them can vouch for.",
                     List.of("destination busy: " + destinationKey), List.of(), 0);
         }
-        reservedDestination.set(destinationKey);
+        control.reservation.set(destinationKey);
 
         Selection src = normalize(request.sourceSelection());
         Selection dst = normalize(request.destinationSelection());
@@ -890,7 +1117,7 @@ public class FileSyncEngine implements AutoCloseable {
                     List.of(), List.of(), 0);
         }
 
-        markActivity("scanning " + sourceDir);
+        markActivity(control, "scanning " + sourceDir);
         DirectoryScanner.ScanResult scan = DirectoryScanner.scanFiles(sourceDir, options);
         Set<String> sourceRels = new HashSet<>();
         for (FileEntry entry : scan.files()) {
@@ -915,7 +1142,7 @@ public class FileSyncEngine implements AutoCloseable {
         // its entry list was tens of megabytes held for the whole job for information one checkbox asks
         // for. With the checkbox off the scan does not happen at all.
         DestinationSides destination = !copies && request.detectExtraFiles()
-                ? scanDestinationSides(destDir, options, sourceRels, dst)
+                ? scanDestinationSides(control, destDir, options, sourceRels, dst)
                 : new DestinationSides(List.of(), List.of());
         List<FileEntry> extras = destination.extras();
 
@@ -1013,6 +1240,7 @@ public class FileSyncEngine implements AutoCloseable {
 
         int rsyncExitCode = 0;
         ProgressReporter progress = new ProgressReporter(workTotal, listener);
+        control.progress.set(progress);
         List<FileOutcome> outcomes = new ArrayList<>();
         Map<String, String> sourceHashes = Map.of();
         boolean dryRun = request.dryRun();
@@ -1034,16 +1262,16 @@ public class FileSyncEngine implements AutoCloseable {
             // written a single byte, and calling that "copying" is exactly how a job looks stalled on the
             // first file for an hour with an empty destination folder.
             listener.onPhase("hashing source");
-            jobPhase = "hash";
+            control.phase = "hash";
             progress.update(0, "Hashing " + workSet.size()
                     + " source file(s) - nothing is written to the destination during this part...");
             // Hashed once, before the copy: these same digests are reused for the comparison below.
-            sourceHashes = hashFiles(workSet, "source", warnings);
+            sourceHashes = hashFiles(control, workSet, "source", warnings);
         }
 
         if (copies) {
             listener.onPhase(dryRun ? "dry run" : "copying");
-            jobPhase = "copy";
+            control.phase = "copy";
             if (verifies) {
                 progress.update(0, "Transferring " + workSet.size() + " file(s)...");
             } else {
@@ -1060,7 +1288,7 @@ public class FileSyncEngine implements AutoCloseable {
                 // held beforehand. The snapshot loop is cancellable because on a slow mount it can be the
                 // longest thing the job does before rsync starts.
                 ledger = new TransferLedger(sourceDir, destDir, workSet, warnings,
-                        () -> cancelRequested.get() || deadlineExceeded());
+                        () -> control.abortRequested());
             }
 
             Path filesFrom = writeFilesFrom(workSet, warnings);
@@ -1071,37 +1299,39 @@ public class FileSyncEngine implements AutoCloseable {
             try {
                 // Asked to stop, and rsync has not started yet: starting it now would put a process on the
                 // source disk that nothing in this program is watching any more.
-                if (cancelRequested.get()) {
-                    return abortedBeforeTransfer("Job cancelled before rsync started: no file was transferred.",
-                            outcomes, errors, warnings, verifies);
+                if (control.cancelRequested()) {
+                    return abortedBeforeTransfer("Job " + abortWords(control.cause())
+                            + " before rsync started: no file was transferred.",
+                            outcomes, errors, warnings, verifies, control.cause());
                 }
-                if (timeoutWasTriggered()) {
-                    return abortedBeforeTransfer("Job aborted: it exceeded the " + jobTimeoutMillis
-                            + " ms timeout before rsync started.", outcomes, errors, warnings, verifies);
+                if (control.timedOut()) {
+                    return abortedBeforeTransfer("Job stopped on timeout: it passed the "
+                            + humanDuration(jobTimeoutMillis) + " limit before rsync had started.",
+                            outcomes, errors, warnings, verifies, AbortCause.TIMED_OUT);
                 }
 
                 Process process = new ProcessBuilder(
                         buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
                         .redirectErrorStream(true)
                         .start();
-                liveProcess.set(process);
-                spawnedTree.set(snapshotTree(process));
+                control.spawn(process);
                 // A cancellation that landed between the check above and the spawn still has to reach this
                 // process, because the person who pressed Cancel has already been told the job stopped.
-                if (cancelRequested.get() || deadlineExceeded()) {
-                    terminateRsync();
+                if (control.abortRequested()) {
+                    control.terminate();
                 }
 
-                int copied = pumpRsyncOutput(process, sourceDir, progress, errors, warnings, listener, dryRun,
+                int copied = pumpRsyncOutput(control, process, sourceDir, progress, errors, warnings, listener,
+                        dryRun,
                         announcedNames);
                 rsyncExitCode = process.waitFor();
-                sweepRsyncTree(process);
-                markActivity("rsync exit " + rsyncExitCode);
+                sweepRsyncTree(control, process);
+                markActivity(control, "rsync exit " + rsyncExitCode);
 
                 // What happened to each announced file, decided before any early return below, because a
                 // job that is about to be reported as cancelled or failed still owes the user a list of
                 // the files it did and did not finish.
-                boolean cleanCopy = !timeoutWasTriggered() && !cancelRequested.get()
+                boolean cleanCopy = !control.timedOut() && !control.cancelRequested()
                         && isSuccessfulExit(rsyncExitCode);
                 transfers = transferFacts(ledger, announcedNames, cleanCopy, dryRun);
                 if (!cleanCopy) {
@@ -1115,12 +1345,12 @@ public class FileSyncEngine implements AutoCloseable {
                     }
                 }
 
-                if (timeoutWasTriggered()) {
-                    return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun,
+                if (control.timedOut()) {
+                    return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun,
                             verifies);
                 }
-                if (cancelRequested.get()) {
-                    return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
+                if (control.cancelRequested()) {
+                    return cancelledDuringCopy(control, progress, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
@@ -1149,11 +1379,11 @@ public class FileSyncEngine implements AutoCloseable {
                         + " reported " + progress.copied() + ". Raise the results limit (--max-results) if"
                         + " the export must name every file.");
             }
-            if (timeoutWasTriggered()) {
-                return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+            if (control.timedOut()) {
+                return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
             }
-            if (cancelRequested.get()) {
-                return cancelledDuringCopy(progress, outcomes, rsyncExitCode, errors, warnings,
+            if (control.cancelRequested()) {
+                return cancelledDuringCopy(control, progress, outcomes, rsyncExitCode, errors, warnings,
                         destinationTargets, dryRun, verifies);
             }
             progress.finish(dryRun ? "Dry run complete" : "Copy complete");
@@ -1163,19 +1393,19 @@ public class FileSyncEngine implements AutoCloseable {
         }
 
         listener.onPhase("verifying");
-        jobPhase = "verify";
+        control.phase = "verify";
         progress.verifyStart(copies);
 
         if (!copies) {
             sourceHashes = Map.of();
         }
-        verifyEntries(workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
+        verifyEntries(control, workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
                 warnings, !copies, transfers);
-        if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+        if (control.timedOut()) {
+            return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
-        if (cancelRequested.get()) {
-            return cancelledDuringVerify(progress, outcomes, errors, warnings);
+        if (control.cancelRequested()) {
+            return cancelledDuringVerify(control, progress, outcomes, errors, warnings);
         }
 
         if (outcomes.size() >= resultLimit) {
@@ -1183,11 +1413,11 @@ public class FileSyncEngine implements AutoCloseable {
                     + (dryRun ? "" : "Raise it (CLI: --max-results N) if the export must list every file."));
         }
 
-        if (timeoutWasTriggered()) {
-            return timeoutResult(progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
+        if (control.timedOut()) {
+            return timeoutResult(control, progress, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
-        if (cancelRequested.get()) {
-            return cancelledDuringVerify(progress, outcomes, errors, warnings);
+        if (control.cancelRequested()) {
+            return cancelledDuringVerify(control, progress, outcomes, errors, warnings);
         }
 
         progress.finish("Verification complete");
@@ -1332,8 +1562,9 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
-    private JobResult cancelledDuringCopy(ProgressReporter progress, List<FileOutcome> outcomes,
-                                          int exitCode, List<String> errors, List<String> warnings,
+    private JobResult cancelledDuringCopy(JobControl control, ProgressReporter progress,
+                                          List<FileOutcome> outcomes, int exitCode, List<String> errors,
+                                          List<String> warnings,
                                           List<Path> destinationTargets, boolean dryRun, boolean verifies) {
         int announced = progress.copied();
         int completed = completedTransfers(progress, announced, dryRun);
@@ -1341,14 +1572,15 @@ public class FileSyncEngine implements AutoCloseable {
                 ? progress.processed() + " file(s) were verified (matched: " + progress.matched()
                     + ", mismatched: " + progress.mismatched() + ", missing: " + progress.missing() + ")"
                 : "verification was off, so nothing was compared";
-        String message = "Job cancelled by the user: " + transfersPhrase(progress, announced, completed, dryRun)
+        String message = "Job " + abortWords(control.cause()) + " while copying: "
+                + transfersPhrase(progress, announced, completed, dryRun)
                 + ", and " + checked + ". rsync exit code: " + exitCode + ".";
         List<String> leftovers = interruptedTempFiles(destinationTargets);
         List<String> extended = new ArrayList<>(warnings);
         extended.add(leftoverWarning(leftovers));
         return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
                 progress.mismatched(), progress.missing(), progress.extra(), completed, exitCode,
-                outcomes, errors, extended);
+                outcomes, errors, extended, control.cause());
     }
 
     /**
@@ -1386,24 +1618,29 @@ public class FileSyncEngine implements AutoCloseable {
                 + " file(s) for copy; it reported no progress, so how many finished is unknown";
     }
 
-    private JobResult cancelledDuringVerify(ProgressReporter progress, List<FileOutcome> outcomes,
-                                            List<String> errors, List<String> warnings) {
-        String message = "Job cancelled during verification after " + progress.processed()
-                + " of " + progress.workTotal() + " file(s) were checked.";
+    private JobResult cancelledDuringVerify(JobControl control, ProgressReporter progress,
+                                            List<FileOutcome> outcomes, List<String> errors,
+                                            List<String> warnings) {
+        String message = "Job " + abortWords(control.cause()) + " during verification after "
+                + progress.processed() + " of " + progress.workTotal() + " file(s) were checked.";
         return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
                 progress.mismatched(), progress.missing(), progress.extra(), progress.copied(), 0,
-                outcomes, errors, warnings);
+                outcomes, errors, warnings, control.cause());
     }
 
-    private JobResult timeoutResult(ProgressReporter progress, List<FileOutcome> outcomes,
+    private JobResult timeoutResult(JobControl control, ProgressReporter progress, List<FileOutcome> outcomes,
                                     List<String> errors, List<String> warnings, List<Path> destinationTargets,
                                     boolean dryRun, boolean verifies) {
         int announced = progress.copied();
         int completed = completedTransfers(progress, announced, dryRun);
-        String message = "Job aborted: it exceeded the " + jobTimeoutMillis + " ms timeout. "
+        // A timeout is a setting that was too short, not a fault in anybody's files, and the message says so:
+        // it is the difference between reading "the copies are wrong" and "raise the limit".
+        String message = "Job stopped on timeout: it passed the " + humanDuration(jobTimeoutMillis)
+                + " limit this job was given, while " + control.phase + ". "
                 + transfersPhrase(progress, announced, completed, dryRun) + ", and "
                 + (verifies ? progress.processed() + " file(s) were verified."
-                    : "verification was off, so nothing was compared.");
+                    : "verification was off, so nothing was compared.")
+                + " The files themselves were not reported as different by this stop.";
         List<String> extended = new ArrayList<>(warnings);
         extended.add("Increase or clear the job timeout if this job is expected to take longer.");
         if (!destinationTargets.isEmpty()) {
@@ -1411,7 +1648,7 @@ public class FileSyncEngine implements AutoCloseable {
         }
         return new JobResult(JobStatus.FAILED, message, progress.processed(), progress.matched(),
                 progress.mismatched(), progress.missing(), progress.extra(), completed, 0,
-                outcomes, errors, extended);
+                outcomes, errors, extended, AbortCause.TIMED_OUT);
     }
 
     /**
@@ -1486,9 +1723,9 @@ public class FileSyncEngine implements AutoCloseable {
     private record DestinationSides(List<FileEntry> extras, List<String> warnings) {
     }
 
-    private DestinationSides scanDestinationSides(Path destDir, ScanOptions options,
+    private DestinationSides scanDestinationSides(JobControl control, Path destDir, ScanOptions options,
                                                  Set<String> sourceRels, Selection dst) {
-        markActivity("scanning " + destDir + " for destination-only files");
+        markActivity(control, "scanning " + destDir + " for destination-only files");
         DirectoryScanner.ScanResult destScan = DirectoryScanner.scanFiles(destDir, options);
         List<FileEntry> extras = new ArrayList<>();
         for (FileEntry entry : destScan.files()) {
@@ -1516,7 +1753,7 @@ public class FileSyncEngine implements AutoCloseable {
      * are consumed in work-set order, so the results list and any export stay deterministic even though
      * the hashing runs in parallel.
      */
-    private void verifyEntries(List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
+    private void verifyEntries(JobControl control, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
                                Map<String, String> knownSourceHashes, ProgressReporter progress,
                                List<FileOutcome> outcomes, ProgressListener listener,
                                List<String> warnings, boolean verifyOnly,
@@ -1538,19 +1775,24 @@ public class FileSyncEngine implements AutoCloseable {
         Set<String> sourceMoved = java.util.concurrent.ConcurrentHashMap.newKeySet();
         try {
             for (int index = 0; index < total; index++) {
-                if (abortRequested()) {
+                if (control.abortRequested()) {
                     break;
                 }
                 final int i = index;
-                futures.add(pool.submit(() -> verdict(i, workSet, extras, destDir, knownSourceHashes,
+                futures.add(pool.submit(() -> verdict(control, i, workSet, extras, destDir, knownSourceHashes,
                         readProblems, unfollowedLinks, sourceMoved)));
             }
         } finally {
             pool.shutdown();
+            if (control.abortRequested()) {
+                // Queuing hashes for a job that is already stopping wastes the read of every remaining
+                // file; the tasks that had not started yet are dropped.
+                pool.shutdownNow();
+            }
         }
 
         for (Future<Verdict> future : futures) {
-            if (abortRequested()) {
+            if (control.abortRequested()) {
                 break;
             }
             Verdict verdict;
@@ -1570,7 +1812,7 @@ public class FileSyncEngine implements AutoCloseable {
             if (verdict == null) {
                 continue;
             }
-            markActivity("verified " + verdict.relPath());
+            markActivity(control, "verified " + verdict.relPath());
             switch (verdict.kind()) {
                 case "OK" -> progress.countMatched();
                 case "MISSING" -> progress.countMissing();
@@ -1605,11 +1847,12 @@ public class FileSyncEngine implements AutoCloseable {
     private record Verdict(String kind, String relPath, String sourceHash, String destHash) {
     }
 
-    private Verdict verdict(int index, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
+    private Verdict verdict(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
+                            Path destDir,
                             Map<String, String> knownSourceHashes, Set<String> readProblems,
                             Set<String> unfollowedLinks, Set<String> sourceMoved)
             throws NoSuchAlgorithmException {
-        if (abortRequested()) {
+        if (control.abortRequested()) {
             return null;
         }
         boolean destinationOnly = index >= workSet.size();
@@ -1702,7 +1945,8 @@ public class FileSyncEngine implements AutoCloseable {
      * recorded in {@code warnings}; absence is inferred by the caller from a missing hash and a missing
      * file. Used for the source digests Copy & Verify needs before rsync runs.
      */
-    private Map<String, String> hashFiles(List<FileEntry> entries, String side, List<String> warnings)
+    private Map<String, String> hashFiles(JobControl control, List<FileEntry> entries, String side,
+                                         List<String> warnings)
             throws NoSuchAlgorithmException {
         if (entries.isEmpty()) {
             return Map.of();
@@ -1716,12 +1960,12 @@ public class FileSyncEngine implements AutoCloseable {
         Map<String, Future<String>> futures = new LinkedHashMap<>();
         try {
             for (FileEntry entry : entries) {
-                if (abortRequested()) {
+                if (control.abortRequested()) {
                     break;
                 }
                 Path path = entry.absolutePath();
                 futures.put(entry.relPath(), pool.submit(() -> {
-                    if (abortRequested()) {
+                    if (control.abortRequested()) {
                         return null;
                     }
                     return FileHasher.computeHash(path);
@@ -1843,7 +2087,8 @@ public class FileSyncEngine implements AutoCloseable {
      * job with verification off: those names are that job's only record of what it wrote, and they become
      * its result rows.
      */
-    private int pumpRsyncOutput(Process process, Path sourceDir, ProgressReporter progress, List<String> errors,
+    private int pumpRsyncOutput(JobControl control, Process process, Path sourceDir, ProgressReporter progress,
+                                List<String> errors,
                                 List<String> warnings, ProgressListener listener, boolean dryRun,
                                 List<String> copiedNames)
             throws IOException {
@@ -1851,7 +2096,7 @@ public class FileSyncEngine implements AutoCloseable {
                 new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (abortRequested()) {
+                if (control.abortRequested()) {
                     // The process is being killed; stop reading and stop counting announcements.
                     break;
                 }
@@ -1871,7 +2116,7 @@ public class FileSyncEngine implements AutoCloseable {
                                 Integer.parseInt(transfer.group(2)),
                                 transfer.group(3).replaceAll("\\s+", " "), transfer.group(4));
                     }
-                    markActivity(line.trim());
+                    markActivity(control, line.trim());
                     continue;
                 }
                 int percent = rsyncTransferPercent(line);
@@ -1881,7 +2126,7 @@ public class FileSyncEngine implements AutoCloseable {
                     if (!dryRun) {
                         progress.transferPercentOnly(percent);
                     }
-                    markActivity(line.trim());
+                    markActivity(control, line.trim());
                     continue;
                 }
                 switch (classifyLine(line)) {
@@ -1898,7 +2143,7 @@ public class FileSyncEngine implements AutoCloseable {
                                 copiedNames.add(rel);
                             }
                         }
-                        markActivity(line.trim());
+                        markActivity(control, line.trim());
                     }
                     case DIRECTORY -> {
                         // Directory creation is implied by --files-from; nothing to count.
@@ -1906,11 +2151,11 @@ public class FileSyncEngine implements AutoCloseable {
                     case ERROR -> {
                         String message = line.trim();
                         errors.add(message);
-                        markActivity(message);
+                        markActivity(control, message);
                     }
                     case WARNING -> {
                         warnings.add(line.trim());
-                        markActivity(line.trim());
+                        markActivity(control, line.trim());
                     }
                     case IGNORED -> {
                         // no action
@@ -1918,7 +2163,7 @@ public class FileSyncEngine implements AutoCloseable {
                 }
             }
         } catch (IOException e) {
-            if (!cancelRequested.get() && !deadlineExceeded()) {
+            if (!control.abortRequested()) {
                 throw e;
             }
             // Cancel/timeout killed the process: a closed pipe is expected, not a job failure.
@@ -2207,12 +2452,55 @@ public class FileSyncEngine implements AutoCloseable {
     // ---------------------------------------------------------------- watchdog
 
     private void watchdogTick() {
-        if (!isRunning()) {
+        JobControl control = currentControl.get();
+        if (control == null) {
             return;
         }
-        if (deadlineExceeded()) {
-            terminateRsync();
+        // The deadline is enforced here as well as in the job's own loops, because a job can be blocked in a
+        // read, a hash or a wait for a process and never reach one of those checkpoints.
+        if (control.deadlineExceeded()) {
+            control.requestCancel(AbortCause.TIMED_OUT);
+            if (!control.terminationRequested()) {
+                control.terminate();
+            }
         }
+        terminalGuard(control);
+    }
+
+    /**
+     * A job thread stuck inside a read, a hash or somebody else's callback cannot be made to return, and the
+     * engine must not report RUNNING indefinitely because of it. Once this job's process tree had been told
+     * to die and the grace period has passed, the engine publishes the job's own counters as a stopped job and
+     * lets go of it. The result that thread publishes later is dropped, so it cannot overwrite this one -
+     * which is only safe because each job owns its controller and its publication gate.
+     *
+     * <p>The destination reservation is released here on purpose: the only thing that wrote to the destination
+     * was rsync, and that process tree has been killed by the time this runs. What may still be running is
+     * Java code reading files or calling back, which writes nothing.
+     */
+    private void terminalGuard(JobControl control) {
+        if (!control.terminationRequested() || control.millisSinceTerminationRequested() < TERMINAL_GRACE_MILLIS) {
+            return;
+        }
+        ProgressReporter progress = control.progress.get();
+        if (progress == null) {
+            return;
+        }
+        // Read from the published snapshot, not from the reporter's own fields: they belong to a thread that
+        // is stuck somewhere, and reading six fields one at a time can pick up a half-finished update.
+        ProgressReporter.Counters counters = progress.snapshot();
+        AbortCause why = control.cause() == AbortCause.NONE ? AbortCause.USER_CANCELLED : control.cause();
+        long seconds = TERMINAL_GRACE_MILLIS / 1000L;
+        String message = "Job stopped (" + abortWords(why) + ") and its own thread had not finished within "
+                + seconds + " s of the transfer being killed. The figures below are as far as that thread had"
+                + " got; the process it was running is gone, so nothing more is being written.";
+        JobResult forced = new JobResult(JobStatus.FAILED, message, counters.processed(), counters.matched(),
+                counters.mismatched(), counters.missing(), counters.extra(), counters.copied(), 0,
+                List.of(), List.of(),
+                List.of("the job's own thread was still finishing when this was reported; per-file results"
+                        + " from it are not included"),
+                why);
+        finishJob(forced, control, control.listener());
     }
 
     /**
@@ -2223,73 +2511,21 @@ public class FileSyncEngine implements AutoCloseable {
         try {
             watchdogTick();
         } catch (Throwable t) {
-            markActivity("watchdog skipped: " + t.getClass().getSimpleName());
+            lastActivityAt.set(System.currentTimeMillis());
+            lastActivity.set("watchdog skipped: " + t.getClass().getSimpleName());
         }
     }
 
-    /**
-     * True when the deadline, not the user, ended the job. Both aborts set the cancel flag, so without
-     * this the two reasons would be indistinguishable in the result.
-     */
-    private boolean timeoutWasTriggered() {
-        return timeoutTriggered.get();
+    /** Mark activity only for the job that is still current, so an old worker cannot rewrite the status line. */
+    private void markActivity(JobControl control, String description) {
+        if (isCurrent(control)) {
+            markActivity(description);
+        }
     }
 
     private void markActivity(String description) {
         lastActivityAt.set(System.currentTimeMillis());
         lastActivity.set(description == null ? "" : description);
-    }
-
-    private boolean deadlineExceeded() {
-        long deadlineNanos = deadline.get();
-        if (deadlineNanos == 0L || System.nanoTime() <= deadlineNanos) {
-            return false;
-        }
-        // Record the timeout here rather than waiting for the watchdog's next tick: a phase that ran
-        // past the deadline must not get to report the job as complete, nor report files it never
-        // hashed as missing.
-        if (timeoutTriggered.compareAndSet(false, true)) {
-            markActivity("timeout after " + jobTimeoutMillis + " ms in phase " + jobPhase);
-        }
-        cancelRequested.set(true);
-        return true;
-    }
-
-    /**
-     * Whether a work loop should stop now: the user cancelled, or the deadline passed - in which case a
-     * live rsync is killed instead of left running. Idempotent, so any thread may call it.
-     */
-    private boolean abortRequested() {
-        if (cancelRequested.get()) {
-            return true;
-        }
-        if (deadlineExceeded()) {
-            terminateRsync();
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Kills the live rsync and everything it spawned. Safe to call more than once.
-     *
-     * <p>The whole tree is snapshotted before anyone is signalled: once the parent dies its children are
-     * re-parented to init, and a {@code descendants()} call made after that finds nothing at all. The
-     * signal is SIGTERM first - rsync responds to it by deleting the hidden partial file it was writing,
-     * which is what a cancelled job should leave behind in someone's destination folder, nothing - and
-     * only survivors get SIGKILL.
-     */
-    private void terminateRsync() {
-        Process process = liveProcess.get();
-        if (process == null) {
-            return;
-        }
-        List<ProcessHandle> tree = snapshotTree(process);
-        signalTree(process, tree, false);
-        if (!awaitTree(process, tree, TERM_GRACE_SECONDS)) {
-            signalTree(process, tree, true);
-            awaitTree(process, tree, TERM_GRACE_SECONDS);
-        }
     }
 
     private static List<ProcessHandle> snapshotTree(Process process) {
@@ -2352,14 +2588,14 @@ public class FileSyncEngine implements AutoCloseable {
      * orphaned to init and this program has no way to reach it again, so anything still alive here is
      * killed. This is what a "three rsync processes I never started" report means.
      */
-    private void sweepRsyncTree(Process process) {
-        List<ProcessHandle> tree = new ArrayList<>(spawnedTree.get());
+    private void sweepRsyncTree(JobControl control, Process process) {
+        List<ProcessHandle> tree = new ArrayList<>(control.tree.get());
         for (ProcessHandle handle : snapshotTree(process)) {
             if (!tree.contains(handle)) {
                 tree.add(handle);
             }
         }
-        spawnedTree.set(List.of());
+        control.tree.set(List.of());
         List<ProcessHandle> alive = new ArrayList<>();
         for (ProcessHandle handle : tree) {
             try {
@@ -2373,7 +2609,7 @@ public class FileSyncEngine implements AutoCloseable {
         if (alive.isEmpty()) {
             return;
         }
-        markActivity("killing " + alive.size() + " rsync process(es) that outlived their parent");
+        markActivity(control, "killing " + alive.size() + " rsync process(es) that outlived their parent");
         signalTree(process, alive, false);
         if (!awaitTree(process, alive, 2)) {
             signalTree(process, alive, true);
@@ -2382,9 +2618,9 @@ public class FileSyncEngine implements AutoCloseable {
 
     /** A job that was stopped before rsync was ever run: nothing moved, and it must not claim otherwise. */
     private JobResult abortedBeforeTransfer(String message, List<FileOutcome> outcomes, List<String> errors,
-                                            List<String> warnings, boolean verifies) {
+                                            List<String> warnings, boolean verifies, AbortCause cause) {
         String full = verifies ? message : message + " Verification was off, so nothing was compared.";
-        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, outcomes, errors, warnings);
+        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, outcomes, errors, warnings, cause);
     }
 
     private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode) {
@@ -2396,16 +2632,40 @@ public class FileSyncEngine implements AutoCloseable {
      * Progress bookkeeping against the work-set size, with integer-percent coalescing and a
      * monotonic bar (progress never moves backwards within a job).
      */
+    /** A time limit in words: 900 ms, 45.0 s, 5 min 3 s. */
+    static String humanDuration(long millis) {
+        if (millis < 1_000L) {
+            return millis + " ms";
+        }
+        if (millis < 60_000L) {
+            return String.format("%.1f s", millis / 1000.0);
+        }
+        return (millis / 60_000L) + " min " + ((millis / 1_000L) % 60L) + " s";
+    }
+
+    /**
+     * The reason a job stopped, in the words used in its own message. "cancelled" is kept for both kinds of
+     * cancellation and "timeout" for the limit, so someone searching a log for the reason finds it.
+     */
+    static String abortWords(AbortCause cause) {
+        return switch (cause) {
+            case USER_CANCELLED -> "cancelled by the user";
+            case ENGINE_CLOSED -> "cancelled as the program was closing";
+            case TIMED_OUT -> "stopped on timeout";
+            case NONE -> "ended";
+        };
+    }
+
     private static final class ProgressReporter {
 
         private final int workTotal;
         private final ProgressListener listener;
-        private int processed;
-        private int matched;
-        private int mismatched;
-        private int missing;
-        private int extra;
-        private int copied;
+        int processed;
+        int matched;
+        int mismatched;
+        int missing;
+        int extra;
+        int copied;
         private int rsyncPercent = -1;
         /** The file rsync is writing right now, and how big it is. */
         private String inFlight;
@@ -2419,6 +2679,25 @@ public class FileSyncEngine implements AutoCloseable {
         /** rsync's completed-transfer count; -1 until rsync reports one. */
         private int rsyncTransfers = -1;
         private int lastPercent = -1;
+
+        /**
+         * The counters as they stood at the last checkpoint, published whole. The watchdog reads this to
+         * report a job whose own thread cannot finish reporting it; publishing a record rather than letting a
+         * reader pick up six separate fields is what keeps a half-updated set of figures out of a report.
+         */
+        private record Counters(int processed, int matched, int mismatched, int missing, int extra,
+                                int copied) {
+        }
+
+        private volatile Counters snapshot = new Counters(0, 0, 0, 0, 0, 0);
+
+        Counters snapshot() {
+            return snapshot;
+        }
+
+        private void publish() {
+            snapshot = new Counters(processed, matched, mismatched, missing, extra, copied);
+        }
 
         ProgressReporter(int workTotal, ProgressListener listener) {
             this.workTotal = workTotal;
@@ -2469,26 +2748,31 @@ public class FileSyncEngine implements AutoCloseable {
         /** One item rsync announced: a file, a changed file, a copied link. Counted whether or not the line carried a name. */
         void countCopied() {
             copied++;
+            publish();
         }
 
         void countMatched() {
             processed++;
             matched++;
+            publish();
         }
 
         void countMismatched() {
             processed++;
             mismatched++;
+            publish();
         }
 
         void countMissing() {
             processed++;
             missing++;
+            publish();
         }
 
         void countExtra() {
             processed++;
             extra++;
+            publish();
         }
 
         void update(int percent, String label) {

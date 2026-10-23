@@ -195,7 +195,9 @@ public final class FileVerifierView extends JPanel {
     public void shutdown() {
         livenessTimer.stop();
         savePreferences();
-        engine.close();
+        // closeOnce, not close: the engine may already have been stopped by a shutdown hook, and two
+        // cleanups waiting on one process tree is how a program hangs on exit instead of exiting.
+        engine.closeOnce();
     }
 
     // ------------------------------------------------------------------ layout
@@ -1341,10 +1343,19 @@ public final class FileVerifierView extends JPanel {
             log("=== JOB COMPLETED ===");
             log(result.message());
         } else {
-            progressBar.setString("Failed");
-            statusLabel.setText("Job failed.");
+            // A stopped job is not the same report as a failed one. A user who pressed Cancel, and a job that
+            // ran into a time limit that was too short, both need to be able to read that back out of the
+            // window hours later; "Job failed." on its own invites the wrong conclusion about the files.
+            boolean stopped = result.wasAborted();
+            progressBar.setString(stopped ? "Stopped" : "Failed");
+            statusLabel.setText(switch (result.abortCause()) {
+                case TIMED_OUT -> "Job stopped: it passed the time limit.";
+                case USER_CANCELLED -> "Job cancelled.";
+                case ENGINE_CLOSED -> "Job stopped: the program was closing.";
+                case NONE -> "Job failed.";
+            });
             log("");
-            log("=== JOB FAILED ===");
+            log(stopped ? "=== JOB STOPPED ===" : "=== JOB FAILED ===");
             log("Reason: " + result.message());
             if (result.rsyncExitCode() != 0) {
                 log("rsync exit code: " + result.rsyncExitCode());
