@@ -1117,6 +1117,38 @@ class FileSyncEngineTest {
         }
     }
 
+    /**
+     * The other half of the destination check. A name that is gone from the source <i>and</i> gone from the
+     * destination is not a vanished non-transfer either: the destination used to hold something, so something
+     * happened that this job cannot explain. Only a destination that held nothing and holds nothing supports
+     * the claim.
+     */
+    @Test
+    void aNameGoneFromBothEndsDuringTheJobIsNotCalledAVanishedNonTransfer() throws Exception {
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        TestSupport.write(dest.resolve("gone.txt"), "an older file that was already there\n");
+
+        Path fake = TestSupport.vanishingRsync(tools, "keep.txt", "gone.txt", true);
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("keep.txt", "gone.txt"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message()),
+                    () -> assertEquals(1, result.filesCopied(), result.toString()),
+                    () -> assertEquals(List.of(), result.vanishedInputs(),
+                            "a destination that lost a file is not evidence that nothing arrived: " + result),
+                    () -> assertEquals(1, result.filesUncertain(), result.toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
     @Test
     void progressWithNoCompletedTransferMeansNothingWasCopied() throws Exception {
         TestSupport.write(source.resolve("big.bin"), "payload\n");

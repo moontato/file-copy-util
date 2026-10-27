@@ -225,6 +225,16 @@ final class TestSupport {
      * "some files vanished before they could be transferred".
      */
     static Path vanishingRsync(Path dir, String copiedName, String vanishedName) throws IOException {
+        return vanishingRsync(dir, copiedName, vanishedName, false);
+    }
+
+    /**
+     * The same, with the option to remove the name from the <b>destination</b> as well. That is the case where
+     * the destination used to hold something and now holds nothing, which is not evidence that nothing arrived:
+     * it is an unexplained disappearance, and it belongs in the uncertain column.
+     */
+    static Path vanishingRsync(Path dir, String copiedName, String vanishedName,
+                               boolean alsoDeleteAtDestination) throws IOException {
         Path script = dir.resolve("fake-vanishing-rsync");
         StringBuilder body = new StringBuilder();
         body.append("#!/bin/sh\n");
@@ -235,6 +245,9 @@ final class TestSupport {
         body.append("printf '%s\\n' '     100   0%   1.23MB/s   00:00:00 (xfr#1, to-chk=1/2)'\n");
         body.append("printf '%s\\n' '>f+++++++++|").append(vanishedName).append("'\n");
         body.append("rm -f \"$src/").append(vanishedName).append("\"\n");
+        if (alsoDeleteAtDestination) {
+            body.append("rm -f \"$dst/").append(vanishedName).append("\"\n");
+        }
         body.append("printf 'rsync: [receiver] failed to open \"%s/").append(vanishedName)
                 .append("\": No such file or directory (code 2)\\n' \"$src\"\n");
         body.append("exit 24\n");

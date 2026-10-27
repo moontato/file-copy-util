@@ -611,8 +611,13 @@ The conservative half of the third fix has its own fixture: `aVanishedSourceFile
 StaysUncertain` — a source name that disappears while the destination already holds a file stays in the uncertain
 column with `vanishedInputs` empty, because nothing can be claimed about whether rsync replaced it.
 
-Suite after the corrections: **296 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
-SpotBugs 0; **290 green** pinned to 3.1.3. Mutation coverage and the pinned runs follow in the next commits.
+A mutation run over these fixes found that the conservative half of the destination check was unguarded: dropping
+`previous.exists` from `TransferLedger.showsNothingAt` changed nothing in the suite. `aNameGoneFromBothEndsDuringThe
+JobIsNotCalledAVanishedNonTransfer` closes it — a name gone from the source *and* gone from a destination that used
+to hold something is an unexplained disappearance, not evidence that nothing arrived, so it stays uncertain.
+
+Suite after the corrections: **297 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
+SpotBugs 0; **290 green** pinned to 3.1.3 (measured before the last two fixtures). Mutation coverage and the pinned runs follow in the next commits.
 
 ## Phase 5 checkpoint — awaiting acceptance
 

@@ -253,7 +253,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-296 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+297 tests, headless (no display needed): counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
 copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
