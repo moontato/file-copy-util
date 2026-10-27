@@ -133,22 +133,22 @@ jobs:
             echo "rsync $version built and identified"
           done
 
-      # The safety fixtures - names, an interrupted overwrite, the process tree, collisions - are the
-      # point of the matrix. Running only the version-matrix test would leave them against one unpinned
-      # rsync while the four-version job proves nothing about them, so each version runs them itself.
-      # FCU_RSYNC pins the engine's binary, and the test harness refuses to run at all if the pinned
-      # binary is unusable instead of skipping the rsync tests. FCU_RSYNC_BINARIES is cleared for each of
-      # these runs: an entry that also extended the matrix would be testing other builds again rather than
-      # the one it is pinned to. The all-four run is the separate step below.
-      - name: Run the safety fixtures against each built rsync
+      # The safety fixtures - names, an interrupted overwrite, the process tree, collisions, symlink
+      # verdicts, the counter families - are the point of the matrix, so each version has to face them
+      # itself. This runs the <b>whole</b> suite pinned to each binary rather than a named list: a named
+      # selection goes out of date silently the day a suite is added, and a green four-version job then
+      # proves less than it appears to. FCU_RSYNC pins the engine's binary, and the test harness refuses to
+      # run at all if the pinned binary is unusable instead of skipping the rsync tests. FCU_RSYNC_BINARIES
+      # is cleared for each of these runs: an entry that also extended the matrix would be testing other
+      # builds again rather than the one it is pinned to. The all-four run is the separate step below.
+      - name: Run the whole suite against each built rsync
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/rsync-matrix"
-          fixtures=RsyncVersionMatrixTest,AuditNameFidelityTest,InterruptedOverwriteTest,FileSyncEngineTest,CancellationAndProcessTreeTest,CollisionAndRaceTest,RobustnessTest,VerificationOptionalTest,CliTest
           for version in 3.1.3 3.2.7 3.3.0 3.4.0; do
-            echo "::group::fixtures against rsync $version"
+            echo "::group::whole suite against rsync $version"
             FCU_RSYNC="$work/rsync-$version/rsync" FCU_RSYNC_BINARIES= \
-              mvn -B -ntp test -Dtest="$fixtures" -Dsurefire.failIfNoSpecifiedTests=true
+              mvn -B -ntp clean test
             echo "::endgroup::"
           done
 
