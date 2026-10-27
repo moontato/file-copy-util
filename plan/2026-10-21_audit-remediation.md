@@ -1080,3 +1080,133 @@ fixtures).
    the check-then-`rsync` race across processes stays documented rather than closed.
 5. Nothing here is released: `pom.xml` is 1.4.0, `main` is still `0069285`, no tag or push. 1.5.0 needs your
    separate go-ahead (A10) after the merge gate is green.
+
+---
+
+## Phase 5 corrections, second round — the exit-24 boundary cases (implemented, green)
+
+Revision 19. Phase 4 stays accepted; the symlink and exact-limit corrections from the previous round are accepted;
+Phase 5 remains **not accepted** by you. This round answers the three exit-24 defects you reproduced, plus the
+contradictory headline your probe exposed.
+
+### What you found, and what the code was doing
+
+**1. Exit 24 with no itemize announcement aborted the job.** `transferFacts` returned the immutable `Map.of()` when
+nothing had been announced, and the vanished-input enrichment then called `put` on it. Your symptom reproduced
+exactly: `error: java.lang.UnsupportedOperationException`, `Job aborted: null`, `no-announcement exit=1`, with the
+export losing rsync's exit code, the vanished name and every figure.
+
+**2. A job that continued after exit 24 recorded each file twice.** Making exit 24 non-clean for attribution made
+the "interrupted jobs still owe per-file rows" block fire, and the normal copy/verification path then produced the
+rows again. Fixture output before the fix: four rows for two files — `keep COPIED, gone NOT_COPIED, keep COPIED,
+gone NOT_COPIED` — while the totals counted each once, and a capped list reported `rowsOmitted=3` for a two-file job
+(your `keep UNCERTAIN / gone NOT_COPIED / keep / gone`).
+
+**3. A metadata failure was read as proven absence.** `TransferLedger.showsNothingAt` caught every `IOException` as
+"nothing there", and the source side used `Files.exists`, which cannot tell absence from "could not look". Your
+symlink-loop probe (`Too many levels of symbolic links`, `showsNothingAt=true`) reproduced.
+
+**3b. The headline contradicted the totals.** `completionMessage` used rsync's announcement count for "copied" while
+receiving the disposition tally: `Copy complete: 1 file(s) copied.` above `totals: copied=0 … uncertain=1`.
+
+### What the code says now
+
+- `transferFacts` always returns a collection the job can enrich.
+- Per-file transfer rows are written **only on the paths that stop there** (`timedOut`, `cancelRequested`,
+  non-successful exit). A job that carries on — 24 is a warning, not a stop — produces its rows through the normal
+  path, once, and a capped report counts the rows it actually left out.
+- Existence is a three-way answer, `TransferLedger.Existence`: `PRESENT`, `ABSENT`, `UNKNOWN`. Only
+  `NoSuchFileException` is absence. `heldBefore` remembers an unreadable before-state as `UNKNOWN` (the ledger
+  already separated `NoSuchFileException` from other errors; the boolean simply discarded the difference), and
+  `existsNow` asks the same question afterwards. `showsNothingAt` survives as a convenience that answers `false` for
+  "could not tell", with a comment pointing callers at the three-way form.
+- "Not copied" requires a **measured absence at both ends**. A name whose source could not be read, or whose
+  destination could not be read before or after, is left as `UNCERTAIN` with a warning naming it — never
+  `NOT_COPIED`, and never missing from the report.
+- The headline counts the same disposition tally as `copied=`; rsync's announcement count is printed as
+  `rsync announced N` when they differ; a copy-only job with anything unconfirmed or not transferred opens with
+  `Copy finished with gaps: N file(s) provably copied, U with an unconfirmed transfer, M not transferred (rsync
+  announced A).` A dry run's line counts `wouldCopy`, not announcements.
+
+### Fixtures
+
+Red before the fixes (`mvn -B -Dtest=FileSyncEngineTest,CliTest`): `anInputThatVanishesBeforeRsyncAnnouncesAnything
+StillReachesTheReport` 5 failures including `status=FAILED … errors=[java.lang.UnsupportedOperationException]`;
+`anExit24JobThatContinuesNamesEachFileExactlyOnce` 3 failures including `expected: <2> but was: <4>` rows;
+`anExit24VerifyingJobNamesEachFileOnceAndCountsTheRowsItCropped` `rowsOmitted expected: <1> but was: <3>`;
+`theCopyHeadlineCountsTransfersTheJobCanShowAndLabelsAnnouncementsApart` 3 failures; `anUninspectableDestination
+IsNotTreatedAsProofThatNothingWasCopied` `filesUncertain expected: <1> but was: <0>`; the CLI fixture 6 failures.
+`TransferLedgerTest` was compile-red for the three-way API before it existed.
+
+New: `anInputThatVanishesBeforeRsyncAnnouncesAnythingStillReachesTheReport`,
+`anExit24JobThatContinuesNamesEachFileExactlyOnce`,
+`anExit24VerifyingJobNamesEachFileOnceAndCountsTheRowsItCropped` (capped and uncapped),
+`theCopyHeadlineCountsTransfersTheJobCanShowAndLabelsAnnouncementsApart`,
+`anUninspectableDestinationIsNotTreatedAsProofThatNothingWasCopied`,
+`aDestinationThatBecomesUnreadableDuringTheJobIsNotCalledAnEmptyOne`,
+`aSourceThisProgramCannotReadIsNotCountedAsAVanishedNonTransfer`,
+`aVanishedInputWithNoAnnouncementStillFailsStrictAndReachesTheReport` (plain exit 0, strict exit 5, `# vanished,1`,
+`# rsyncExitCode,24`, JSON `vanishedInputs`), and `TransferLedgerTest` (absent / present / uninspectable before and
+after the snapshot). Two stand-ins: `TestSupport.vanishingRsyncWithoutAnnouncements`,
+`TestSupport.loopingDestinationRsync`/`loopingSourceRsync`.
+
+### Mutation coverage (disposable `git worktree` trees, verified clean before and after)
+
+At `4c81542`:
+
+| Mutation | Caught? | By |
+|---|---|---|
+| T1 empty facts map made immutable again | **yes** (4 fixtures) | the no-announcement engine + CLI fixtures, both unreadable-end fixtures |
+| T2 rows also recorded on every path (old shape) | **yes** (3) | once-only rows fixtures |
+| T3 headline always claims "complete" | **yes** (1) | the headline fixture |
+| T4 any `IOException` answered "absent" | **yes** (3) | both ledger fixtures, source fixture |
+| T5 unreadable source treated as absent | **yes** (1) | the source fixture |
+| T6 unreadable before-state remembered as empty | **yes** (1) | `aDestinationThatCouldNotBeReadBeforeTheCopy…` |
+
+At `def12ab` (T4/T5 re-run, plus two new):
+
+| Mutation | Caught? | By |
+|---|---|---|
+| T4 (re-run) | **yes** (4) | now including `aDestinationThatBecomesUnreadableDuringTheJob…` |
+| T5 (re-run) | **yes** (1) | the source fixture |
+| T7 `now == UNKNOWN` dropped from the second condition | **yes** (1) | `aDestinationThatBecomesUnreadableDuringTheJob…` **alone** — that branch had no fixture before it |
+| T8 `putIfAbsent(UNCERTAIN)` removed from the source branch | **yes** (1) | the source fixture |
+
+T7 is the honest finding of this round: with only the pre-existing fixtures, "the destination could not be read
+*now*" was guarded solely by the before-state being unreadable. `def12ab` exists because of it.
+
+### Validation
+
+- Matrix (`FCU_RSYNC_BINARIES` = 3.1.3 + 3.4.0): `mvn -o clean verify` → **307 tests, 0 failures, 0 errors,
+  1 skipped**, SpotBugs `BugInstance size is 0`, BUILD SUCCESS (`-Werror` clean).
+- Whole suite pinned to **rsync 3.1.3**: **301 green**; pinned to **rsync 3.4.0**: **301 green** (the 6 skipped in
+  the matrix run are the version-matrix fixtures that need more than one binary).
+- The container's Maven local repository was wiped by a reset mid-round; it was re-downloaded, and every number
+  above was measured after that. The mutation runs used the warm cache offline (`-o`).
+
+### Commits and push
+
+`4c81542` (engine + ledger fixes, all fixtures, CHANGELOG/README/DESIGN) and `def12ab` (the mid-job destination
+fixture). `main` is still `0069285`; `pom.xml` is still 1.4.0; no tag, no merge, no release.
+
+The authorised push was attempted from this container and could not be made — there is no GitHub credential here:
+
+```
+$ git -c push.followTags=false push origin \
+    8fde21736bce22b2fcba0354ed0bf0f6b5c40f1a:refs/heads/remediation/audit
+remote: No anonymous write access.
+fatal: Authentication failed for 'https://github.com/moontato/file-copy-util.git/'
+```
+
+Nothing was pushed, and nothing was forced. CI run URLs, checked SHA, per-version build results and
+failures/skips therefore remain **outstanding**, not evidence.
+
+Two things for you to decide when you run it from an authenticated environment:
+
+1. The authorized SHA `8fde217` predates this round's corrections. Pushing it as authorized gives CI evidence for
+   the previous round's fixes and the whole-suite-per-binary matrix step, but not for `4c81542`/`def12ab`.
+   Pushing `def12ab` instead needs a fresh authorization.
+2. Matrix-scope note, restated because it changes what a green CI run would prove: the per-version step in
+   `validate.yml` now runs the **whole suite** pinned to each of 3.1.3, 3.2.7, 3.3.0 and 3.4.0 (it used to name nine
+   suites, which silently left the newer safety suites out). So the only remaining gap for a four-version claim is
+   execution, not scope — 3.2.7 and 3.3.0 have never been built here.
