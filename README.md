@@ -202,7 +202,11 @@ Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0 extra=0
   none were computed. It is not coloured like a file that passed a check, because nothing checked it, and the
   job's own summary and warnings say that no comparison happened:
   `Copy complete: 214 file(s) copied. Verification was turned off, so none of them were compared.`
-  A dry run of the same job lists `WOULD_COPY` instead, since nothing was written
+  A dry run of the same job lists `WOULD_COPY` instead, since nothing was written. Where the destination cannot show
+  that a transfer arrived, the same line does not claim completion:
+  `Copy finished with gaps: 1 file(s) provably copied, 0 with an unconfirmed transfer, 1 not transferred (rsync
+  announced 2).` — the headline's number is the same figure as `copied=` in the totals, and `rsync announced N` is
+  stated as rsync's claim
 
 A **failed** job (cancelled, timed out, or an rsync error) reports the partial counters it reached rather than zeros.
 
@@ -331,8 +335,12 @@ saying why the byte comparison could not run: the same words in a link are not t
 
 When `rsync` exits 24 ("some files vanished before they could be transferred") the job still finishes with a
 warning, as it always has. What it does not do is take that exit code as proof about individual files: a name
-`rsync` announced and did not deliver falls back to the destination evidence, and if the source no longer has it and
-the destination never did, it is reported as not copied and counted in the vanished figure below.
+`rsync` announced and did not deliver falls back to the destination evidence. "Not copied" needs a measured absence
+at both ends — the name is gone from the source, and the destination held nothing there before the copy and holds
+nothing there now — and then it is reported as not copied and counted in the vanished figure below. A stat that
+fails for another reason (an access error, a filesystem error, a name under a symbolic link that points at itself)
+is not an answer to "is this name there?", so such a file is never called not copied: it stays counted as a
+transfer whose result cannot be confirmed, with a warning naming it.
 
 ### What a report says about the job itself
 

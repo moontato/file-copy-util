@@ -47,6 +47,46 @@ final class TransferLedger {
     private final Map<String, Expected> expected;
     private final List<String> unreadableNames = new ArrayList<>();
 
+    /** Whether a stat found the name, found it missing, or could not answer the question at all. */
+    enum Existence { PRESENT, ABSENT, UNKNOWN }
+
+    /**
+     * Ask one question of one path, without following links: is the name there?
+     *
+     * <p>Only {@code NoSuchFileException} is an answer of "absent". An access error, a filesystem error or an
+     * ancestor that cannot be resolved (a symbolic-link loop, say) means the question could not be asked, and
+     * treating that as absence would let a job report a file as not copied on evidence that proves nothing.
+     */
+    static Existence probe(Path path) {
+        try {
+            Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            return Existence.PRESENT;
+        } catch (java.nio.file.NoSuchFileException absent) {
+            return Existence.ABSENT;
+        } catch (IOException couldNotAsk) {
+            return Existence.UNKNOWN;
+        }
+    }
+
+    /** What stood at the destination for this name before the copy began. */
+    Existence heldBefore(String rel) {
+        Before previous = before.get(rel);
+        if (previous == Before.ABSENT) {
+            return Existence.ABSENT;
+        }
+        if (previous != null) {
+            return Existence.PRESENT;
+        }
+        // The snapshot either could not read this name or never covered it: that is not "nothing was there".
+        return Existence.UNKNOWN;
+    }
+
+    /** What stands at the destination for this name now. */
+    Existence existsNow(String rel) {
+        return probe(destDir.resolve(rel));
+    }
+
     /**
      * Records the source intent and the destination state for every name the job may write.
      *
@@ -166,28 +206,15 @@ final class TransferLedger {
     }
 
     /**
-     * What the destination can prove about one file rsync announced.
-     *
-     * @param rel             the file's path relative to the source directory
-     * @param cleanCompletion the copy phase ran to the end with an exit rsync considers clean
-     * @param dryRun          nothing was written at all
-     */
-    /**
      * True when the destination held nothing at this name before the copy and holds nothing there now. That is
      * the pair of facts that lets a vanished input be reported as not transferred rather than as an unconfirmed
      * transfer: nothing arrived, and there was nothing there already for rsync to have replaced.
+     *
+     * <p>{@code false} here means either "something is at that name" or "this could not be established". A
+     * caller that has to tell those apart asks {@link #heldBefore} and {@link #existsNow} directly.
      */
     boolean showsNothingAt(String rel) {
-        Before previous = before.get(rel);
-        if (previous == null || previous.exists) {
-            return false;
-        }
-        try {
-            Files.readAttributes(destDir.resolve(rel), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            return false;
-        } catch (IOException nothingThere) {
-            return true;
-        }
+        return heldBefore(rel) == Existence.ABSENT && existsNow(rel) == Existence.ABSENT;
     }
 
     FileSyncEngine.TransferDisposition disposition(String rel, boolean cleanCompletion, boolean dryRun) {

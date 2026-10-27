@@ -1091,6 +1091,191 @@ class FileSyncEngineTest {
      * program cannot say whether rsync replaced it. It belongs in the uncertain column, and the vanished figure
      * stays empty.
      */
+    /**
+     * The exit-24 case with nothing to go on: no itemize line, only the exit code. The vanished name still has to
+     * reach the report, and the job must not fall over on the way there.
+     */
+    @Test
+    void anInputThatVanishesBeforeRsyncAnnouncesAnythingStillReachesTheReport() throws Exception {
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+
+        Path fake = TestSupport.vanishingRsyncWithoutAnnouncements(tools, "gone.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("gone.txt"), TestSupport.none()), new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(),
+                            "exit 24 stays a completed job: " + result.message()),
+                    () -> assertEquals(List.of("gone.txt"), result.vanishedInputs(), result.toString()),
+                    () -> assertEquals(1, result.rowsListed(), result.toString()),
+                    () -> assertEquals(0, result.rowsOmitted(), result.toString()),
+                    () -> assertEquals(1, result.filesNotTransferred(), result.toString()),
+                    () -> assertEquals(0, result.filesUncertain(), result.toString()),
+                    () -> assertEquals(List.of("gone.txt"),
+                            result.outcomes().stream().map(FileSyncEngine.FileOutcome::relPath)
+                                    .collect(java.util.stream.Collectors.toList()),
+                            result.outcomes().toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * A job that continues after exit 24 produces its rows through the normal path. Recording them early as
+     * well gives every file two rows - which reads as a job that handled twice as much as it did, and breaks
+     * the count of rows a capped report left out.
+     */
+    @Test
+    void anExit24JobThatContinuesNamesEachFileExactlyOnce() throws Exception {
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+
+        Path fake = TestSupport.vanishingRsync(tools, "keep.txt", "gone.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("keep.txt", "gone.txt"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(2, result.outcomes().size(),
+                            "two files handled, two rows: " + result.outcomes()),
+                    () -> assertEquals(2, result.rowsListed(), result.toString()),
+                    () -> assertEquals(0, result.rowsOmitted(), result.toString()),
+                    () -> assertEquals(1, result.filesCopied(), result.toString()),
+                    () -> assertEquals(0, result.filesUncertain(), result.toString()),
+                    () -> assertEquals(1, result.filesNotTransferred(), result.toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** The same for a job that copies and verifies: one row per file, whether capped or not. */
+    @Test
+    void anExit24VerifyingJobNamesEachFileOnceAndCountsTheRowsItCropped() throws Exception {
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+
+        Path fake = TestSupport.vanishingRsync(tools, "keep.txt", "gone.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            engine.setResultLimit(1);
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_AND_VERIFY,
+                    TestSupport.selection("keep.txt", "gone.txt"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(1, result.rowsListed(),
+                            "the limit holds one row: " + result.outcomes()),
+                    () -> assertEquals(1, result.rowsOmitted(),
+                            "and says it left one out, not three: " + result));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * The headline a user reads first has to count the same thing the totals line counts. Announcing a transfer
+     * is not the same as showing one arrived.
+     */
+    @Test
+    void theCopyHeadlineCountsTransfersTheJobCanShowAndLabelsAnnouncementsApart() throws Exception {
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+
+        Path fake = TestSupport.vanishingRsync(tools, "keep.txt", "gone.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("keep.txt", "gone.txt"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertAll(
+                    // The headline's own number is the figure the totals line reports, and rsync's announcement
+                    // count is labelled as rsync's claim rather than being read as this job's.
+                    () -> assertTrue(result.message().contains(
+                            result.filesCopied() + " file(s) provably copied"), result.message()),
+                    () -> assertTrue(result.message().contains("rsync announced 2"), result.message()),
+                    () -> assertFalse(result.message().startsWith("Copy complete"),
+                            "a job that lost a file is not reported as a complete copy: " + result.message()),
+                    () -> assertEquals(1, result.filesCopied(), result.toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * The same rule on the other side. If the source cannot be read, "it is gone" is not known, and a name that
+     * may already have been copied must not be reported as a confirmed non-transfer.
+     */
+    @Test
+    void aSourceThisProgramCannotReadIsNotCountedAsAVanishedNonTransfer() throws Exception {
+        TestSupport.write(source.resolve("sdir/gone.txt"), "gone\n");
+
+        Path fake = TestSupport.loopingSourceRsync(tools, "sdir");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("sdir/gone.txt"), TestSupport.none()), new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(List.of(), result.vanishedInputs(),
+                            "an unreadable source cannot confirm a vanished non-transfer: " + result),
+                    () -> assertEquals(1, result.filesUncertain(),
+                            "the name stays on the books as unknown: " + result),
+                    () -> assertEquals(0, result.filesNotTransferred(), result.toString()),
+                    () -> assertTrue(result.warnings().stream().anyMatch(w -> w.contains("sdir/gone.txt")
+                                    && w.contains("could not be inspected")),
+                            result.warnings().toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * A destination this program cannot inspect is not a destination that holds nothing. A symbolic-link loop
+     * over the name is the case: the stat fails with an error, and an error says the question could not be
+     * asked, not that the answer is "absent".
+     */
+    @Test
+    void anUninspectableDestinationIsNotTreatedAsProofThatNothingWasCopied() throws Exception {
+        TestSupport.write(source.resolve("loop/x.txt"), "x\n");
+        Files.createSymbolicLink(dest.resolve("loop"), Path.of("loop"));
+
+        Path fake = TestSupport.vanishingRsyncWithoutAnnouncements(tools, "loop/x.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("loop/x.txt"), TestSupport.none()), new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(List.of(), result.vanishedInputs(),
+                            "an unreadable destination cannot confirm a vanished non-transfer: " + result),
+                    () -> assertEquals(1, result.filesUncertain(),
+                            "the name stays accounted for, as unknown: " + result),
+                    () -> assertTrue(result.warnings().stream().anyMatch(w -> w.contains("loop/x.txt")
+                                    && (w.contains("could not be inspected")
+                                        || w.contains("cannot be inspected"))),
+                            result.warnings().toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
     @Test
     void aVanishedSourceFileWithSomethingAlreadyAtTheDestinationStaysUncertain() throws Exception {
         TestSupport.write(source.resolve("keep.txt"), "keep\n");

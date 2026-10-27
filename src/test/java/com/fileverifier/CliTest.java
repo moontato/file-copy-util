@@ -536,6 +536,42 @@ class CliTest {
                 () -> assertTrue(strict.out().contains("verification was off"), strict.out()));
     }
 
+    /**
+     * Exit 24 with no itemize line at all: the run has an exit code and nothing else to go on. It must still
+     * report the vanished name, keep rsync's exit code in the export, and not fall over.
+     */
+    @Test
+    void aVanishedInputWithNoAnnouncementStillFailsStrictAndReachesTheReport() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        Path fakeDir = Files.createDirectories(reports.resolve("fake-vanish-silent"));
+        Path fake = TestSupport.vanishingRsyncWithoutAnnouncements(fakeDir, "gone.txt");
+        Path csv = reports.resolve("silent.csv");
+        Path json = reports.resolve("silent.json");
+
+        Output plain = new Output();
+        int plainExit = runWithRsync(plain, fake.toString(), "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--files", "gone.txt", "--no-verify", "--csv", csv.toString(),
+                "--json", json.toString());
+
+        // The stand-in deleted the source name, so the strict run starts from the same place: this fixture is
+        // about a name that disappears during the transfer.
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        Output strict = new Output();
+        int strictExit = runWithRsync(strict, fake.toString(), "--cli", "--quiet", "--strict", "--source",
+                source.toString(), "--dest", dest.toString(), "--files", "gone.txt", "--no-verify");
+
+        String csvText = Files.readString(csv);
+        String jsonText = Files.readString(json);
+        assertAll(
+                () -> assertEquals(Cli.EXIT_OK, plainExit, plain.out() + plain.err()),
+                () -> assertEquals(Cli.EXIT_STRICT, strictExit, strict.out() + strict.err()),
+                () -> assertTrue(csvText.contains("# vanished,1"), csvText),
+                () -> assertTrue(csvText.contains("# rsyncExitCode,24"), csvText),
+                () -> assertTrue(jsonText.contains("\"vanishedInputs\": [\"gone.txt\"]"), jsonText),
+                () -> assertTrue(strict.out().contains("vanished: 1 input file"), strict.out()));
+    }
+
     /** A report that does not name the vanished name is a report that says the job was complete. */
     @Test
     void theReportNamesTheInputThatVanishedDuringTheTransfer() throws Exception {

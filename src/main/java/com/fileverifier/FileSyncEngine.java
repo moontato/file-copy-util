@@ -1673,27 +1673,25 @@ public class FileSyncEngine implements AutoCloseable {
                     applyVanishedInputs(control, workSet, transfers, ledger, destDir, warnings);
                 }
                 tally = TransferTally.of(transfers);
-                if (!cleanCopy) {
-                    // A job that is about to be reported as cancelled, timed out or failed still owes the
-                    // user a per-file answer. Without it the report is a count with no names, and a count
-                    // of "1 copied" over two announced files says nothing about which one.
-                    if (verifies) {
-                        recordPendingTransfers(progress, outcomes, listener, transfers);
-                    } else {
-                        recordTransferRows(progress, outcomes, listener, transfers, warnings);
-                    }
-                }
 
+                // A job that stops here still owes the user a per-file answer: without these rows the report is a
+                // count with no names, and "1 copied" over two announced files says nothing about which one. They
+                // are written only on the paths that end now. A job that carries on - exit 24 is a warning, not a
+                // stop - produces its own rows through the normal path, and writing them here as well gave every
+                // file two rows and inflated the count of rows a capped report had left out.
                 if (control.timedOut()) {
+                    recordInterruptedTransfers(verifies, progress, outcomes, listener, transfers, warnings);
                     return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun,
                             verifies);
                 }
                 if (control.cancelRequested()) {
+                    recordInterruptedTransfers(verifies, progress, outcomes, listener, transfers, warnings);
                     return cancelledDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
                 if (!isSuccessfulExit(rsyncExitCode)) {
                     errors.add("rsync exited with code " + rsyncExitCode);
+                    recordInterruptedTransfers(verifies, progress, outcomes, listener, transfers, warnings);
                     return rsyncFailedDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
                 }
@@ -1841,17 +1839,28 @@ public class FileSyncEngine implements AutoCloseable {
     private static String completionMessage(ProgressReporter progress, TransferTally tally, boolean dryRun,
                                             JobType jobType) {
         if (!jobType.verifies()) {
-            return dryRun
-                ? "Dry run - nothing was written: " + progress.copied()
-                    + " file(s) would have been copied. Verification was turned off, so nothing was compared."
-                : "Copy complete: " + progress.copied() + " file(s) copied. Verification was turned off, so"
-                    + " none of them were compared.";
+            // What rsync said it did stays rsync's claim; this headline states what this job can show.
+            int announced = progress.copied();
+            if (dryRun) {
+                return "Dry run - nothing was written: " + tally.wouldCopy()
+                        + " file(s) would have been copied. Verification was turned off, so nothing was compared.";
+            }
+            String headline = tally.copied() == announced && tally.uncertain() == 0 && tally.notTransferred() == 0
+                    ? "Copy complete: " + tally.copied() + " file(s) copied."
+                    : "Copy finished with gaps: " + tally.copied() + " file(s) provably copied, "
+                            + tally.uncertain() + " with an unconfirmed transfer, " + tally.notTransferred()
+                            + " not transferred (rsync announced " + announced + ").";
+            return headline + " Verification was turned off, so none of them were compared.";
         }
         StringBuilder message = new StringBuilder(dryRun ? "Dry run - nothing was written: " : "Job complete: ")
                 .append(progress.matched()).append(" matched, ")
                 .append(progress.mismatched()).append(" mismatched, ")
                 .append(progress.missing()).append(" missing, ")
-                .append(progress.copied()).append(dryRun ? " would be copied" : " copied");
+                .append(dryRun ? tally.wouldCopy() : tally.copied())
+                .append(dryRun ? " would be copied" : " copied");
+        if (!dryRun && progress.copied() != tally.copied()) {
+            message.append(" (rsync announced ").append(progress.copied()).append(" transfer(s))");
+        }
         if (progress.extra() > 0) {
             message.append(", ").append(progress.extra()).append(" destination-only");
         }
@@ -1914,10 +1923,12 @@ public class FileSyncEngine implements AutoCloseable {
     private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger,
                                                                   List<String> announced, boolean cleanCopy,
                                                                   boolean dryRun) {
-        if (announced.isEmpty()) {
-            return Map.of();
-        }
+        // Always a collection this job can enrich. An exit-24 job may have nothing to attribute and still gain
+        // entries from what the two ends can be seen to hold, and an immutable empty map made that throw.
         Map<String, TransferDisposition> facts = new LinkedHashMap<>();
+        if (announced.isEmpty()) {
+            return facts;
+        }
         for (String rel : announced) {
             // No ledger means no before-state, which means nothing may be claimed - except a dry run, where
             // the honest answer is "would have been copied" and nothing was written.
@@ -1950,6 +1961,21 @@ public class FileSyncEngine implements AutoCloseable {
                     + " whether the bytes arrived - a file that was already there, of the same size, looks"
                     + " exactly the same either way. Re-run the job with verification to check them: "
                     + describeNames(unresolved) + ".");
+        }
+    }
+
+    /**
+     * The per-file transfer answer for a job that stops before the normal reporting path: a verifying job gets
+     * rows saying the transfer question is answered and the check never ran, a copy-only job gets the transfer
+     * rows themselves, which are all such a job knows.
+     */
+    private void recordInterruptedTransfers(boolean verifies, ProgressReporter progress, List<FileOutcome> outcomes,
+                                            ProgressListener listener, Map<String, TransferDisposition> transfers,
+                                            List<String> warnings) {
+        if (verifies) {
+            recordPendingTransfers(progress, outcomes, listener, transfers);
+        } else {
+            recordTransferRows(progress, outcomes, listener, transfers, warnings);
         }
     }
 
@@ -2816,35 +2842,63 @@ public class FileSyncEngine implements AutoCloseable {
                                             Path destDir, List<String> warnings) {
         warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
         List<String> vanished = new ArrayList<>();
+        List<String> couldNotTell = new ArrayList<>();
         for (FileEntry entry : workSet) {
             String rel = entry.relPath();
             if (transfers.get(rel) == TransferDisposition.COPIED) {
                 continue;
             }
-            if (Files.exists(entry.absolutePath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            TransferLedger.Existence sourceNow = TransferLedger.probe(entry.absolutePath());
+            if (sourceNow == TransferLedger.Existence.PRESENT) {
+                continue;                            // still on the source: nothing vanished about it
+            }
+            if (sourceNow == TransferLedger.Existence.UNKNOWN) {
+                // The source itself could not be read. Nothing may be claimed about this name - it may already
+                // have been transferred, it may not - so it stays an unconfirmed transfer.
+                transfers.putIfAbsent(rel, TransferDisposition.UNCERTAIN);
+                couldNotTell.add(rel);
                 continue;
             }
-            boolean destinationEmpty = ledger != null
-                    ? ledger.showsNothingAt(rel)
-                    : !Files.exists(destDir.resolve(rel), java.nio.file.LinkOption.NOFOLLOW_LINKS);
-            if (!destinationEmpty) {
-                continue;
+            TransferLedger.Existence held;
+            TransferLedger.Existence now;
+            if (ledger != null) {
+                held = ledger.heldBefore(rel);
+                now = ledger.existsNow(rel);
+            } else {
+                // No ledger means no recorded before-state, so "there was nothing here already" cannot be said.
+                held = TransferLedger.Existence.UNKNOWN;
+                now = TransferLedger.probe(destDir.resolve(rel));
             }
-            vanished.add(rel);
-            // A name rsync never reached has no row of its own; a name it announced and then lost is sitting in
-            // the uncertain column. Both become NOT_COPIED - nothing was written for this file in this job -
-            // which is the claim the two facts actually support.
-            transfers.put(rel, TransferDisposition.NOT_COPIED);
+            if (held == TransferLedger.Existence.ABSENT && now == TransferLedger.Existence.ABSENT) {
+                vanished.add(rel);
+                // A name rsync never reached has no row of its own; a name it announced and then lost is sitting in
+                // the uncertain column. Both become NOT_COPIED - nothing was written for this file in this job -
+                // which is the claim the two measured absences actually support.
+                transfers.put(rel, TransferDisposition.NOT_COPIED);
+            } else if (held == TransferLedger.Existence.UNKNOWN || now == TransferLedger.Existence.UNKNOWN) {
+                // An inspection that failed is not evidence of absence. The name stays on the books as an
+                // unconfirmed transfer rather than vanishing from the report or being called a non-transfer.
+                transfers.putIfAbsent(rel, TransferDisposition.UNCERTAIN);
+                couldNotTell.add(rel);
+            }
+            // Otherwise something stands at that name, and the ledger's own verdict about it decides.
         }
         vanished.sort(java.util.Comparator.naturalOrder());
-        if (vanished.isEmpty()) {
-            return;
+        if (!vanished.isEmpty()) {
+            control.setVanishedInputs(vanished);
+            warnings.add(vanished.size() + " input file(s) were there when the work set was built and were gone from"
+                    + " the source when the transfer reached them: " + describeNames(vanished)
+                    + ". The destination held nothing for them before and holds nothing there now, so they are"
+                    + " counted as not copied - not as copied, and not as a transfer whose result cannot be"
+                    + " confirmed.");
         }
-        control.setVanishedInputs(vanished);
-        warnings.add(vanished.size() + " input file(s) were there when the work set was built and were gone from"
-                + " the source when the transfer reached them: " + describeNames(vanished)
-                + ". The destination holds nothing for them either, so they are counted as not copied - not as"
-                + " copied, and not as a transfer whose result cannot be confirmed.");
+        if (!couldNotTell.isEmpty()) {
+            couldNotTell.sort(java.util.Comparator.naturalOrder());
+            warnings.add("The source or destination could not be inspected for " + describeNames(couldNotTell)
+                    + ": a failed inspection is not evidence that a name is absent, so nothing is claimed about"
+                    + " whether these files were copied. They are counted as transfers whose result cannot be"
+                    + " confirmed.");
+        }
     }
 
 

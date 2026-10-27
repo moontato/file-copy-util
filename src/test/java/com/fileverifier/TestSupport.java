@@ -259,6 +259,50 @@ final class TestSupport {
         return script;
     }
 
+    /**
+     * A stand-in rsync that announces nothing: it removes a selected name from the source and exits 24. Real
+     * rsync does this when a file is gone before it can be listed for transfer, which leaves this program with an
+     * exit code saying "something vanished" and no per-file line at all to work from.
+     */
+    static Path vanishingRsyncWithoutAnnouncements(Path dir, String vanishedName) throws IOException {
+        Path script = dir.resolve("fake-vanishing-silent-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("src=$(eval echo \"\\${$(($#-1))}\")\n");
+        body.append("rm -f \"$src/").append(vanishedName).append("\"\n");
+        body.append("printf 'rsync: [generator] failed to set times on \"%s\": No such file or directory (code 2)\\n' \"$src\"\n");
+        body.append("exit 24\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
+    /**
+     * A stand-in rsync that makes part of the <i>source</i> unreadable during the run - a directory replaced by a
+     * symbolic link that points at itself - and exits 24 with no itemize line. It exercises the case where this
+     * program cannot tell whether a name is still on the source.
+     */
+    static Path loopingSourceRsync(Path dir, String subDirName) throws IOException {
+        Path script = dir.resolve("fake-looping-source-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("src=$(eval echo \"\\${$(($#-1))}\")\n");
+        body.append("rm -rf \"$src/").append(subDirName).append("\"\n");
+        body.append("ln -s ").append(subDirName).append(" \"$src/").append(subDirName).append("\"\n");
+        body.append("printf 'rsync: [receiver] cannot enumerate the source tree: Too many levels of symbolic links\\n'\n");
+
+        body.append("exit 24\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
     static Path hangingFakeRsync(Path dir, String output, String partialFile) throws IOException {
         Path script = dir.resolve("fake-hanging-rsync");
         StringBuilder body = new StringBuilder();

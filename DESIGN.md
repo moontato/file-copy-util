@@ -744,6 +744,25 @@ there — nothing now, and nothing before the copy either. Then the name is reco
 not called vanished: "gone from the source" and "cannot be shown to have arrived" are different claims, and the
 second belongs to the uncertain figure.
 
+**A stat that fails is not an answer.** "Is this name there?" has three answers, and the code says so
+(`TransferLedger.Existence`): present, absent, could not be inspected. Only `NoSuchFileException` is absence; an
+access error, a filesystem error or an unresolvable ancestor (`Too many levels of symbolic links`) is "the question
+could not be asked", which is not evidence of anything. That covers both ends and both times: the destination's
+before-state, which the ledger remembers as unknown when its own stat failed, and the source as it stands when the
+transfer reached it. A name whose source or destination could not be read is therefore left as an unconfirmed
+transfer with a warning naming it — never as a confirmed non-transfer, and never missing from the report.
+
+**Where the transfer rows are written.** A job that stops mid-copy — cancelled, timed out, or an rsync error —
+records a row per file before returning its result, because a count with no names says nothing about which file.
+Those rows are written only on the paths that stop: a job that carries on (exit 24 is a warning) produces its rows
+through the normal copy or verification path, and writing them in both places gave every file two rows and inflated
+the count of rows a capped report had left out.
+
+**The headline states this program's finding.** The summary line a user reads first — `Copy complete: N file(s)
+copied.`, or `… N copied` in a verifying job's line — counts the same disposition tally as the `copied=` figure.
+What rsync announced is a separate figure, printed as `rsync announced N` when the two differ, and a copy-only job
+with anything unconfirmed or not transferred opens with `Copy finished with gaps: …`.
+
 The related attribution rule changed with it: because exit 24 is `rsync` reporting that not everything it announced
 was transferred, it is not treated as a *clean completion* for per-file evidence — only exit 0 is. The job-level rule
 is unchanged: 24 is still a warning, not a failure.

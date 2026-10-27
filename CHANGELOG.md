@@ -28,6 +28,32 @@
   per-file `transfer` figure: a name `rsync` announced and did not deliver falls back to the destination evidence
   instead of being reported `COPIED`.
 
+### Fixed — three boundary cases in that exit-24 path, found in the next review round
+
+- **A vanished input with no `rsync` announcement aborted the job.** An exit-24 run that had not itemized anything
+  (a name gone before `rsync` could list it) handed an immutable empty facts map to the vanished-input check, which
+  tried to add an entry to it. The job died with `UnsupportedOperationException`: `Job aborted: null`, exit 1, and
+  the export lost rsync's exit code and the vanished name along with every figure. The facts collection is now one
+  the job can enrich, and the run reports the vanished name as it always should have — exit 0 without `--strict`,
+  exit 5 with it.
+- **A job that carried on after exit 24 named each file twice.** The per-file transfer rows meant for cancelled,
+  timed-out and failed jobs were written whenever the copy phase had not ended cleanly, and exit 24 does not end the
+  job cleanly. So the rows appeared twice — `keep UNCERTAIN, gone NOT_COPIED, keep UNCERTAIN, gone NOT_COPIED` —
+  while the totals counted each file once, and a capped results list reported three omitted rows for a two-file job.
+  The rows are now written only on the paths that stop there.
+- **The headline counted announcements while the totals counted transfers.** A copy-only job could open with
+  `Copy complete: 1 file(s) copied.` above `totals: copied=0 … uncertain=1`. "Copied" in the headline and the summary
+  for a verifying job now come from the same disposition tally as the totals, and what `rsync` announced is stated
+  separately (`rsync announced 2`) instead of being read as this program's finding. A copy-only job with anything
+  unconfirmed or not transferred opens with `Copy finished with gaps: …` rather than "complete".
+- **A metadata read that failed was recorded as proven absence.** `showsNothingAt` answered "nothing is there" for
+  every `IOException`, and the source check used `Files.exists`, which cannot tell "absent" from "could not look".
+  An access error, a filesystem error or an ancestor that cannot be resolved (a symbolic-link loop answers `Too many
+  levels of symbolic links`) is not evidence of absence, and the job was using it to declare files not copied.
+  Existence is now a three-way answer — present, absent, could not be inspected — and only a measured absence at
+  both ends supports "not copied". A name whose source or destination could not be read stays counted as a transfer
+  whose result cannot be confirmed, with a warning naming it. New: `TransferLedgerTest`.
+
 ### Added — `--strict`, and an ignore pattern that does not compile says so
 
 - `--strict` makes a run nobody is watching fail when it did not do everything it was named for. It fails for one
