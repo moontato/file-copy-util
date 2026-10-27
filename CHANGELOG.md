@@ -52,7 +52,8 @@
   levels of symbolic links`) is not evidence of absence, and the job was using it to declare files not copied.
   Existence is now a three-way answer — present, absent, could not be inspected — and only a measured absence at
   both ends supports "not copied". A name whose source or destination could not be read stays counted as a transfer
-  whose result cannot be confirmed, with a warning naming it. New: `TransferLedgerTest`.
+  whose result cannot be confirmed, with a warning naming it — whether the destination was unreadable before the
+  copy, became unreadable during it, or the source itself could not be read. New: `TransferLedgerTest`.
 
 ### Added — `--strict`, and an ignore pattern that does not compile says so
 

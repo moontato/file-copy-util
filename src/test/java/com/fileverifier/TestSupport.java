@@ -293,7 +293,31 @@ final class TestSupport {
         body.append("rm -rf \"$src/").append(subDirName).append("\"\n");
         body.append("ln -s ").append(subDirName).append(" \"$src/").append(subDirName).append("\"\n");
         body.append("printf 'rsync: [receiver] cannot enumerate the source tree: Too many levels of symbolic links\\n'\n");
+        body.append("exit 24\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
 
+    /**
+     * A stand-in rsync that removes a selected name from the source and then makes the part of the
+     * <i>destination</i> that name sits under unusable - a directory replaced by a symbolic link pointing at
+     * itself - before exiting 24 with no itemize line. The ledger's snapshot of that name was a measured absence;
+     * what stands there afterwards cannot be read at all, which is not the same as holding nothing.
+     */
+    static Path loopingDestinationRsync(Path dir, String srcName, String subDirName) throws IOException {
+        Path script = dir.resolve("fake-looping-destination-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("src=$(eval echo \"\\${$(($#-1))}\")\n");
+        body.append("dst=$(eval echo \"\\${$#}\")\n");
+        body.append("rm -f \"$src/").append(srcName).append("\"\n");
+        body.append("rm -rf \"$dst/").append(subDirName).append("\"\n");
+        body.append("ln -s ").append(subDirName).append(" \"$dst/").append(subDirName).append("\"\n");
+        body.append("printf 'rsync: [receiver] cannot enumerate a destination path: Too many levels of symbolic links\\n'\n");
         body.append("exit 24\n");
         Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
         Files.setPosixFilePermissions(script, java.util.EnumSet.of(

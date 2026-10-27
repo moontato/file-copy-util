@@ -1215,6 +1215,37 @@ class FileSyncEngineTest {
     }
 
     /**
+     * The destination being unusable by the time the job looks at it, even though it was readable (and empty)
+     * when the ledger took its snapshot. The before-state is a measured absence, the after-state is no answer at
+     * all, and the pair does not support "nothing was copied".
+     */
+    @Test
+    void aDestinationThatBecomesUnreadableDuringTheJobIsNotCalledAnEmptyOne() throws Exception {
+        TestSupport.write(source.resolve("sdir/gone.txt"), "gone\n");
+
+        Path fake = TestSupport.loopingDestinationRsync(tools, "sdir/gone.txt", "sdir");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("sdir/gone.txt"), TestSupport.none()), new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(List.of(), result.vanishedInputs(),
+                            "a destination that cannot be read now cannot confirm the before-state's absence: "
+                                    + result),
+                    () -> assertEquals(1, result.filesUncertain(), "the name stays unknown: " + result),
+                    () -> assertEquals(0, result.filesNotTransferred(), result.toString()),
+                    () -> assertTrue(result.warnings().stream().anyMatch(w -> w.contains("sdir/gone.txt")
+                                    && w.contains("could not be inspected")),
+                            result.warnings().toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
      * The same rule on the other side. If the source cannot be read, "it is gone" is not known, and a name that
      * may already have been copied must not be reported as a confirmed non-transfer.
      */
