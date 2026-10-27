@@ -1,4 +1,4 @@
-# Audit remediation plan — File Copy Util (revision 17)
+# Audit remediation plan — File Copy Util (revision 18)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
@@ -616,8 +616,40 @@ A mutation run over these fixes found that the conservative half of the destinat
 JobIsNotCalledAVanishedNonTransfer` closes it — a name gone from the source *and* gone from a destination that used
 to hold something is an unexplained disappearance, not evidence that nothing arrived, so it stays uncertain.
 
+**Mutation coverage for the four corrections**, in a disposable `git worktree`, both trees verified clean before it
+was removed:
+
+| Mutation | Caught? |
+|---|---|
+| link-text equality applies under `FOLLOW` again | yes — `followPolicyDoesNotCallTwoLinksWithTheSameTextAMatch`, by itself |
+| source links hashed again under `LINK` | yes — `linkPolicyDoesNotOpenTheThingALinkPointsAtWhenHashingTheSource`, by itself |
+| `rsync` exit 24 counts as a clean completion again | yes — 3 fixtures: the strict exit-code fixture, the report fixture, and the conservative one |
+| vanished names never recorded | yes — the two CLI fixtures |
+| truncation warning back to "the list is as full as the limit" | yes — the exactly-at-limit fixture |
+| `showsNothingAt` stops requiring that the destination held nothing before | **not caught at first.** The mutation found the unguarded half; `aNameGoneFromBothEndsDuringTheJobIsNotCalledAVanishedNonTransfer` (`402c53f`) closes it, and that mutation is then caught by that fixture alone. |
+
 Suite after the corrections: **297 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
-SpotBugs 0; **290 green** pinned to 3.1.3 (measured before the last two fixtures). Mutation coverage and the pinned runs follow in the next commits.
+SpotBugs 0, `-Werror` clean. Pinned whole-suite runs: **291 green** against local `rsync 3.1.3`, **291 green**
+against local `rsync 3.4.0`. Mutation coverage and the pinned runs follow in the next commits.
+
+### The CI coverage qualification, and the push
+
+Your qualification was right and is now fixed in the workflow rather than remembered: the per-version step in
+`validate.yml` named nine suites, which silently excluded `JobOwnershipTest`, `WriteSafetyTest`,
+`SymlinkVerdictTest`, `CounterTruthTest` and anything else added later. The step now runs the **whole suite**
+pinned to each of the four binaries (`FCU_RSYNC` pinned, `FCU_RSYNC_BINARIES` cleared), with the all-four matrix run
+separate as before (`c9ca21d`). A named selection cannot be trusted to stay current; a whole-suite run can.
+
+The authorized push was attempted and **did not go**: this container has no GitHub credentials, and
+`https://github.com/moontato/file-copy-util.git` answered `No anonymous write access / Authentication failed`.
+Nothing was pushed, tagged or force-pushed. The command has to be run where a credential exists:
+
+```
+git -c push.followTags=false push origin <sha>:refs/heads/remediation/audit
+```
+
+That also means the CI evidence you asked to be reported (run URLs, checked SHA, versions actually built,
+failures/skips) is still outstanding: it cannot be produced from here.
 
 ## Phase 5 checkpoint — awaiting acceptance
 
