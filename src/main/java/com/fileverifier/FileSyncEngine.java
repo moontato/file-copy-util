@@ -361,14 +361,29 @@ public class FileSyncEngine implements AutoCloseable {
                             int filesProcessed,
                             int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
                             List<String> warnings, int rowsOmitted, AbortCause abortCause,
-                            List<String> selectedButAbsent) {
+                            List<String> selectedButAbsent, List<String> vanishedInputs) {
 
         public JobResult {
             outcomes = List.copyOf(outcomes);
             errors = List.copyOf(errors);
             warnings = List.copyOf(warnings);
             selectedButAbsent = List.copyOf(selectedButAbsent);
+            vanishedInputs = List.copyOf(vanishedInputs);
             abortCause = abortCause == null ? AbortCause.NONE : abortCause;
+        }
+
+        /** The shape from before an input that vanished during the transfer was kept as a figure. */
+        public JobResult(JobStatus status, String message,
+                         int filesMatched, int filesMismatched, int filesMissing, int filesExtra,
+                         int filesCopied, int filesWouldCopy, int filesUncertain,
+                         int filesNotTransferred, int transfersAnnounced, int transfersCompletedByRsync,
+                         int filesProcessed, int rsyncExitCode, List<FileOutcome> outcomes,
+                         List<String> errors, List<String> warnings, int rowsOmitted,
+                         AbortCause abortCause, List<String> selectedButAbsent) {
+            this(status, message, filesMatched, filesMismatched, filesMissing, filesExtra, filesCopied,
+                    filesWouldCopy, filesUncertain, filesNotTransferred, transfersAnnounced,
+                    transfersCompletedByRsync, filesProcessed, rsyncExitCode, outcomes, errors, warnings,
+                    rowsOmitted, abortCause, selectedButAbsent, List.of());
         }
 
         /** The shape from before the unanswered requests were kept as a figure: nothing known about them. */
@@ -420,6 +435,17 @@ public class FileSyncEngine implements AutoCloseable {
          */
         public List<String> selectedButAbsent() {
             return selectedButAbsent;
+        }
+
+        /**
+         * Names that were in the work set - so they existed when it was built - and were gone from the source by
+         * the time the transfer reached them. {@code rsync} says only that <i>some</i> input vanished (exit 24);
+         * this list is this program's own evidence about which. A name that cannot be accounted for is not here:
+         * it stays in the uncertain figure, because "gone from the source" and "cannot be shown to have arrived"
+         * are different claims.
+         */
+        public List<String> vanishedInputs() {
+            return vanishedInputs;
         }
 
         /** How many per-file rows the report holds. */
@@ -535,6 +561,8 @@ public class FileSyncEngine implements AutoCloseable {
          * request unanswered.
          */
         private volatile List<String> selectedButAbsent = List.of();
+        /** Names this job was handling that disappeared from the source during the transfer. */
+        private volatile List<String> vanishedInputs = List.of();
         /**
          * The rsync this job started, and every process it had spawned, snapshotted while the parent was
          * still alive. A local rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only
@@ -588,6 +616,14 @@ public class FileSyncEngine implements AutoCloseable {
 
         List<String> selectedButAbsent() {
             return selectedButAbsent;
+        }
+
+        void setVanishedInputs(List<String> names) {
+            this.vanishedInputs = List.copyOf(names);
+        }
+
+        List<String> vanishedInputs() {
+            return vanishedInputs;
         }
 
         ProgressReporter.Counters counters() {
@@ -1561,7 +1597,8 @@ public class FileSyncEngine implements AutoCloseable {
             progress.update(0, "Hashing " + workSet.size()
                     + " source file(s) - nothing is written to the destination during this part...");
             // Hashed once, before the copy: these same digests are reused for the comparison below.
-            sourceHashes = hashFiles(control, workSet, "source", warnings);
+            sourceHashes = hashFiles(control, workSet, "source", warnings,
+                    options.symlinkPolicy());
         }
 
         if (copies) {
@@ -1626,9 +1663,15 @@ public class FileSyncEngine implements AutoCloseable {
                 // What happened to each announced file, decided before any early return below, because a
                 // job that is about to be reported as cancelled or failed still owes the user a list of
                 // the files it did and did not finish.
-                boolean cleanCopy = !control.timedOut() && !control.cancelRequested()
-                        && isSuccessfulExit(rsyncExitCode);
+                // Exit 0 is what can be taken as "rsync ran this file and finished": exit 24 says some input
+                // vanished, so rsync itself is reporting that not every announced file was transferred, and its
+                // exit then says nothing about the individual files. The destination evidence decides instead.
+                // The job's own status is unaffected: 24 stays a warning, not a failure.
+                boolean cleanCopy = !control.timedOut() && !control.cancelRequested() && rsyncExitCode == 0;
                 transfers = transferFacts(ledger, announcedNames, cleanCopy, dryRun);
+                if (rsyncExitCode == 24) {
+                    applyVanishedInputs(control, workSet, transfers, ledger, destDir, warnings);
+                }
                 tally = TransferTally.of(transfers);
                 if (!cleanCopy) {
                     // A job that is about to be reported as cancelled, timed out or failed still owes the
@@ -1653,9 +1696,6 @@ public class FileSyncEngine implements AutoCloseable {
                     errors.add("rsync exited with code " + rsyncExitCode);
                     return rsyncFailedDuringCopy(control, progress, tally, outcomes, rsyncExitCode, errors, warnings,
                             destinationTargets, dryRun, verifies);
-                }
-                if (rsyncExitCode == 24) {
-                    warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
                 }
                 progress.copyComplete(copied, dryRun);
             } finally {
@@ -1709,8 +1749,13 @@ public class FileSyncEngine implements AutoCloseable {
             return cancelledDuringVerify(control, progress, tally, outcomes, errors, warnings);
         }
 
-        if (outcomes.size() >= resultLimit) {
-            warnings.add("Results list truncated at " + resultLimit + " entries; counters are still exact. "
+        int omittedRows = rowsOmitted(progress, outcomes);
+        if (omittedRows > 0) {
+            // The test is a row that did not make it into the report, not a report that happens to be as long as
+            // the limit allows. A one-file job with a limit of one lists every file it handled, and a warning
+            // saying otherwise teaches the reader to ignore the warnings.
+            warnings.add("Results list truncated at " + resultLimit + " entries; " + omittedRows
+                    + " row(s) the job produced are not listed. Counters are still exact. "
                     + (dryRun ? "" : "Raise it (CLI: --max-results N) if the export must list every file."));
         }
 
@@ -1789,7 +1834,8 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.matched(), progress.mismatched(), progress.missing(), progress.extra(),
                 tally.copied(), tally.wouldCopy(), tally.uncertain(), tally.notTransferred(),
                 progress.copied(), claimedByRsync(progress), progress.processed(), rsyncExitCode, outcomes,
-                errors, warnings, rowsOmitted(progress, outcomes), AbortCause.NONE, control.selectedButAbsent());
+                errors, warnings, rowsOmitted(progress, outcomes), AbortCause.NONE,
+                control.selectedButAbsent(), control.vanishedInputs());
     }
 
     private static String completionMessage(ProgressReporter progress, TransferTally tally, boolean dryRun,
@@ -1852,7 +1898,8 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.NONE,
-                control.selectedButAbsent());
+                control.selectedButAbsent(),
+                control.vanishedInputs());
     }
 
     /**
@@ -1938,7 +1985,8 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), control.cause(),
-                control.selectedButAbsent());
+                control.selectedButAbsent(),
+                control.vanishedInputs());
     }
 
     /**
@@ -1985,7 +2033,8 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), progress.copied(), claimedByRsync(progress), progress.processed(), 0,
                 outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause(),
-                control.selectedButAbsent());
+                control.selectedButAbsent(),
+                control.vanishedInputs());
     }
 
     private JobResult timeoutResult(JobControl control, ProgressReporter progress, TransferTally tally,
@@ -2011,7 +2060,8 @@ public class FileSyncEngine implements AutoCloseable {
                 progress.missing(), progress.extra(), tally.copied(), tally.wouldCopy(), tally.uncertain(),
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), 0,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.TIMED_OUT,
-                control.selectedButAbsent());
+                control.selectedButAbsent(),
+                control.vanishedInputs());
     }
 
     /**
@@ -2257,14 +2307,30 @@ public class FileSyncEngine implements AutoCloseable {
                 return new Verdict("EXTRA", rel, null, null);
             }
             if (sourceLink) {
-                String sourceText = readLink(sourcePath);
-                String destText = readLink(destPath);
-                if (sourceText != null && sourceText.equals(destText)) {
-                    return new Verdict("OK", rel, null, null);
+                if (linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
+                    // Under LINK the link is the object, and its text is the comparison. Same text, same object
+                    // as far as this job is concerned; different text is a mismatch in what the links say.
+                    String sourceText = readLink(sourcePath);
+                    String destText = readLink(destPath);
+                    if (sourceText != null && sourceText.equals(destText)) {
+                        return new Verdict("OK", rel, null, null);
+                    }
+                    kindChanges.add(rel + ": both sides are symbolic links but they carry different link text -"
+                            + " the source says " + quoted(sourceText) + ", the destination says "
+                            + quoted(destText) + ". Under LINK a link is judged by its text, and nothing was read"
+                            + " through either one.");
+                    return new Verdict("MISMATCH", rel, null, null);
                 }
-                kindChanges.add(rel + ": both sides are symbolic links but they carry different link text - the"
-                        + " source says " + quoted(sourceText) + ", the destination says " + quoted(destText)
-                        + ". Under LINK a link is judged by its text, and nothing was read through either one.");
+                // FOLLOW asks for a verdict about bytes, and what stands in the destination is a link. Two links
+                // can carry exactly the same text and reach different bytes - which is the case this branch
+                // exists for - so the text is no evidence here, and reading through a destination link is not
+                // something any policy allows. The honest answer is a mismatch in kind, with the reason the byte
+                // comparison could not run.
+                kindChanges.add(rel + ": both sides hold a symbolic link. Under FOLLOW the verdict would be about"
+                        + " the bytes reached through them, but a link standing in the destination is never read"
+                        + " through, and the same link text can reach different bytes - so no comparison was made"
+                        + " and nothing was read through either link. Copy the file (a copy replaces the link) or"
+                        + " use LINK to compare the links themselves.");
                 return new Verdict("MISMATCH", rel, null, null);
             }
             kindChanges.add(rel + ": the source has a regular file and the destination holds a symbolic link."
@@ -2361,7 +2427,7 @@ public class FileSyncEngine implements AutoCloseable {
      * file. Used for the source digests Copy & Verify needs before rsync runs.
      */
     private Map<String, String> hashFiles(JobControl control, List<FileEntry> entries, String side,
-                                         List<String> warnings)
+                                         List<String> warnings, ScanOptions.SymlinkPolicy linkPolicy)
             throws NoSuchAlgorithmException {
         if (entries.isEmpty()) {
             return Map.of();
@@ -2380,6 +2446,14 @@ public class FileSyncEngine implements AutoCloseable {
                     break;
                 }
                 Path path = entry.absolutePath();
+                if ("source".equals(side) && linkPolicy == ScanOptions.SymlinkPolicy.LINK
+                        && Files.isSymbolicLink(path)) {
+                    // Under LINK a link is judged by its kind and its text, so its content is never wanted here.
+                    // Opening the link follows it: a link to a directory fails the open with "Is a directory", a
+                    // link to a FIFO blocks the job on a read it was never asked to make, and a link outside the
+                    // two trees gets a digest of something the job has no business reading.
+                    continue;
+                }
                 Future<String> task = pool.submit(() -> {
                     if (control.abortRequested()) {
                         return null;
@@ -2725,6 +2799,55 @@ public class FileSyncEngine implements AutoCloseable {
      * destination. A group is only a collision when it holds more than one distinct path.
      */
     /** The relative paths of a work set, in the order the identity wants them. */
+    /**
+     * rsync's exit 24 says <i>some</i> input vanished. Which one is this program's question, and it is answered
+     * only where both sides speak: the name is gone from the source, and the destination holds nothing where it
+     * should be. Then the name is recorded as not transferred, and it goes into the job's vanished figure, which
+     * is what {@code --strict} and the report need.
+     *
+     * <p>What is deliberately not done: a name whose transfer cannot be accounted for is not called vanished -
+     * "gone from the source" and "cannot be shown to have arrived at the destination" are different claims, and
+     * the second belongs to the uncertain figure. A name this job can show it copied is not vanished either:
+     * its bytes are at the destination whatever became of the source. This is an observation at the moment the
+     * transfer ended; a source file that reappears afterwards is not evidence about this job.
+     */
+    private static void applyVanishedInputs(JobControl control, List<FileEntry> workSet,
+                                            Map<String, TransferDisposition> transfers, TransferLedger ledger,
+                                            Path destDir, List<String> warnings) {
+        warnings.add("rsync exit code 24: some files vanished before they could be transferred.");
+        List<String> vanished = new ArrayList<>();
+        for (FileEntry entry : workSet) {
+            String rel = entry.relPath();
+            if (transfers.get(rel) == TransferDisposition.COPIED) {
+                continue;
+            }
+            if (Files.exists(entry.absolutePath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                continue;
+            }
+            boolean destinationEmpty = ledger != null
+                    ? ledger.showsNothingAt(rel)
+                    : !Files.exists(destDir.resolve(rel), java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            if (!destinationEmpty) {
+                continue;
+            }
+            vanished.add(rel);
+            // A name rsync never reached has no row of its own; a name it announced and then lost is sitting in
+            // the uncertain column. Both become NOT_COPIED - nothing was written for this file in this job -
+            // which is the claim the two facts actually support.
+            transfers.put(rel, TransferDisposition.NOT_COPIED);
+        }
+        vanished.sort(java.util.Comparator.naturalOrder());
+        if (vanished.isEmpty()) {
+            return;
+        }
+        control.setVanishedInputs(vanished);
+        warnings.add(vanished.size() + " input file(s) were there when the work set was built and were gone from"
+                + " the source when the transfer reached them: " + describeNames(vanished)
+                + ". The destination holds nothing for them either, so they are counted as not copied - not as"
+                + " copied, and not as a transfer whose result cannot be confirmed.");
+    }
+
+
     private static Collection<String> namesOf(Collection<FileEntry> entries) {
         List<String> names = new ArrayList<>();
         for (FileEntry entry : entries) {
@@ -2965,7 +3088,7 @@ public class FileSyncEngine implements AutoCloseable {
                 Math.max(0, counters.rsyncTransfers()), counters.processed(), 0, List.of(), List.of(),
                 List.of("the job's own thread was still finishing when this was reported; per-file results"
                         + " from it are not included"),
-                counters.rowCount(), why, control.selectedButAbsent());
+                counters.rowCount(), why, control.selectedButAbsent(), control.vanishedInputs());
         finishJob(forced, control, control.listener(), delivery);
     }
 

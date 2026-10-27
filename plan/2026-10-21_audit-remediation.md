@@ -1,4 +1,4 @@
-# Audit remediation plan — File Copy Util (revision 16)
+# Audit remediation plan — File Copy Util (revision 17)
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
@@ -588,6 +588,27 @@ before and after, because the table was never the format at risk.
   apostrophe in a filename would be a different file. A non-leading `=` is ordinary text.
 - The class comment that told the next reader "do not describe this format as safe to open in a spreadsheet until
   it is" is replaced by what the rule now is.
+
+## Phase 5 corrections — the owner's four findings (implemented, green)
+
+The review of the Phase 5 checkpoint found four gaps, one of them a false verification match. All four were
+reproduced first with fixtures, then fixed; all four fixtures were red before the fix.
+
+| Finding | Red evidence | Fix |
+|---|---|---|
+| `FOLLOW` reported a match from identical link text without comparing bytes (`src/a -> real`, `dst/a -> real`, different bytes behind them → `matched=1`, no digests) | `SymlinkVerdictTest.followPolicyDoesNotCallTwoLinksWithTheSameTextAMatch` — failed with `Job complete: 1 matched, 0 mismatched` | link-text equality is a `LINK`-only rule; under `FOLLOW` a destination link is a kind mismatch, with a warning giving the reason the byte comparison could not run. Not fixed by reading through an unvalidated destination link |
+| `LINK` still opened source link targets during pre-copy hashing (`Could not read source file: mirror (java.io.IOException: Is a directory)`) | `SymlinkVerdictTest.linkPolicyDoesNotOpenTheThingALinkPointsAtWhenHashingTheSource`, and `assertNoReadProblem` widened to catch `Could not read source file:` as well as `Could not read file:` | the hashing pass skips symbolic links under `LINK`; the kind/text comparison is unchanged |
+| `--strict --no-verify` exited 0 after an input vanished during the transfer (rsync exit 24) | `CliTest.strictFailsANameThatVanishedDuringTheTransferNotOnlyOneThatWasNeverThere` and `theReportNamesTheInputThatVanishedDuringTheTransfer`, with a new `TestSupport.vanishingRsync` (copies one name, deletes another, exits 24) | confirmed vanishings become `JobResult.vanishedInputs()` — source gone without following links, and `TransferLedger.showsNothingAt` for the destination — recorded as `NOT_COPIED`, exported (`vanishedInputs` / `# vanished,N`), printed, and failed for by `--strict` (exit 5). Uncertain stays distinct |
+| exactly reaching `--max-results` claimed truncation | `CliTest.aResultsListThatExactlyReachesTheLimitDoesNotClaimToBeTruncated` — one row at a limit of one warned | the warning tests rows actually omitted and names the count; tested below, exactly at, and above the limit |
+
+**One contract change came out of the third finding**, and it strengthens rather than narrows the claim: `rsync` exit
+24 is no longer treated as a *clean completion* for per-file attribution, because exit 24 is `rsync` itself saying
+that not everything it announced was transferred. Announced-but-undelivered names fall back to the destination
+evidence. The job-level rule is unchanged — 24 remains a warning, not a failure — and no existing fixture depended
+on the old attribution.
+
+Suite after the corrections: **295 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
+SpotBugs 0. Mutation coverage and the pinned runs follow in the next commits.
 
 ## Phase 5 checkpoint — awaiting acceptance
 

@@ -60,6 +60,17 @@ class CliTest {
      * the worst failure it can have, and a test that only looks at the destination and the exit code would
      * never see it.
      */
+    /**
+     * The same, with one stand-in rsync as the process default for the duration of the call - and without the
+     * source-immutability check, because a fixture that reaches here on purpose changes the source (an input
+     * that vanishes mid-transfer is the case). The previous binary is restored exactly as it was.
+     */
+    private int runWithRsync(Output o, String binary, String... args) throws Exception {
+        int[] exit = new int[1];
+        TestSupport.withRsyncBinary(binary, () -> exit[0] = Cli.run(args, o.outStream, o.errStream));
+        return exit[0];
+    }
+
     private int run(Output o, String... args) throws Exception {
         Map<String, String> sourceBefore = TestSupport.digests(source);
         Map<String, String> destBefore = TestSupport.digests(dest);
@@ -485,6 +496,116 @@ class CliTest {
      * needed no transfer, and a file reported as extra in the destination, are observations: turning them
      * into a failure would push people away from the switch that reports the real gaps.
      */
+    /**
+     * A name that was there when the work set was built and gone by the time {@code rsync} reached it. That is
+     * not the same event as a typo in a list, and a copy-only job has no verdict that would notice it, so
+     * without a figure of its own the run reports success.
+     */
+    @Test
+    void strictFailsANameThatVanishedDuringTheTransferNotOnlyOneThatWasNeverThere() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        Path fakeDir = Files.createDirectories(reports.resolve("fake-vanish"));
+        Path fake = TestSupport.vanishingRsync(fakeDir, "keep.txt", "gone.txt");
+
+        Output plain = new Output();
+        int plainExit = runWithRsync(plain, fake.toString(), "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--files", "keep.txt,gone.txt", "--no-verify");
+        // The stand-in deleted the source file it was handed, so the second run has to be given the same
+        // starting point: this fixture is about a name that disappears during the transfer, not about one that
+        // was never there (which has a fixture of its own above).
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        Output strict = new Output();
+        int strictExit = runWithRsync(strict, fake.toString(), "--cli", "--quiet", "--strict", "--source",
+                source.toString(), "--dest", dest.toString(), "--files", "keep.txt,gone.txt", "--no-verify");
+
+        assertAll(
+                () -> assertEquals(Cli.EXIT_OK, plainExit,
+                        "exit 24 stays a warning, as it has always been: " + plain.out()),
+                () -> assertEquals(Cli.EXIT_STRICT, strictExit, strict.out()),
+                () -> assertTrue(plain.out().contains("gone.txt"), plain.out()),
+                () -> assertTrue(strict.out().contains("gone.txt"), strict.out()),
+                // The file that did arrive, arrived. The vanished name is a figure of its own, and it is not
+                // counted as an uncertain transfer or as a verification verdict.
+                () -> assertTrue(Files.exists(dest.resolve("keep.txt")), plain.out()),
+                () -> assertTrue(Files.exists(dest.resolve("keep.txt")), strict.out()),
+                () -> assertTrue(plain.out().contains("vanished: 1 input file"), plain.out()),
+                () -> assertTrue(strict.out().contains("vanished: 1 input file"), strict.out()),
+                () -> assertTrue(plain.out().contains("verification was off"), plain.out()),
+                () -> assertTrue(strict.out().contains("verification was off"), strict.out()));
+    }
+
+    /** A report that does not name the vanished name is a report that says the job was complete. */
+    @Test
+    void theReportNamesTheInputThatVanishedDuringTheTransfer() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        Path fakeDir = Files.createDirectories(reports.resolve("fake-vanish-json"));
+        Path fake = TestSupport.vanishingRsync(fakeDir, "keep.txt", "gone.txt");
+        Path csv = reports.resolve("report.csv");
+        Path json = reports.resolve("report.json");
+
+        Output o = new Output();
+        int exit = runWithRsync(o, fake.toString(), "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--files", "keep.txt,gone.txt", "--no-verify",
+                "--csv", csv.toString(), "--json", json.toString());
+        assertEquals(Cli.EXIT_OK, exit, o.out());
+
+        String csvText = Files.readString(csv);
+        String jsonText = Files.readString(json);
+        assertAll(
+                () -> assertTrue(csvText.contains("# vanished,1"), csvText),
+                () -> assertTrue(jsonText.contains("\"vanishedInputs\": [\"gone.txt\"]"), jsonText));
+    }
+
+    /**
+     * A results list that holds every row is not truncated, even when it happens to be exactly as long as the
+     * limit allows. Only an omitted row makes a report incomplete.
+     */
+    @Test
+    void aResultsListThatExactlyReachesTheLimitDoesNotClaimToBeTruncated() throws Exception {
+        assumeRsync();
+        TestSupport.write(source.resolve("a.txt"), "a\n");
+        Path csv = reports.resolve("report.csv");
+
+        Output one = new Output();
+        assertEquals(Cli.EXIT_OK, run(one, "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--all", "--max-results", "1", "--csv", csv.toString()), one.out());
+        String oneCsv = Files.readString(csv);
+        assertAll(
+                () -> assertTrue(oneCsv.contains("# truncated,false"), oneCsv),
+                () -> assertTrue(oneCsv.contains("# rowsListed,1"), oneCsv),
+                () -> assertTrue(oneCsv.contains("# rowsOmitted,0"), oneCsv),
+                () -> assertFalse(one.out().contains("truncated"), one.out()));
+
+        // Two rows at a limit of two: still complete. Three rows at the same limit: one row is missing, and
+        // that is the first run that may say so.
+        TestSupport.write(source.resolve("b.txt"), "b\n");
+        Path csvTwo = reports.resolve("report-two.csv");
+        Output two = new Output();
+        assertEquals(Cli.EXIT_OK, run(two, "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--all", "--max-results", "2", "--csv", csvTwo.toString()), two.out());
+        String twoCsv = Files.readString(csvTwo);
+        assertAll(
+                () -> assertTrue(twoCsv.contains("# truncated,false"), twoCsv),
+                () -> assertTrue(twoCsv.contains("# rowsOmitted,0"), twoCsv),
+                () -> assertFalse(two.out().contains("truncated"), two.out()));
+
+        TestSupport.write(source.resolve("c.txt"), "c\n");
+        Path csvThree = reports.resolve("report-three.csv");
+        Output three = new Output();
+        assertEquals(Cli.EXIT_OK, run(three, "--cli", "--quiet", "--source", source.toString(),
+                "--dest", dest.toString(), "--all", "--max-results", "2", "--csv", csvThree.toString()),
+                three.out());
+        String threeCsv = Files.readString(csvThree);
+        assertAll(
+                () -> assertTrue(threeCsv.contains("# truncated,true"), threeCsv),
+                () -> assertTrue(threeCsv.contains("# rowsOmitted,1"), threeCsv),
+                () -> assertTrue(three.out().contains("truncated"), three.out()));
+    }
+
     @Test
     void strictDoesNotTurnAnObservationIntoAFailure() throws Exception {
         assumeRsync();

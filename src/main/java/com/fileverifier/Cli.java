@@ -110,8 +110,12 @@ public final class Cli {
             warns, with exit 0.
           - a name was refused because it points outside the directory it belongs to: exit 1, with or
             without --strict - a refusal already fails the job.
-          - a file the job was handling disappeared, or verification found it missing at the destination:
-            exit 3, with or without --strict.
+          - a file verification found missing at the destination: exit 3, with or without --strict.
+          - an input that was in the work set and disappeared during the transfer (rsync exit 24): a warning
+            and exit 0 without --strict, because the rest of the copy completed; with --strict, exit 5. A
+            verifying job normally reports the same file as missing at the destination, which is already exit 3.
+            A vanished input and a transfer whose result cannot be confirmed are different figures: only the
+            first is claimed to have disappeared.
           - a report could not be written: exit 4, with or without --strict.
         --strict changes the exit code and nothing else. It does not fail a job for an observation: a file that
         needed no transfer because it was already identical, and a file reported as extra in the destination,
@@ -670,12 +674,22 @@ public final class Cli {
                     result.rowsListed(), result.rowsListed() + result.rowsOmitted());
         }
 
+        if (!result.vanishedInputs().isEmpty()) {
+            // Named in the output, not only in the warning list: an input that disappeared during the transfer
+            // is a file this run did not handle, and a totals line that leaves it out reads as a complete copy.
+            out.printf("vanished: %d input file(s) were in the work set and were gone from the source by the"
+                    + " time the transfer reached them; they are not counted as copied.%n",
+                    result.vanishedInputs().size());
+        }
         int exit = exitCode(result, options.strict());
         if (exit == EXIT_STRICT) {
-            // The warning above named the names; this says why the run is now a non-zero run, so that the
-            // exit code of a scheduled job can be read without scrolling through its output.
-            out.printf("strict: exit %d because %d name(s) this run was given had no file behind them"
-                    + " when the work set was built.%n", EXIT_STRICT, result.selectedButAbsent().size());
+            // The warnings above named the names; this says why the run is now a non-zero run, and keeps the two
+            // ways a name can go unhandled apart, so that a scheduled job's exit code can be read without
+            // scrolling through its output.
+            out.printf("strict: exit %d because %d name(s) this run was given were not handled - %d absent when"
+                    + " the work set was built, %d vanished during the transfer.%n", EXIT_STRICT,
+                    result.selectedButAbsent().size() + result.vanishedInputs().size(),
+                    result.selectedButAbsent().size(), result.vanishedInputs().size());
         }
         if (!writeReports(options, result, out, err) && (exit == EXIT_OK || exit == EXIT_STRICT)) {
             // The copies happened; the record of them did not survive. A run whose report could not be
@@ -706,7 +720,11 @@ public final class Cli {
         if (result.filesMismatched() + result.filesMissing() > 0) {
             return EXIT_VERIFICATION_PROBLEMS;
         }
-        if (strict && !result.selectedButAbsent().isEmpty()) {
+        // Both ways a name goes unhandled: it was not there when the work set was built, or it was there and
+        // disappeared before the transfer reached it. The second matters most for a copy-only job, which has no
+        // verdict that would notice; a verifying job usually reports the same file as missing, and that is
+        // already exit 3 above.
+        if (strict && (!result.selectedButAbsent().isEmpty() || !result.vanishedInputs().isEmpty())) {
             return EXIT_STRICT;
         }
         return EXIT_OK;

@@ -2,6 +2,32 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Fixed — four gaps found in review of the Phase 5 work
+
+- **A verification match that was never a comparison.** Under `--symlinks follow`, two symbolic links carrying the
+  same link text were reported as matching, with no digest of anything — even when the files behind them hold
+  different bytes. Identical link text is not identical content. A link standing in the destination is never read
+  through under any policy, so this case is now a mismatch in kind, with a warning naming why the byte comparison
+  could not run. `matched=1` for such a pair was a false pass.
+- **A copy opened the thing a source link points at.** With `--symlinks link`, Copy & Verify still handed every
+  work-set entry to the hasher, links included. A link to a directory failed with `Could not read source file: b
+  (java.io.IOException: Is a directory)`, a link to a large file cost a digest nobody asked for, and a link to a
+  FIFO or a stalled target could stop a job whose links only needed copying as links. Links under `LINK` are no
+  longer hashed; their kind and text comparison is unchanged.
+- **`--strict` succeeded after an input vanished during the transfer.** Strict only checked names absent when the
+  work set was built, and a copy-only job produces no verdict that would notice the difference, so
+  `--strict --no-verify` with a file that disappeared mid-copy exited 0. Confirmed vanishings are now a figure of
+  their own — `vanishedInputs` in JSON, `# vanished,N` in CSV, a `vanished: N input file(s)` line in the output —
+  and strict fails the run for them (exit 5). A name whose transfer cannot be accounted for is *not* called
+  vanished: it stays in the uncertain figure.
+- **A complete results list warned about being truncated.** A run whose rows exactly reached `--max-results`
+  (one file, `--max-results 1`) warned that the list was cut short while the JSON said `truncated: false`. The
+  warning is now based on rows actually omitted, and names how many.
+- **`rsync` exit 24 no longer counts as proof about individual files.** A job that exits 24 still completes with a
+  warning, as before. But exit 24 says some input vanished, so it is no longer taken as a clean completion for the
+  per-file `transfer` figure: a name `rsync` announced and did not deliver falls back to the destination evidence
+  instead of being reported `COPIED`.
+
 ### Added — `--strict`, and an ignore pattern that does not compile says so
 
 - `--strict` makes a run nobody is watching fail when it did not do everything it was named for. It fails for one

@@ -219,6 +219,33 @@ final class TestSupport {
         return script;
     }
 
+    /**
+     * A stand-in rsync for a source file that disappears while the transfer runs: it copies one name for
+     * real, deletes another from the source, announces both, and exits 24 - the code real rsync uses for
+     * "some files vanished before they could be transferred".
+     */
+    static Path vanishingRsync(Path dir, String copiedName, String vanishedName) throws IOException {
+        Path script = dir.resolve("fake-vanishing-rsync");
+        StringBuilder body = new StringBuilder();
+        body.append("#!/bin/sh\n");
+        body.append("src=$(eval echo \"\\${$(($#-1))}\")\n");
+        body.append("dst=$(eval echo \"\\${$#}\")\n");
+        body.append("printf '%s\\n' '>f+++++++++|").append(copiedName).append("'\n");
+        body.append("cp \"$src/").append(copiedName).append("\" \"$dst/").append(copiedName).append("\"\n");
+        body.append("printf '%s\\n' '     100   0%   1.23MB/s   00:00:00 (xfr#1, to-chk=1/2)'\n");
+        body.append("printf '%s\\n' '>f+++++++++|").append(vanishedName).append("'\n");
+        body.append("rm -f \"$src/").append(vanishedName).append("\"\n");
+        body.append("printf 'rsync: [receiver] failed to open \"%s/").append(vanishedName)
+                .append("\": No such file or directory (code 2)\\n' \"$src\"\n");
+        body.append("exit 24\n");
+        Files.writeString(script, body.toString(), StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(script, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return script;
+    }
+
     static Path hangingFakeRsync(Path dir, String output, String partialFile) throws IOException {
         Path script = dir.resolve("fake-hanging-rsync");
         StringBuilder body = new StringBuilder();

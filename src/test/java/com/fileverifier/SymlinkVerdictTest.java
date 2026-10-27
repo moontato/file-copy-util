@@ -53,7 +53,14 @@ class SymlinkVerdictTest {
      * was read through the link.
      */
     private static void assertNoReadProblem(JobResult result, String name) {
-        assertTrue(result.warnings().stream().noneMatch(w -> w.startsWith("Could not read file: " + name)),
+        // Two wordings exist for a failed read - the verdict path says "Could not read file:", the source and
+        // destination hashing passes say "Could not read source file:" and "Could not read destination file:".
+        // A job that is not supposed to open the object must not produce either one, whichever pass it comes from.
+        assertTrue(result.warnings().stream()
+                        .noneMatch(w -> (w.startsWith("Could not read file: " + name)
+                                        || w.contains("Could not read file: " + name + " ")
+                                        || w.contains("Could not read source file: " + name)
+                                        || w.contains("Could not read destination file: " + name))),
                 "a job that never opened the target must not report a read problem: " + result.warnings());
     }
 
@@ -203,6 +210,71 @@ class SymlinkVerdictTest {
                     && (w.contains("link text") || w.contains("different text"))), result.warnings().toString());
             assertNoReadProblem(result, "same");
             assertNoReadProblem(result, "other");
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * Two links carrying the same text do not have the same target. Under {@code FOLLOW} the verdict is about
+     * bytes, and the object standing in the destination is a link, which no policy lets this program read
+     * through - so the honest answer is that the two cannot be compared as bytes, never a match inferred from
+     * the words in the link.
+     */
+    @Test
+    void followPolicyDoesNotCallTwoLinksWithTheSameTextAMatch() throws Exception {
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        // The same link text in both trees, and different bytes behind it.
+        TestSupport.write(src.resolve("real"), "GOOD\n");
+        TestSupport.write(dst.resolve("real"), "BAD!\n");
+        Files.createSymbolicLink(src.resolve("a"), Path.of("real"));
+        Files.createSymbolicLink(dst.resolve("a"), Path.of("real"));
+
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            JobResult result = engine.execute(request(src, dst, VERIFY_ONLY,
+                    policy(ScanOptions.SymlinkPolicy.FOLLOW), "a"), null);
+            assertEquals(0, result.filesMatched(),
+                    "identical link text is not identical target content: " + result.message());
+            assertEquals(1, result.filesMismatched(), result.message());
+            assertEquals(0, result.filesExtra(), result.message());
+            assertNull(outcome(result, "a").sourceHash(), "no digest was produced by reading through a link");
+            assertNull(outcome(result, "a").destHash(), "no digest was produced by reading through a link");
+            assertTrue(result.warnings().stream().anyMatch(w -> w.contains("a")
+                            && w.toLowerCase().contains("symbolic link")
+                            && w.contains("not") && w.toLowerCase().contains("read through")),
+                    "the job says why the byte comparison it was asked for could not be made: "
+                            + result.warnings());
+            assertNoReadProblem(result, "a");
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * Under {@code LINK} a link is an object with kind and text, not a window onto something else. The hashing
+     * pass that runs before the copy must not open it: a link to a directory fails the open with "Is a
+     * directory", and a link to a stalled FIFO would stop a job that has nothing to read at all.
+     */
+    @Test
+    void linkPolicyDoesNotOpenTheThingALinkPointsAtWhenHashingTheSource() throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("dir/inner.txt"), "1\n");
+        TestSupport.write(dst.resolve("dir/inner.txt"), "1\n");
+        Files.createSymbolicLink(src.resolve("mirror"), Path.of("dir"));
+        Files.createSymbolicLink(dst.resolve("mirror"), Path.of("dir"));
+
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            JobResult result = engine.execute(request(src, dst, COPY_AND_VERIFY,
+                    policy(ScanOptions.SymlinkPolicy.LINK), "mirror"), null);
+            assertEquals(1, result.filesMatched(), result.message());
+            assertNoReadProblem(result, "mirror");
+            assertTrue(result.warnings().stream().noneMatch(w -> w.contains("Is a directory")),
+                    "nothing tried to read the link as a file: " + result.warnings());
         } finally {
             engine.close();
         }

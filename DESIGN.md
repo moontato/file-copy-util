@@ -362,6 +362,10 @@ link can appear during verification under any policy. It is judged as the link i
 never followed under any policy, including `FOLLOW`: its target may sit outside the destination, and a digest of
 a file belonging to neither directory is not the destination's verdict. A copy replaces a link at that path
 (measured), which is why `FOLLOW` follows the *source* link and still refuses to follow a destination one.
+  Two links with the **same text** are therefore equal only under `LINK`. Under `FOLLOW` the verdict was asked to
+  be about bytes, the destination object is a link, and no policy allows reading through it — so it is a mismatch
+  in kind with the reason stated. This is not a formality: `src/a -> real` and `dst/a -> real` where the two
+  `real` files hold different bytes used to report a match with no digests at all.
 
 **An unreadable locale is a warning with a fix.** File-name encoding comes from the locale, so under `LANG=C`
 non-ASCII names are unrepresentable. The scan skips those entries and says which encoding was in force and
@@ -731,6 +735,19 @@ says, and the disagreement stays on the page instead of being averaged away.
 **Progress unit.** `processed` counts the rows the job reported on, extras included. That is what the progress bar
 counts. It is not `checked`.
 
+### An input that disappears mid-transfer
+
+`rsync` exit 24 says *some* input vanished; which one is this program's question, and it is answered only where both
+sides speak: the name is gone from the source (checked without following links) and the destination holds nothing
+there — nothing now, and nothing before the copy either. Then the name is recorded as `NOT_COPIED`, put in
+`JobResult.vanishedInputs()`, and `--strict` fails the run for it. A name whose transfer cannot be accounted for is
+not called vanished: "gone from the source" and "cannot be shown to have arrived" are different claims, and the
+second belongs to the uncertain figure.
+
+The related attribution rule changed with it: because exit 24 is `rsync` reporting that not everything it announced
+was transferred, it is not treated as a *clean completion* for per-file evidence — only exit 0 is. The job-level rule
+is unchanged: 24 is still a warning, not a failure.
+
 ### Requests that went unanswered, and rules that could not be applied
 
 Two silences that both read as success.
@@ -739,7 +756,8 @@ Two silences that both read as success.
 `--files` that is not there is simply not in it. The job warns and carries on; the names are kept on the job
 (`JobControl.selectedButAbsent`) and reported as a figure — `selectedButAbsent` in JSON, `# selectedAbsent,N` in the
 CSV — so a scheduled run can decide that "did without" is not "did what was asked". That decision is `--strict`, and
-it is deliberately narrow: exit 5 for the unanswered request and nothing else, because a switch that punished
+it is deliberately narrow: exit 5 for an unanswered request - absent when the work set was built, or confirmed to
+have vanished during the transfer - and nothing else, because a switch that punished
 harmless observations (an already-identical file needing no transfer, a destination-only file) would get switched
 off. Refused names, missing/vanished files and an unwritable report already fail the run by themselves.
 

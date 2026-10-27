@@ -172,6 +172,24 @@ final class TransferLedger {
      * @param cleanCompletion the copy phase ran to the end with an exit rsync considers clean
      * @param dryRun          nothing was written at all
      */
+    /**
+     * True when the destination held nothing at this name before the copy and holds nothing there now. That is
+     * the pair of facts that lets a vanished input be reported as not transferred rather than as an unconfirmed
+     * transfer: nothing arrived, and there was nothing there already for rsync to have replaced.
+     */
+    boolean showsNothingAt(String rel) {
+        Before previous = before.get(rel);
+        if (previous == null || previous.exists) {
+            return false;
+        }
+        try {
+            Files.readAttributes(destDir.resolve(rel), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return false;
+        } catch (IOException nothingThere) {
+            return true;
+        }
+    }
+
     FileSyncEngine.TransferDisposition disposition(String rel, boolean cleanCompletion, boolean dryRun) {
         if (dryRun) {
             return FileSyncEngine.TransferDisposition.WOULD_COPY;

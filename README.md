@@ -114,12 +114,19 @@ verdicts, same output. It fails the run for one more thing:
 | --- | --- | --- |
 | a name in `--files`/`--files-from` had no file behind it when the work set was built | warns, exit 0 | warns, **exit 5** |
 | a name was refused (it points outside the directory it belongs to) | exit 1 | exit 1 |
-| a file was missing at the destination, or vanished mid-job | exit 3 | exit 3 |
+| a file verification found missing at the destination | exit 3 | exit 3 |
+| an input that was in the work set and disappeared during the transfer (`rsync` exit 24) | warns, exit 0 — a verifying job usually reports the same file as missing, which is already exit 3 | warns, **exit 5** |
 | a report could not be written | exit 4 | exit 4 |
 
 It does **not** fail a run for an observation: a file that needed no transfer because it was already identical, and
-a file reported as destination-only, are reported and leave the exit code alone. The names that were asked for and
-not found are in the report as well as the terminal: JSON `selectedButAbsent`, CSV `# selectedAbsent,N`.
+a file reported as destination-only, are reported and leave the exit code alone.
+
+The two ways a name can go unhandled are named separately — in the terminal (`vanished: N input file(s) …`), in the
+JSON (`selectedButAbsent`, `vanishedInputs`) and in the CSV (`# selectedAbsent,N`, `# vanished,N`). A vanished input
+and an unconfirmed transfer are different claims: the first says the source no longer has the file and the
+destination never did; the second says the job cannot show what arrived. The exit code is checked in the order
+above, and a report that could not be written outranks a strict finding: a run that cannot record itself is the
+worse failure.
 
 ### An ignore pattern that does not compile says so
 
@@ -246,7 +253,7 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-290 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+295 tests, headless (no display needed): counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
 copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
@@ -314,6 +321,18 @@ CSV carries both as the `transfer` and `verification` columns, JSON as `transfer
 fields, and the window shows the transfer answer in the Results table's `Transfer` column. Both are
 appended after the columns that were already there, so anything already reading `status`, `path` and the
 two digests still reads the same thing.
+
+A symbolic link is judged as the object it is, not as a window onto something else. Under **copy as link**
+(`--symlinks link`) its kind and its link text are the comparison and nothing is read through it. Under **follow
+target** (`--symlinks follow`) the verdict is about the bytes at the end of the *source* link — but a link standing
+in the **destination** is never read through under any policy, because its target may sit outside the destination.
+So two links carrying the same link text whose targets hold different bytes are a **mismatch**, with a warning
+saying why the byte comparison could not run: the same words in a link are not the same bytes behind them.
+
+When `rsync` exits 24 ("some files vanished before they could be transferred") the job still finishes with a
+warning, as it always has. What it does not do is take that exit code as proof about individual files: a name
+`rsync` announced and did not deliver falls back to the destination evidence, and if the source no longer has it and
+the destination never did, it is reported as not copied and counted in the vanished figure below.
 
 ### What a report says about the job itself
 
