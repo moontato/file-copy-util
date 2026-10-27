@@ -607,8 +607,12 @@ that not everything it announced was transferred. Announced-but-undelivered name
 evidence. The job-level rule is unchanged — 24 remains a warning, not a failure — and no existing fixture depended
 on the old attribution.
 
-Suite after the corrections: **295 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
-SpotBugs 0. Mutation coverage and the pinned runs follow in the next commits.
+The conservative half of the third fix has its own fixture: `aVanishedSourceFileWithSomethingAlreadyAtTheDestination
+StaysUncertain` — a source name that disappears while the destination already holds a file stays in the uncertain
+column with `vanishedInputs` empty, because nothing can be claimed about whether rsync replaced it.
+
+Suite after the corrections: **296 tests, 0 failures, 0 errors, 1 skipped** (matrix over local 3.1.3 and 3.4.0),
+SpotBugs 0; **290 green** pinned to 3.1.3. Mutation coverage and the pinned runs follow in the next commits.
 
 ## Phase 5 checkpoint — awaiting acceptance
 

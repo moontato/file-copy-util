@@ -1085,6 +1085,38 @@ class FileSyncEngineTest {
 
     }
 
+    /**
+     * The other side of the vanished-input rule. A name that disappears from the source while its destination
+     * already holds a file is not a vanished non-transfer: something is sitting at the destination, and this
+     * program cannot say whether rsync replaced it. It belongs in the uncertain column, and the vanished figure
+     * stays empty.
+     */
+    @Test
+    void aVanishedSourceFileWithSomethingAlreadyAtTheDestinationStaysUncertain() throws Exception {
+        TestSupport.write(source.resolve("keep.txt"), "keep\n");
+        TestSupport.write(source.resolve("gone.txt"), "gone\n");
+        TestSupport.write(dest.resolve("gone.txt"), "an older file that was already there\n");
+
+        Path fake = TestSupport.vanishingRsync(tools, "keep.txt", "gone.txt");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fake.toString());
+            FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                    FileSyncEngine.JobType.COPY_ONLY,
+                    TestSupport.selection("keep.txt", "gone.txt"), TestSupport.none()),
+                    new TestSupport.Recorder());
+
+            assertAll(
+                    () -> assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message()),
+                    () -> assertEquals(1, result.filesCopied(), "the file that arrived, arrived: " + result),
+                    () -> assertEquals(List.of(), result.vanishedInputs(),
+                            "something is at the destination, so nothing may be claimed about a vanished copy"),
+                    () -> assertEquals(1, result.filesUncertain(), result.toString()));
+        } finally {
+            engine.close();
+        }
+    }
+
     @Test
     void progressWithNoCompletedTransferMeansNothingWasCopied() throws Exception {
         TestSupport.write(source.resolve("big.bin"), "payload\n");
