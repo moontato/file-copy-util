@@ -108,9 +108,13 @@ class RobustnessTest {
                 "what rsync said it completed must not be hidden: " + result.message());
             assertEquals(0, result.filesCopied(),
                 "and nothing may be claimed as copied, because nothing arrived: " + result.message());
-            assertEquals(1, result.filesUncertain(),
-                "a transfer that started and cannot be accounted for is reported as uncertain: "
+            assertEquals(2, result.filesUncertain(),
+                "both the announced transfer and the unannounced selected name remain uncertain: "
                     + result.message());
+            assertEquals(java.util.List.of("a.txt", "b.txt"), result.outcomes().stream()
+                    .map(FileSyncEngine.FileOutcome::relPath).sorted().toList());
+            assertTrue(result.outcomes().stream().allMatch(row -> row.kind().equals("PENDING")
+                    && row.transfer() == FileSyncEngine.TransferDisposition.UNCERTAIN), result.toString());
             assertTrue(result.message().contains("completed 1"), result.message());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("partial")
                     || w.contains("left") || w.contains("hidden")),

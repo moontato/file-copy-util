@@ -815,7 +815,8 @@ class JobOwnershipTest {
                 if [ "$1" = --version ]; then echo 'rsync version 3.2.7'; exit 0; fi
                 src=$(eval echo "\\${$(($#-1))}")
                 dst=$(eval echo "\\${$#}")
-                printf '%s\\n' "$$" > "$dst/process.pid"
+                printf '%s\\n' "$$" > "$dst/process.pid.tmp"
+                mv "$dst/process.pid.tmp" "$dst/process.pid"
                 printf '%s\\n' '>f+++++++++|a.txt'
                 while [ ! -e "$dst/allow-copy" ]; do sleep 0.05; done
                 cp "$src/a.txt" "$dst/a.txt"

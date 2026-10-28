@@ -161,7 +161,11 @@ class CollisionAndRaceTest {
             // stays 0: the stand-in announced the transfer and left a partial file, and the destination cannot
             // show that any complete file arrived.
             assertEquals(0, result.filesCopied(), result.message());
-            assertEquals(1, result.filesUncertain(), result.message());
+            assertEquals(2, result.filesUncertain(), result.message());
+            assertEquals(java.util.List.of("data", "later"), result.outcomes().stream()
+                    .map(FileSyncEngine.FileOutcome::relPath).sorted().toList());
+            assertTrue(result.outcomes().stream().allMatch(row -> row.kind().equals("PENDING")
+                    && row.transfer() == FileSyncEngine.TransferDisposition.UNCERTAIN), result.toString());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains(".data.AAAAAA")),
                 "the half-written file rsync left behind has to be named: " + result.warnings());
             assertTrue(result.warnings().stream().anyMatch(w -> w.contains("No space left")),
