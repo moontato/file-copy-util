@@ -1697,12 +1697,12 @@ public class FileSyncEngine implements AutoCloseable {
                 if (control.cancelRequested()) {
                     return abortedBeforeTransfer("Job " + abortWords(control.cause())
                             + " before rsync started: no file was transferred." + limitPhrase(control),
-                            outcomes, errors, warnings, verifies, control.cause());
+                            workSet, progress, outcomes, errors, warnings, listener, verifies, control);
                 }
                 if (control.timedOut()) {
                     return abortedBeforeTransfer("Job stopped on timeout: it passed the "
                             + humanDuration(jobTimeoutMillis) + " limit before rsync had started.",
-                            outcomes, errors, warnings, verifies, AbortCause.TIMED_OUT);
+                            workSet, progress, outcomes, errors, warnings, listener, verifies, control);
                 }
 
                 Process process = new ProcessBuilder(
@@ -3363,7 +3363,22 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
-    /** A job that was stopped before rsync was ever run: nothing moved, and it must not claim otherwise. */
+    /** The work set is known and rsync never started: the absence of a process, not missing output, is proof. */
+    private JobResult abortedBeforeTransfer(String message, List<FileEntry> workSet, ProgressReporter progress,
+                                            List<FileOutcome> outcomes, List<String> errors, List<String> warnings,
+                                            ProgressListener listener, boolean verifies, JobControl control) {
+        Map<String, TransferDisposition> transfers = new LinkedHashMap<>();
+        for (FileEntry entry : workSet) {
+            transfers.put(entry.relPath(), TransferDisposition.NOT_COPIED);
+        }
+        recordInterruptedTransfers(verifies, progress, outcomes, listener, transfers, warnings);
+        String full = verifies ? message : message + " Verification was off, so nothing was compared.";
+        return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, transfers.size(), 0, 0, 0, 0,
+                outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause(),
+                control.selectedButAbsent(), control.vanishedInputs());
+    }
+
+    /** A job stopped before its work set was built: no selected-file dispositions can be asserted yet. */
     private JobResult abortedBeforeTransfer(String message, List<FileOutcome> outcomes, List<String> errors,
                                             List<String> warnings, boolean verifies, AbortCause cause) {
         String full = verifies ? message : message + " Verification was off, so nothing was compared.";

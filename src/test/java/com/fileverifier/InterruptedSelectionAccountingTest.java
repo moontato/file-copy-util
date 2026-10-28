@@ -202,6 +202,45 @@ class InterruptedSelectionAccountingTest {
     }
 
     @Test
+    void cancellationBeforeSpawnAccountsForKnownWorkSetAndCappedRows() throws Exception {
+        assumeTrue(TestSupport.rsyncAvailable(), "requires real rsync");
+        for (JobType type : List.of(JobType.COPY_ONLY, JobType.COPY_AND_VERIFY)) {
+            for (boolean dryRun : List.of(false, true)) {
+                Path base = Files.createDirectories(tmp.resolve(type.name() + "-" + dryRun));
+                Path src = Files.createDirectories(base.resolve("src"));
+                Path dst = Files.createDirectories(base.resolve("dst"));
+                TestSupport.write(src.resolve("a.txt"), "a");
+                TestSupport.write(src.resolve("b.txt"), "b");
+                try (FileSyncEngine engine = new FileSyncEngine()) {
+                    engine.setResultLimit(1);
+                    JobResult result = engine.execute(TestSupport.request(src, dst, type,
+                            TestSupport.selection("a.txt", "b.txt"), TestSupport.selection(),
+                            ScanOptions.DEFAULTS, false, dryRun), new ProgressListener() {
+                                @Override public void onPhase(String phase) {
+                                    if ("copying".equals(phase) || "dry run".equals(phase)) engine.cancel();
+                                }
+                                @Override public void onCompletion(JobResult result) { }
+                            });
+                    assertEquals(JobStatus.FAILED, result.status(), result.toString());
+                    assertEquals(FileSyncEngine.AbortCause.USER_CANCELLED, result.abortCause(), result.toString());
+                    assertEquals(0, result.filesCopied(), result.toString());
+                    assertEquals(0, result.filesWouldCopy(), result.toString());
+                    assertEquals(0, result.filesUncertain(), result.toString());
+                    assertEquals(2, result.filesNotTransferred(), result.toString());
+                    assertEquals(0, result.transfersAnnounced(), result.toString());
+                    assertEquals(1, result.outcomes().size(), result.toString());
+                    assertEquals(1, result.rowsOmitted(), result.toString());
+                    assertEquals(TransferDisposition.NOT_COPIED, result.outcomes().get(0).transfer());
+                    assertEquals(type == JobType.COPY_AND_VERIFY ? "PENDING" : "NOT_COPIED",
+                            result.outcomes().get(0).kind());
+                    assertFalse(Files.exists(dst.resolve("a.txt")));
+                    assertFalse(Files.exists(dst.resolve("b.txt")));
+                }
+            }
+        }
+    }
+
+    @Test
     void cancellationDuringVerificationDoesNotCallAnUnannouncedNameNotCopied() throws Exception {
         assumeTrue(TestSupport.rsyncAvailable(), "requires real rsync");
         Path src = Files.createDirectories(tmp.resolve("src"));
