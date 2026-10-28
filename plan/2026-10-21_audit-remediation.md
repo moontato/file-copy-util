@@ -1,30 +1,24 @@
 # Audit remediation plan — File Copy Util (revision 22)
 
-> Latest status: Phase 4 and Phase 5 are accepted for their reviewed scopes. Phase 6 responsiveness has a
-> local checkpoint awaiting review; its evidence and limits are recorded at the end. GitHub validation has not run.
+> **Current review status (2026-10-28):** Phases 1–6 are technically accepted for their reviewed
+> scopes, through `5a5c1f5`. The owner published `remediation/audit`; CI-trigger fix `841c359` is published and
+> its first GitHub validation run was observed in progress, not yet passed. Older status sections below
+> are checkpoint history, not the latest disposition. Technical acceptance is not integration/release permission.
 
-**Date:** 2026-10-21, status updated 2026-10-23
+**Date:** 2026-10-21, current review/migration summary updated 2026-10-28
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
-**Status:** approved and under way, revision 12 — **Phase 4 accepted by the owner** (the reviewed scope: `fbb9b61`,
-`33737ab`, `da6b124`; the evidence wording of the close/admission fixture corrected in `eee48d0`), and **Phase 5 is
-under way**: §2.13's symlink-verdict rule (item 1) and the §2.13 counter-truth rule (item 2) are implemented and
-green, item 4 (CSV formula neutralisation) is implemented and green — which closes the one hardening item the
-changelog had been carrying as "not done" — and item 5 (`--strict`, and invalid ignore patterns) is implemented and
-green. **Phase 5 is complete and awaits acceptance** (the checkpoint below). Earlier: Phase 4 remains
-awaiting acceptance for the reviewed scope. Item 2 changes what two published figures *mean* (`copied`, `checked`) — the change is stated in
-DESIGN §20 and the changelog, and the expectations that encoded the old meanings were rewritten to the approved
-ones rather than loosened. Phase 6 responsiveness stays out of scope, as agreed. Earlier: Phase 4's job-ownership work was corrected twice: first for four lifecycle holes (closing disarming the watchdog; a stopped job with no counters having no report at all; admission racing terminal publication; a forced completion running on the watchdog) and for cancellation not stopping hashing; then for the remaining blocker from the next review, **a close that could miss a job being admitted**. The earlier four are confirmed fixed by the reviewer's own probes; the close-vs-admission race is closed by putting admission and closing in one critical section. Phase 4 remains awaiting acceptance. Phase 0a, Phase 0b, Phase 1, **Phase 2 (write safety, including the five
-corrections from your source review)**, the two Phase 2 closeout items (publication that cannot replace, and alias-aware
-report targets), **Phase 3 (selection authority, with collision acceptance bound to the job)** plus its export-pairing
-correction, and the **Phase 4 remainder (job ownership: per-job abort controller, bounded terminal delivery, shutdown-hook
-ownership, cancellation causality, and the measured completion-evidence protocol)** are implemented and green on this
-machine, along with the part of Phase 4 that gates 1.5.0 (per-file transfer records for interrupted copy jobs) and the
-matrix-isolation follow-up. Phase 0b's workflows are written and reviewed but **have not been run on
-GitHub**, so its gate is specified rather than demonstrated. Matrix status is qualified as agreed: local evidence for
-3.1.3 and 3.4.0, GitHub coverage pending for all four and local for 3.2.7/3.3.0. Next: your review of the Phase 4
-checkpoint below; then Phase 5 (the scheduled §2.13 hardening, including CSV formula-character neutralisation) only on
-go-ahead. Branch `remediation/audit`; `main` is held at the approved baseline commit `0069285`, `pom.xml` is still
-1.4.0, and no merge, push, tag, version bump or release is authorised by this checkpoint.
+**Current status:** local remediation through Phase 6 is reviewed and accepted within its stated limits.
+Phase 4 acceptance includes `fbb9b61` / `33737ab` / `da6b124`; Phase 5 closeout includes `51a2cd4` / `d9e37a4`;
+Phase 6 includes `8df7154` / `fbaa79c` / `5a5c1f5`. Local independent validation at the last application checkpoint:
+321 tests, 0 failures/errors, 1 conditional skip, SpotBugs 0 (rsync 3.1.3 + 3.4.0). Separate pinned runs were
+implementer-reported as 315 green each. These are not four-version or rendered-window evidence.
+
+**Next:** inspect [the first GitHub run](https://github.com/moontato/file-copy-util/actions/runs/40652661744)
+for `841c359`, re-establish the development environment on the new server, and obtain a separate human go-ahead
+before Phase 7 packaging work. The whole-suite four-version matrix is configured but has not yet supplied a
+reviewed successful result. The branch is `remediation/audit`; the local audit baseline `main` is `0069285`,
+`pom.xml` is still 1.4.0, and no remediation merge, tag, version bump, or release has occurred. The owner authorized
+and performed the branch push for CI; older "nothing pushed" and "awaiting acceptance" entries below are historical.
 
 ## Revision log (v4, from your second review)
 

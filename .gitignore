@@ -6,6 +6,9 @@ apache-maven-*/
 scratch/
 *.png
 
+# local temporary files and private handoffs
+/tmp/
+
 # editors and OS noise
 .idea/
 *.iml
