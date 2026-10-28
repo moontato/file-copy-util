@@ -624,29 +624,80 @@ class JobOwnershipTest {
     }
 
     @Test
+    void aCompletedBeforeCloseFakeDoesNotProveAWriteAfterClose(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(TestSupport.fakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt", 0).toString());
+            CountDownLatch completed = new CountDownLatch(1);
+            AtomicReference<JobResult> outcome = new AtomicReference<>();
+            JobRequest job = request(src, dst, JobType.COPY_ONLY, "a.txt");
+            Thread caller = new Thread(() -> {
+                try { outcome.set(engine.execute(job, null)); }
+                finally { completed.countDown(); }
+            });
+            caller.start();
+            assertTrue(completed.await(20, TimeUnit.SECONDS), "job did not finish before close");
+            caller.join(10_000);
+            assertFalse(caller.isAlive());
+            assertEquals(JobStatus.COMPLETED, outcome.get().status(), outcome.get().toString());
+            assertFalse(Files.exists(dst.resolve("a.txt")), "the stand-in never copies a file");
+            // The old oracle (COMPLETED && !copiedAtClose) is true even though execute returned before close.
+            engine.closeOnce();
+            assertTrue(outcome.get().status() == JobStatus.COMPLETED && !Files.exists(dst.resolve("a.txt")),
+                    "this ordered case demonstrates the old predicate's false positive");
+            assertFalse(engine.isRunning());
+            TestSupport.assertNoProcessesRunning("rsync", "after a job completed before close");
+        }
+    }
+
+    @Test
+    void aRealFileCompletedBeforeCloseRemainsAValidCompletion(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(TestSupport.copyingFakeRsync(Files.createDirectories(tmp.resolve("fake")),
+                    ">f+++++++++|a.txt").toString());
+            JobResult result = engine.execute(request(src, dst, JobType.COPY_ONLY, "a.txt"), null);
+            assertEquals(JobStatus.COMPLETED, result.status(), result.toString());
+            assertEquals("a\n", Files.readString(dst.resolve("a.txt")));
+            engine.closeOnce();
+            assertEquals("a\n", Files.readString(dst.resolve("a.txt")));
+            assertFalse(engine.isRunning());
+            TestSupport.assertNoProcessesRunning("rsync", "after a real file completed before close");
+        }
+    }
+
+    @Test
     void aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped(@TempDir Path tmp) throws Exception {
         assumeRealRsync();
         Path src = Files.createDirectories(tmp.resolve("src"));
         Path dst = Files.createDirectories(tmp.resolve("dst"));
         TestSupport.write(src.resolve("a.txt"), "a\n");
         Path fakeDir = Files.createDirectories(tmp.resolve("fake"));
+        Path fake = fakeRsyncGatedUntilAfterClose(fakeDir);
 
-        // The reproduced race: a job is being admitted exactly as the program closes. Only two endings are
-        // acceptable - the close was marked first and the job is refused, or the job got in and the close
-        // captured and stopped it. What must never happen is a close that returned having never seen the job,
-        // which then copies with the watchdog already retired.
+        // The child cannot complete a copy until the closer creates its gate after closeOnce returns.
+        // Thus a successful copy, a surviving owned PID, or a file appearing after close is observable
+        // evidence of continued work, rather than an inference from an announcement by a no-write fake.
         for (int round = 0; round < 40; round++) {
             // A destination of its own per round, so a file left by one round can never be mistaken for a
             // file written by the next one.
             Path roundDest = Files.createDirectories(dst.resolve("r" + round));
             FileSyncEngine engine = new FileSyncEngine();
-            engine.useRsync(TestSupport.fakeRsync(fakeDir, ">f+++++++++|a.txt", 0).toString());
+            engine.useRsync(fake.toString());
             engine.setJobTimeoutMillis(20_000L);
             JobRequest request = request(src, roundDest, JobType.COPY_ONLY, "a.txt");
             AtomicReference<JobResult> outcome = new AtomicReference<>();
             AtomicReference<Throwable> thrown = new AtomicReference<>();
             AtomicBoolean runningAtClose = new AtomicBoolean();
             AtomicBoolean copiedAtClose = new AtomicBoolean();
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
             final int r = round;
 
             Thread caller = new Thread(() -> {
@@ -657,9 +708,14 @@ class JobOwnershipTest {
                 }
             }, "caller-" + r);
             Thread closer = new Thread(() -> {
-                engine.closeOnce();
-                runningAtClose.set(engine.isRunning());
-                copiedAtClose.set(Files.exists(roundDest.resolve("a.txt")));
+                try {
+                    engine.closeOnce();
+                    runningAtClose.set(engine.isRunning());
+                    copiedAtClose.set(Files.exists(roundDest.resolve("a.txt")));
+                    Files.writeString(roundDest.resolve("allow-copy"), "close returned");
+                } catch (Throwable t) {
+                    closeFailure.set(t);
+                }
             }, "closer-" + r);
             caller.start();
             closer.start();
@@ -667,6 +723,9 @@ class JobOwnershipTest {
             closer.join(30_000);
             assertFalse(caller.isAlive(), "round " + round + ": the caller never came back");
             assertFalse(closer.isAlive(), "round " + round + ": the close never came back");
+            assertNull(closeFailure.get(), "round " + round + ": close or gate failed: " + closeFailure.get());
+            assertFalse(runningAtClose.get(), "round " + round + ": engine still running when close returned");
+            assertFalse(copiedAtClose.get(), "round " + round + ": the gated child copied before its gate");
 
             JobResult result = outcome.get();
             if (result == null) {
@@ -677,15 +736,18 @@ class JobOwnershipTest {
                     fail("round " + round + ": the destination stayed claimed with no job holding it: "
                             + result.message());
                 }
-                if (result.status() == JobStatus.COMPLETED && !copiedAtClose.get()) {
-                    fail("round " + round + ": close() had already returned with nothing copied, and the job"
-                            + " then copied anyway - close missed the controller it had admitted. running at"
-                            + " close=" + runningAtClose.get() + ", result=" + result);
-                }
+                assertEquals(JobStatus.FAILED, result.status(),
+                        "round " + round + ": the gated job completed after close: " + result);
             }
             assertFalse(engine.isRunning(), "round " + round + ": the engine is still running after closing");
-            assertFalse(Files.exists(roundDest.resolve("a.txt")) && !copiedAtClose.get(),
-                    "round " + round + ": a file appeared after close() returned");
+            assertFalse(Files.exists(roundDest.resolve("a.txt")),
+                    "round " + round + ": a gated copy appeared after close() returned");
+            Path pidFile = roundDest.resolve("process.pid");
+            if (Files.exists(pidFile)) {
+                long pid = Long.parseLong(Files.readString(pidFile).trim());
+                assertTrue(TestSupport.waitFor(() -> ProcessHandle.of(pid).map(p -> !p.isAlive()).orElse(true),
+                        10_000), "round " + round + ": the gated rsync process survived close: " + pid);
+            }
             try {
                 TestSupport.assertNoProcessesRunning("rsync", "in round " + round + " of closing vs admission");
             } finally {
@@ -701,6 +763,70 @@ class JobOwnershipTest {
             assertFalse(claims.contains(key),
                     "the job in round " + round + " left its destination claim behind: " + key);
         }
+    }
+
+    @Test
+    void aStartedGatedCopyIsStoppedBeforeThePostCloseGateOpens(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        Path fake = fakeRsyncGatedUntilAfterClose(Files.createDirectories(tmp.resolve("fake")));
+        try (FileSyncEngine engine = new FileSyncEngine()) {
+            engine.useRsync(fake.toString());
+            JobRequest job = request(src, dst, JobType.COPY_ONLY, "a.txt");
+            AtomicReference<JobResult> result = new AtomicReference<>();
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            Thread caller = new Thread(() -> {
+                try { result.set(engine.execute(job, null)); }
+                catch (Throwable t) { thrown.set(t); }
+            }, "started-gated-copy");
+            caller.start();
+            try {
+                Path pidFile = dst.resolve("process.pid");
+                awaitMarker(pidFile);
+                long pid = Long.parseLong(Files.readString(pidFile).trim());
+                assertTrue(ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false),
+                        "the marked owned process was not running before close");
+                assertFalse(Files.exists(dst.resolve("a.txt")));
+                engine.closeOnce();
+                Files.writeString(dst.resolve("allow-copy"), "close returned");
+                caller.join(30_000);
+                assertFalse(caller.isAlive());
+                assertNull(thrown.get(), String.valueOf(thrown.get()));
+                assertNotNull(result.get());
+                assertEquals(JobStatus.FAILED, result.get().status(), result.get().toString());
+                assertEquals(AbortCause.ENGINE_CLOSED, result.get().abortCause(), result.get().toString());
+                assertFalse(Files.exists(dst.resolve("a.txt")), "the process copied after close");
+                assertTrue(TestSupport.waitFor(() -> ProcessHandle.of(pid).map(p -> !p.isAlive()).orElse(true),
+                        10_000), "the owned process survived close: " + pid);
+                TestSupport.assertNoProcessesRunning("rsync", "after stopping a started gated copy");
+            } finally {
+                engine.closeOnce();
+                caller.join(30_000);
+            }
+        }
+    }
+
+    private static Path fakeRsyncGatedUntilAfterClose(Path dir) throws IOException {
+        Path fake = dir.resolve("fake-gated-rsync");
+        String script = """
+                #!/bin/sh
+                if [ "$1" = --version ]; then echo 'rsync version 3.2.7'; exit 0; fi
+                src=$(eval echo "\\${$(($#-1))}")
+                dst=$(eval echo "\\${$#}")
+                printf '%s\\n' "$$" > "$dst/process.pid"
+                printf '%s\\n' '>f+++++++++|a.txt'
+                while [ ! -e "$dst/allow-copy" ]; do sleep 0.05; done
+                cp "$src/a.txt" "$dst/a.txt"
+                exit 0
+                """;
+        Files.writeString(fake, script);
+        Files.setPosixFilePermissions(fake, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return fake;
     }
 
     // ------------------------------------------------------------------ hashing that keeps reading

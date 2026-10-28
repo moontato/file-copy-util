@@ -1731,7 +1731,7 @@ public class FileSyncEngine implements AutoCloseable {
                 // exit then says nothing about the individual files. The destination evidence decides instead.
                 // The job's own status is unaffected: 24 stays a warning, not a failure.
                 boolean cleanCopy = !control.timedOut() && !control.cancelRequested() && rsyncExitCode == 0;
-                transfers = transferFacts(ledger, announcedNames, cleanCopy, dryRun);
+                transfers = transferFacts(ledger, workSet, announcedNames, cleanCopy, dryRun, warnings);
                 if (rsyncExitCode == 24) {
                     applyVanishedInputs(control, workSet, transfers, ledger, destDir, warnings);
                 }
@@ -1771,11 +1771,7 @@ public class FileSyncEngine implements AutoCloseable {
             // A dry run wrote nothing, so its rows are named for what would have happened. An export that
             // says COPIED for a file that was never written would be a record of an event that did not occur.
             recordTransferRows(progress, outcomes, listener, transfers, warnings);
-            if (progress.copied() > announcedNames.size()) {
-                warnings.add("Only the first " + announcedNames.size() + " copied file(s) are listed; the copy"
-                        + " reported " + progress.copied() + ". Raise the results limit (--max-results) if"
-                        + " the export must name every file.");
-            }
+            warnTruncatedRows(progress, outcomes, warnings);
             if (control.timedOut()) {
                 return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
             }
@@ -1801,8 +1797,31 @@ public class FileSyncEngine implements AutoCloseable {
             // file the destination shows a file, and a verdict taken afterwards cannot say what it replaced.
             warnings.addAll(ledger.kindChanges());
         }
-        verifyEntries(control, workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
-                warnings, !copies, transfers, options.symlinkPolicy());
+        Set<String> verifiedNames = verifyEntries(control, workSet, extras, destDir, sourceHashes, progress,
+                outcomes, listener, warnings, !copies, transfers, options.symlinkPolicy());
+        if (copies && (control.timedOut() || control.cancelRequested())) {
+            // A clean copy can have unannounced names. Once the overall job is interrupted, do not turn
+            // that missing observation into a claim of non-transfer, including on an already recorded row.
+            for (FileEntry entry : workSet) {
+                transfers.putIfAbsent(entry.relPath(), TransferDisposition.UNCERTAIN);
+            }
+            for (int i = 0; i < outcomes.size(); i++) {
+                FileOutcome row = outcomes.get(i);
+                TransferDisposition transfer = transfers.get(row.relPath());
+                if (transfer != null && transfer != row.transfer()) {
+                    outcomes.set(i, new FileOutcome(row.relPath(), row.kind(), row.sourceHash(), row.destHash(), transfer));
+                }
+            }
+            tally = TransferTally.of(transfers);
+            // verifiedNames includes rows omitted by the cap. Emit one pending verdict per remaining input.
+            for (FileEntry entry : workSet) {
+                if (!verifiedNames.contains(entry.relPath())) {
+                    recordOutcome(progress, outcomes, listener, entry.relPath(), "PENDING", null, null,
+                            transfers.get(entry.relPath()));
+                }
+            }
+            warnTruncatedRows(progress, outcomes, warnings);
+        }
         if (control.timedOut()) {
             return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
         }
@@ -1810,15 +1829,7 @@ public class FileSyncEngine implements AutoCloseable {
             return cancelledDuringVerify(control, progress, tally, outcomes, errors, warnings);
         }
 
-        int omittedRows = rowsOmitted(progress, outcomes);
-        if (omittedRows > 0) {
-            // The test is a row that did not make it into the report, not a report that happens to be as long as
-            // the limit allows. A one-file job with a limit of one lists every file it handled, and a warning
-            // saying otherwise teaches the reader to ignore the warnings.
-            warnings.add("Results list truncated at " + resultLimit + " entries; " + omittedRows
-                    + " row(s) the job produced are not listed. Counters are still exact. "
-                    + (dryRun ? "" : "Raise it (CLI: --max-results N) if the export must list every file."));
-        }
+        warnTruncatedRows(progress, outcomes, warnings);
 
         if (control.timedOut()) {
             return timeoutResult(control, progress, tally, outcomes, errors, warnings, destinationTargets, dryRun, verifies);
@@ -1874,6 +1885,15 @@ public class FileSyncEngine implements AutoCloseable {
      */
     private static int rowsOmitted(ProgressReporter progress, List<FileOutcome> outcomes) {
         return Math.max(0, progress.rowCount() - outcomes.size());
+    }
+
+    private void warnTruncatedRows(ProgressReporter progress, List<FileOutcome> outcomes, List<String> warnings) {
+        int omitted = rowsOmitted(progress, outcomes);
+        if (omitted > 0) {
+            warnings.add("Results list truncated at " + resultLimit + " entries; " + omitted
+                    + " row(s) the job produced are not listed. Counters are still exact."
+                    + " Raise it (CLI: --max-results N) if the export must list every file.");
+        }
     }
 
     /**
@@ -1983,21 +2003,33 @@ public class FileSyncEngine implements AutoCloseable {
      * still has the same identity, nothing can: the bytes on disk are the ones that were there already.
      * Those files are reported as UNCERTAIN rather than counted as copied.
      */
-    private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger,
+    private static Map<String, TransferDisposition> transferFacts(TransferLedger ledger, List<FileEntry> workSet,
                                                                   List<String> announced, boolean cleanCopy,
-                                                                  boolean dryRun) {
-        // Always a collection this job can enrich. An exit-24 job may have nothing to attribute and still gain
-        // entries from what the two ends can be seen to hold, and an immutable empty map made that throw.
+                                                                  boolean dryRun, List<String> warnings) {
         Map<String, TransferDisposition> facts = new LinkedHashMap<>();
-        if (announced.isEmpty()) {
-            return facts;
-        }
+        Set<String> selected = new HashSet<>(namesOf(workSet));
+        Set<String> unexpected = new java.util.TreeSet<>();
         for (String rel : announced) {
-            // No ledger means no before-state, which means nothing may be claimed - except a dry run, where
-            // the honest answer is "would have been copied" and nothing was written.
-            facts.put(rel, ledger == null
+            if (!selected.contains(rel)) {
+                unexpected.add(rel);
+                continue;
+            }
+            // Repeated announcements are still only one selected file and one disposition.
+            facts.putIfAbsent(rel, ledger == null
                     ? (dryRun ? TransferDisposition.WOULD_COPY : TransferDisposition.UNCERTAIN)
                     : ledger.disposition(rel, cleanCopy, dryRun));
+        }
+        if (!unexpected.isEmpty()) {
+            warnings.add("rsync announced names outside the selected work set: " + describeNames(new ArrayList<>(unexpected))
+                    + ". They are not attributed to selected files.");
+        }
+        if (!cleanCopy) {
+            // The destination can advance while our output reader is delayed. No consumed announcement is
+            // not evidence that rsync did, or did not, transfer the name. Exit 24 may subsequently establish
+            // a vanished non-transfer using its independent before/after checks.
+            for (FileEntry entry : workSet) {
+                facts.putIfAbsent(entry.relPath(), TransferDisposition.UNCERTAIN);
+            }
         }
         return facts;
     }
@@ -2040,6 +2072,7 @@ public class FileSyncEngine implements AutoCloseable {
         } else {
             recordTransferRows(progress, outcomes, listener, transfers, warnings);
         }
+        warnTruncatedRows(progress, outcomes, warnings);
     }
 
     /**
@@ -2255,7 +2288,7 @@ public class FileSyncEngine implements AutoCloseable {
      * are consumed in work-set order, so the results list and any export stay deterministic even though
      * the hashing runs in parallel.
      */
-    private void verifyEntries(JobControl control, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
+    private Set<String> verifyEntries(JobControl control, List<FileEntry> workSet, List<FileEntry> extras, Path destDir,
                                Map<String, String> knownSourceHashes, ProgressReporter progress,
                                List<FileOutcome> outcomes, ProgressListener listener,
                                List<String> warnings, boolean verifyOnly,
@@ -2263,8 +2296,9 @@ public class FileSyncEngine implements AutoCloseable {
                                ScanOptions.SymlinkPolicy linkPolicy)
             throws NoSuchAlgorithmException, InterruptedException {
         int total = workSet.size() + extras.size();
+        Set<String> verifiedNames = new HashSet<>();
         if (total == 0) {
-            return;
+            return verifiedNames;
         }
         int threads = Math.min(MAX_HASH_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
         ExecutorService pool = Executors.newFixedThreadPool(threads, runnable -> {
@@ -2330,6 +2364,7 @@ public class FileSyncEngine implements AutoCloseable {
                 case "MISMATCH" -> progress.countMismatched();
                 default -> progress.countExtra();
             }
+            verifiedNames.add(verdict.relPath());
             recordOutcome(progress, outcomes, listener, verdict.relPath(), verdict.kind(),
                     verdict.sourceHash(), verdict.destHash(),
                     transfers.getOrDefault(verdict.relPath(), TransferDisposition.NOT_COPIED));
@@ -2355,6 +2390,7 @@ public class FileSyncEngine implements AutoCloseable {
                     + ". Under FOLLOW the verdict is about the contents at the end of the link, not about the"
                     + " link itself; a link pointing outside the two directories takes that read outside them.");
         }
+        return verifiedNames;
     }
 
     private static String quoted(String value) {
