@@ -53,6 +53,16 @@ class TailLogTest {
     }
 
     @Test
+    void retainedTextIsBoundedEvenForOversizedIndividualLines() {
+        TailLog log = new TailLog(10, 2);
+        for (int i = 0; i < 100; i++) log.append("x".repeat(100_000));
+        assertTrue(log.trackedLines() <= 12);
+        assertTrue(log.text().length() <= 12 * (TailLog.MAX_LINE_CHARS + 30));
+        assertTrue(log.text().contains("display text shortened"));
+        assertTrue(log.text().contains("older log lines dropped"));
+    }
+
+    @Test
     void nothingIsDroppedBelowTheLimit() {
         TailLog log = new TailLog(5000, 1000);
         for (int i = 0; i < 200; i++) {

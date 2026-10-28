@@ -331,6 +331,8 @@ final class TestSupport {
         Path script = dir.resolve("fake-hanging-rsync");
         StringBuilder body = new StringBuilder();
         body.append("#!/bin/sh\n");
+        // The engine probes each binary with --version; that probe must not enter the transfer hang.
+        body.append("if [ \"$1\" = --version ]; then echo 'rsync version 3.2.7'; exit 0; fi\n");
         body.append("printf '%s\\n' ").append(shellQuote(output)).append('\n');
         if (partialFile != null) {
             // The engine passes source and destination as the last two arguments; the eval turns

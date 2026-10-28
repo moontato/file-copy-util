@@ -492,6 +492,7 @@ public class FileSyncEngine implements AutoCloseable {
     private final AtomicInteger lateResultsDropped = new AtomicInteger();
     /** Cleanup runs once, however many callers ask for it. */
     private final AtomicBoolean closeStarted = new AtomicBoolean(false);
+    private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
     private volatile boolean closed;
     /** The one collision answer on record: that set, for that job. */
     private volatile CollisionAcceptance collisionAcceptance;
@@ -922,6 +923,18 @@ public class FileSyncEngine implements AutoCloseable {
         return true;
     }
 
+    /** Capture and mark this job now; process termination may block and runs away from the caller. */
+    boolean cancelInBackground() {
+        JobControl control = currentControl.get();
+        if (control == null) return false;
+        control.requestCancel(AbortCause.USER_CANCELLED);
+        markActivity(control, "cancel requested");
+        Thread terminator = new Thread(control::terminate, "sync-ui-cancel");
+        terminator.setDaemon(true);
+        terminator.start();
+        return true;
+    }
+
     @Override
     public void close() {
         closeOnce();
@@ -938,8 +951,36 @@ public class FileSyncEngine implements AutoCloseable {
      * controller is no longer the current one.
      */
     public void closeOnce() {
+        Runnable cleanup = beginClose();
+        if (cleanup != null) {
+            try { cleanup.run(); } finally { closeFinished.countDown(); }
+        }
+    }
+
+    /** Close admission synchronously, then perform process cleanup outside the caller (typically the EDT). */
+    void closeInBackground(Runnable finished) {
+        Runnable cleanup = beginClose();
+        Thread closer = new Thread(() -> {
+            try {
+                if (cleanup != null) {
+                    try { cleanup.run(); } finally { closeFinished.countDown(); }
+                } else {
+                    closeFinished.await();
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } finally {
+                finished.run();
+            }
+        }, "sync-ui-close");
+        // Keep the JVM alive until the owned process tree has been cleaned up, even after the last window closes.
+        closer.setDaemon(false);
+        closer.start();
+    }
+
+    private Runnable beginClose() {
         if (!closeStarted.compareAndSet(false, true)) {
-            return;
+            return null;
         }
         final JobControl control;
         synchronized (lifecycleLock) {
@@ -950,8 +991,12 @@ public class FileSyncEngine implements AutoCloseable {
             closed = true;
             control = currentControl.get();
         }
+        if (control != null) control.requestCancel(AbortCause.ENGINE_CLOSED);
+        return () -> finishClose(control);
+    }
+
+    private void finishClose(JobControl control) {
         if (control != null) {
-            control.requestCancel(AbortCause.ENGINE_CLOSED);
             control.terminate();
             // Give the job's own thread a bounded moment to publish what it knows while its process dies...
             Thread worker = control.worker.get();

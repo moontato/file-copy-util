@@ -23,7 +23,7 @@ public final class FileVerifierFrame extends JFrame {
     public FileVerifierFrame() {
         // The long name stays here: it is the window's title, not the project's coordinate.
         setTitle("File Verifier & Copier");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setSize(1150, 820);
         setMinimumSize(new java.awt.Dimension(820, 600));
         setLocationRelativeTo(null);
@@ -33,9 +33,12 @@ public final class FileVerifierFrame extends JFrame {
         view = new FileVerifierView();
         setContentPane(view);
         addWindowListener(new WindowAdapter() {
+            private boolean closing;
             @Override
             public void windowClosing(WindowEvent e) {
-                view.shutdown();
+                if (closing) return;
+                closing = true;
+                view.shutdownAsync(FileVerifierFrame.this::dispose);
             }
         });
     }

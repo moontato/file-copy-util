@@ -21,6 +21,8 @@ public final class TailLog {
     public static final int DEFAULT_MAX_LINES = 5000;
     /** Extra lines allowed past the limit before a batch is dropped, to avoid churn per line. */
     public static final int DEFAULT_DROP_BATCH = 1000;
+    /** Upper bound per display line; exports and engine results are not shortened. */
+    public static final int MAX_LINE_CHARS = 4096;
 
     private final JTextArea area = new JTextArea();
     private final Deque<Integer> lineLengths = new ArrayDeque<>();
@@ -49,7 +51,9 @@ public final class TailLog {
     }
 
     public void append(String line) {
-        String withNewline = line + "\n";
+        String display = line.length() > MAX_LINE_CHARS
+                ? line.substring(0, MAX_LINE_CHARS) + "… [display text shortened]" : line;
+        String withNewline = display + "\n";
         area.append(withNewline);
         lineLengths.addLast(withNewline.length());
         if (lineLengths.size() > maxLines + dropBatch) {

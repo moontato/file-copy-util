@@ -2,6 +2,16 @@
 
 ## Unreleased — audit remediation, first phases
 
+### Changed — live GUI responsiveness
+
+- Live file-display events are bounded and may be suppressed under load, with a visible count. Progress is
+  coalesced; phase transitions and the authoritative completed result remain separate. Results, exports and
+  exit codes do not depend on which live lines reached the window.
+- Cancelling and closing a window no longer wait for process termination on the Swing event thread. Close still
+  prevents new jobs immediately and waits for owned cleanup before disposing the frame.
+- The retained live log bounds both line count and individual display-line length; long display text is marked
+  as shortened. Results and exported names are not shortened.
+
 ### Fixed — four gaps found in review of the Phase 5 work
 
 - **A verification match that was never a comparison.** Under `--symlinks follow`, two symbolic links carrying the

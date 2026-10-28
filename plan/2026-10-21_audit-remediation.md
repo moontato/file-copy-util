@@ -1,7 +1,7 @@
-# Audit remediation plan — File Copy Util (revision 20)
+# Audit remediation plan — File Copy Util (revision 21)
 
-> Latest status: Phase 4 remains accepted. Phase 5 remains **pending owner acceptance**; the unannounced
-> disappearance closeout is recorded at the end of this document. GitHub validation has not run.
+> Latest status: Phase 4 and Phase 5 are accepted for their reviewed scopes. Phase 6 responsiveness has a
+> local checkpoint awaiting review; its evidence and limits are recorded at the end. GitHub validation has not run.
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
@@ -1234,3 +1234,43 @@ remains pending; Phase 4 remains accepted. This is an accounting correction, not
 - The exact authorized normal push of `36851cb960bcd4809d5082728ac86d6ee0bdd990` was attempted and failed with
   `No anonymous write access`; no push occurred. No CI URL or GitHub matrix evidence exists. 3.2.7 and 3.3.0 remain
   unmeasured here. This push authorization does not extend to the later fix commit.
+
+## Phase 6 responsiveness checkpoint (revision 21)
+
+Owner accepted Phase 5 through `d9e37a4`; `8df7154` was an unreviewed partial Phase 6 checkpoint, not acceptance.
+The present work is local; it does not extend the push authorization for `d9e37a4`.
+
+**Structural bounds.** A per-view `UiDrainScheduler` holds at most one pending EDT drain, even across replaced job
+identities. Each `UiJobEvents` holds at most 256 pending file-display lines, at most 2,048 characters per live
+line/status (plus a short clipping marker), one latest progress/status, and a four-slot representation of the
+engine's finite phase sequence. An unexpected future phase is coalesced in one extra slot rather than allowed to
+throw from a display callback. A drain processes at most 64 file lines, except that terminal delivery discards the
+remaining display lines and counts them as suppressed so completion is not queued behind them. The result, counters,
+exports and CLI exit policy remain engine-owned. The view checks the identity on every sink callback; after completion
+late events are ignored. `TailLog` retains at most its line limit plus its batch allowance, with a 4,096-character
+per-line cap and explicit shortening text. It is a display tail, not an archive.
+
+**Close/cancel.** The UI cancellation path captures and marks the current job controller before handing its process
+termination to a background thread. Close marks the engine closed and captures the controller under the existing
+lifecycle lock before starting background cleanup; the frame disposes only after cleanup. A non-daemon closer keeps
+the JVM alive during that cleanup. Engine synchronous close remains available to non-UI callers. No process waiting,
+joining or callback runs inside the lifecycle lock.
+
+**Evidence.** `UiJobEventsTest` exercises 10,000 synthetic file/status events with an explicitly blocked EDT and a
+separate deterministic scheduler: one scheduled drain, 256 pending lines, latest status in the first drain, exact
+suppression, phase and completion delivery, and stale-generation isolation. A separate test switches 10,000 job
+identities while one drain is queued. A headless view fixture distinguishes 10,000 suppressed display events from
+two actual omitted result rows and checks a mismatch counter in the authoritative result. `UiCancellationTest`
+uses a TERM-resistant shell stand-in: cancel and close handlers return on the EDT, the job publishes a result, the
+owned parent and its previously observed descendants exit, and close refuses new admission. This is headless panel/seam and real-EDT coverage, not
+rendered-window testing; it is not a proof of all scheduling interleavings or a benchmark of a real 10,000-file copy.
+The earlier 50,000-row filter fixture bounds model notifications, not row construction, sorting, rendering or EDT
+execution time. There is no hard wall-clock latest-status guarantee while the EDT is blocked or overloaded.
+
+One headless run of `clean verify` measured: latest status **0.116 ms after releasing the deliberately blocked EDT**;
+cancel handler **0.759 ms** and close handler **0.984 ms** on the EDT with a TERM-resistant stand-in. These are
+single observations, not configured time bounds or worst-case latency. Structural configuration is reported above.
+The complete run was **319 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0; whole-suite pinned runs were
+**313 green on 3.1.3** and **313 green on 3.4.0**. A prior full run failed a timeout fixture because its fake rsync
+could hang during `--version`; the same failure was reproduced at baseline `8df7154`. The fixture's version probe
+now exits promptly, without changing its cancellation assertions. No GitHub execution or 3.2.7/3.3.0 evidence exists.

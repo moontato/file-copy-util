@@ -121,6 +121,9 @@ public final class FileVerifierView extends JPanel {
 
     /** One engine per window: it owns at most one job at a time. */
     private final FileSyncEngine engine = new FileSyncEngine();
+    /** EDT-owned identity: callbacks belonging to a previous job cannot update this job's display. */
+    private UiJobEvents activeEvents;
+    private final UiDrainScheduler displayScheduler = new UiDrainScheduler(SwingUtilities::invokeLater);
 
     /** Kept so the Results tab can be re-filtered or exported after the job ends. */
     /**
@@ -198,6 +201,15 @@ public final class FileVerifierView extends JPanel {
         // closeOnce, not close: the engine may already have been stopped by a shutdown hook, and two
         // cleanups waiting on one process tree is how a program hangs on exit instead of exiting.
         engine.closeOnce();
+    }
+
+    /** Called on the EDT by the frame: close admission now, but wait for process cleanup off the EDT. */
+    void shutdownAsync(Runnable finished) {
+        livenessTimer.stop();
+        savePreferences();
+        setJobControlsEnabled(false);
+        cancelButton.setEnabled(false);
+        engine.closeInBackground(() -> SwingUtilities.invokeLater(finished));
     }
 
     // ------------------------------------------------------------------ layout
@@ -1032,7 +1044,7 @@ public final class FileVerifierView extends JPanel {
         cancelButton.setEnabled(false);
         log("Cancellation requested - terminating rsync...");
         statusLabel.setText("Cancelling...");
-        engine.cancel();
+        engine.cancelInBackground();
     }
 
     /** Liveness display driven by a timer, not by rsync output (a long transfer is silent). */
@@ -1182,46 +1194,9 @@ public final class FileVerifierView extends JPanel {
         // selection, returned earlier, so the finished job already on screen keeps its own pairing. The
         // completion callback below names the request it belongs to; there is no "current request" field for a
         // later job to overwrite.
-        if (!engine.start(request, new FileSyncEngine.ProgressListener() {
-            @Override
-            public void onPhase(String phase) {
-                SwingUtilities.invokeLater(() -> {
-                    phaseLabel.setText("Phase: " + phase);
-                    log(phase + "...");
-                    if ("copying".equals(phase) && !explanationShown) {
-                        // Measured behaviour of rsync, and the single most confusing thing about a large
-                        // copy: the file you are waiting for is in the destination the whole time, under a
-                        // hidden name, and only gets its real name at the end of its transfer.
-                        explanationShown = true;
-                        log("  rsync writes each file as a hidden temporary file in its destination folder"
-                            + " (for example .big.iso.qjX7kX) and renames it to its real name only when that"
-                            + " file's transfer is complete. A large file therefore appears in the"
-                            + " destination at the end of its copy, not the start - show hidden files in"
-                            + " your file manager to watch it grow.");
-                    }
-                });
-            }
-
-            @Override
-            public void onProgress(int percent, String statusText) {
-                SwingUtilities.invokeLater(() -> {
-                    statusLabel.setText(statusText);
-                    progressBar.setValue(Math.max(0, Math.min(100, percent)));
-                });
-            }
-
-            @Override
-            public void onFileProcessed(String relPath, String kind, String srcHash, String dstHash) {
-                SwingUtilities.invokeLater(() -> log(formatFileLine(kind, relPath, srcHash, dstHash)));
-            }
-
-            @Override
-            public void onCompletion(FileSyncEngine.JobResult result) {
-                // The request is captured in this closure: it is the one this callback describes, not whatever
-                // the window is thinking about now.
-                SwingUtilities.invokeLater(() -> finishJob(request, result));
-            }
-        })) {
+        UiJobEvents events = beginJobDisplay(request);
+        if (!engine.start(request, events)) {
+            activeEvents = null;
             inform("A job is already running.", "Job Running", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -1230,7 +1205,55 @@ public final class FileVerifierView extends JPanel {
         livenessTimer.start();
     }
 
-    private static String formatFileLine(String kind, String relPath, String srcHash, String dstHash) {
+    /** Install a display generation on the EDT; old queued callbacks cannot update it. */
+    UiJobEvents beginJobDisplay(FileSyncEngine.JobRequest request) {
+        UiJobEvents[] identity = new UiJobEvents[1];
+        long[] suppressedTotal = {0};
+        UiJobEvents events = new UiJobEvents(task -> displayScheduler.submit(identity[0], task), new UiJobEvents.Sink() {
+            private boolean current() { return activeEvents == identity[0]; }
+
+            @Override public void phase(String phase) {
+                if (!current()) return;
+                phaseLabel.setText("Phase: " + phase);
+                log(phase + "...");
+                if ("copying".equals(phase) && !explanationShown) {
+                    explanationShown = true;
+                    log("  rsync writes each file as a hidden temporary file in its destination folder"
+                        + " (for example .big.iso.qjX7kX) and renames it to its real name only when that"
+                        + " file's transfer is complete. A large file therefore appears in the"
+                        + " destination at the end of its copy, not the start - show hidden files in"
+                        + " your file manager to watch it grow.");
+                }
+            }
+            @Override public void progress(int percent, String text) {
+                if (!current()) return;
+                statusLabel.setText(text);
+                progressBar.setValue(Math.max(0, Math.min(100, percent)));
+            }
+            @Override public void line(String line) { if (current()) log(line); }
+            @Override public void suppressed(long count) {
+                if (!current()) return;
+                suppressedTotal[0] += count;
+                log("  " + count + " live display event(s) suppressed; job results and counters are unaffected.");
+            }
+            @Override public void complete(FileSyncEngine.JobResult result) {
+                if (!current()) return;
+                activeEvents = null;
+                finishJob(request, result);
+                // The final warning list can itself be long enough to trim an earlier suppression notice.
+                // Repeat the cumulative display-only count after those warnings, without changing the result.
+                if (suppressedTotal[0] > 0 && activeEvents == null) {
+                    log("  Total: " + suppressedTotal[0] + " live display event(s) suppressed; job results and counters are unaffected.");
+                }
+            }
+        });
+        identity[0] = events;
+        activeEvents = events;
+        displayScheduler.activate(events);
+        return events;
+    }
+
+    static String formatFileLine(String kind, String relPath, String srcHash, String dstHash) {
         String icon = switch (kind) {
             case "OK" -> "[OK]       ";
             case "MISMATCH" -> "[MISMATCH] ";
@@ -1241,7 +1264,7 @@ public final class FileVerifierView extends JPanel {
             case "WOULD_COPY" -> "[WOULD COPY]";
             default -> "[INFO]     ";
         };
-        StringBuilder line = new StringBuilder("  ").append(icon).append(relPath);
+        StringBuilder line = new StringBuilder("  ").append(icon).append(RsyncNameCodec.forDisplay(relPath));
         if (srcHash != null && !srcHash.isEmpty()) {
             line.append("  src=").append(srcHash);
         }
