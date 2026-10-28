@@ -274,6 +274,41 @@ class FileVerifierViewTest {
     }
 
     @Test
+    void filteringAtDefaultResultLimitPublishesOneTableChangePerReplacement() throws Exception {
+        FileVerifierView view = build();
+        JTable table = (JTable) field(view, "resultsTable");
+        JCheckBox onlyProblems = (JCheckBox) field(view, "onlyProblemsCheck");
+        List<FileSyncEngine.FileOutcome> outcomes = new java.util.ArrayList<>();
+        for (int i = 0; i < FileSyncEngine.MAX_OUTCOMES; i++) {
+            outcomes.add(new FileSyncEngine.FileOutcome("file-" + i, i % 2 == 0 ? "OK" : "MISMATCH", null, null));
+        }
+        FileSyncEngine.JobResult result = new FileSyncEngine.JobResult(
+                FileSyncEngine.JobStatus.COMPLETED, "done", 0, 0, 0, 0, 0, 0, 0,
+                outcomes, List.of(), List.of());
+        java.lang.reflect.Method show = FileVerifierView.class.getDeclaredMethod("showResults", FileSyncEngine.JobResult.class);
+        show.setAccessible(true);
+        java.util.concurrent.atomic.AtomicInteger notifications = new java.util.concurrent.atomic.AtomicInteger();
+        table.getModel().addTableModelListener(event -> notifications.incrementAndGet());
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                show.invoke(view, result);
+                assertEquals(FileSyncEngine.MAX_OUTCOMES, table.getRowCount());
+                assertEquals(1, notifications.get(), "one notification, not one per row");
+                onlyProblems.setSelected(true);
+                // The view has no completed job in this fixture, so its listener clears the table. Populate
+                // explicitly with the same immutable result to exercise the filter at the supported limit.
+                notifications.set(0);
+                show.invoke(view, result);
+                assertEquals(FileSyncEngine.MAX_OUTCOMES / 2, table.getRowCount());
+                assertEquals(1, notifications.get(), "filtering publishes one replacement notification");
+                assertEquals("MISMATCH", table.getValueAt(0, 0));
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
+    @Test
     void resultsTableHasAHeaderSoColumnsCanBeSorted() throws Exception {
         FileVerifierView view = build();
         JTable table = (JTable) field(view, "resultsTable");

@@ -489,13 +489,7 @@ public final class FileVerifierView extends JPanel {
         logScrollPane = new JScrollPane(logArea);
         UiTheme.edge(logScrollPane);
 
-        resultsTable = UiTheme.table(new DefaultTableModel(
-            new Object[]{"Status", "Path", "Source SHA-256", "Destination SHA-256", "Transfer"}, 0) {
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
-        });
+        resultsTable = UiTheme.table(new ResultsTableModel());
         resultsTable.setAutoCreateRowSorter(true);
         resultsTable.setDefaultRenderer(Object.class, new OutcomeCellRenderer());
         resultsTable.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
@@ -1389,17 +1383,39 @@ public final class FileVerifierView extends JPanel {
 
     // ------------------------------------------------------------------ results (3.3)
 
+    private static final class ResultsTableModel extends DefaultTableModel {
+        private static final long serialVersionUID = 1L;
+
+        ResultsTableModel() {
+            super(new Object[]{"Status", "Path", "Source SHA-256", "Destination SHA-256", "Transfer"}, 0);
+        }
+
+        @Override
+        public boolean isCellEditable(int row, int column) {
+            return false;
+        }
+
+        void replaceRows(List<Object[]> rows) {
+            // Preserve column configuration and sorter while replacing all rows with one model notification.
+            dataVector.clear();
+            for (Object[] row : rows) {
+                dataVector.add(convertToVector(row));
+            }
+            fireTableDataChanged();
+        }
+    }
+
     private void showResults(FileSyncEngine.JobResult result) {
-        DefaultTableModel table = (DefaultTableModel) resultsTable.getModel();
-        table.setRowCount(0);
+        ResultsTableModel table = (ResultsTableModel) resultsTable.getModel();
         if (result == null) {
+            table.replaceRows(List.of());
             resultsTable.setEnabled(false);
             exportCsvButton.setEnabled(false);
             exportJsonButton.setEnabled(false);
             outputTabs.setTitleAt(1, "Results");
             return;
         }
-        int shown = 0;
+        List<Object[]> rows = new ArrayList<>(result.outcomes().size());
         for (FileSyncEngine.FileOutcome outcome : result.outcomes()) {
             // A file that was written, or would have been, is not a problem: it is the job's own record of
             // what it did. Only a comparison verdict that failed, or a file that is not where it should be,
@@ -1411,7 +1427,7 @@ public final class FileVerifierView extends JPanel {
             if (onlyProblemsCheck.isSelected() && !problem) {
                 continue;
             }
-            table.addRow(new Object[]{
+            rows.add(new Object[]{
                 outcome.kind(),
                 // Escaped for display only: a name with a newline in it would otherwise break the row
                 // apart, and the filter box would offer a match on text that is not part of the name.
@@ -1422,8 +1438,9 @@ public final class FileVerifierView extends JPanel {
                 // from the verdict, and a stopped job has to be able to show COPIED next to UNCERTAIN.
                 outcome.transfer() == null ? "" : outcome.transfer().name()
             });
-            shown++;
         }
+        table.replaceRows(rows);
+        int shown = rows.size();
         resultsTable.setEnabled(true);
         exportCsvButton.setEnabled(true);
         exportJsonButton.setEnabled(true);
