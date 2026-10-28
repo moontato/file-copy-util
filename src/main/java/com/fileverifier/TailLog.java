@@ -21,7 +21,7 @@ public final class TailLog {
     public static final int DEFAULT_MAX_LINES = 5000;
     /** Extra lines allowed past the limit before a batch is dropped, to avoid churn per line. */
     public static final int DEFAULT_DROP_BATCH = 1000;
-    /** Upper bound per display line; exports and engine results are not shortened. */
+    /** Maximum retained payload characters per line; a shortening marker is appended when clipped. */
     public static final int MAX_LINE_CHARS = 4096;
 
     private final JTextArea area = new JTextArea();

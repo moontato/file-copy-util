@@ -491,6 +491,11 @@ public class FileSyncEngine implements AutoCloseable {
     /** Results published by a job the engine had already let go. Counted, never applied. */
     private final AtomicInteger lateResultsDropped = new AtomicInteger();
     /** Cleanup runs once, however many callers ask for it. */
+    private volatile java.util.function.Consumer<Runnable> cancellationWorkerLauncher = task -> {
+        Thread terminator = new Thread(task, "sync-ui-cancel");
+        terminator.setDaemon(true);
+        terminator.start();
+    };
     private final AtomicBoolean closeStarted = new AtomicBoolean(false);
     private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
     private volatile boolean closed;
@@ -555,6 +560,8 @@ public class FileSyncEngine implements AutoCloseable {
         private final long deadlineNanos;
         private final AtomicReference<ProgressListener> listener;
         private final AtomicBoolean cancelRequested = new AtomicBoolean();
+        /** One UI cancellation worker per job, even when Escape or direct callers repeat the request. */
+        private final AtomicBoolean backgroundCancellationScheduled = new AtomicBoolean();
         private final AtomicReference<AbortCause> cause = new AtomicReference<>(AbortCause.NONE);
         /**
          * Names this job was asked for that had no file behind them at scan time. Per job, not per engine:
@@ -929,10 +936,21 @@ public class FileSyncEngine implements AutoCloseable {
         if (control == null) return false;
         control.requestCancel(AbortCause.USER_CANCELLED);
         markActivity(control, "cancel requested");
-        Thread terminator = new Thread(control::terminate, "sync-ui-cancel");
-        terminator.setDaemon(true);
-        terminator.start();
+        if (control.backgroundCancellationScheduled.compareAndSet(false, true)) {
+            try {
+                cancellationWorkerLauncher.accept(control::terminate);
+            } catch (RuntimeException | Error failedToSchedule) {
+                // A rejected launch has not scheduled cleanup. Permit a later request to retry it.
+                control.backgroundCancellationScheduled.set(false);
+                throw failedToSchedule;
+            }
+        }
         return true;
+    }
+
+    /** Test seam for holding a scheduled worker without racing the operating system's process termination. */
+    void setCancellationWorkerLauncher(java.util.function.Consumer<Runnable> launcher) {
+        cancellationWorkerLauncher = java.util.Objects.requireNonNull(launcher);
     }
 
     @Override

@@ -1,4 +1,4 @@
-# Audit remediation plan — File Copy Util (revision 21)
+# Audit remediation plan — File Copy Util (revision 22)
 
 > Latest status: Phase 4 and Phase 5 are accepted for their reviewed scopes. Phase 6 responsiveness has a
 > local checkpoint awaiting review; its evidence and limits are recorded at the end. GitHub validation has not run.
@@ -1241,14 +1241,15 @@ Owner accepted Phase 5 through `d9e37a4`; `8df7154` was an unreviewed partial Ph
 The present work is local; it does not extend the push authorization for `d9e37a4`.
 
 **Structural bounds.** A per-view `UiDrainScheduler` holds at most one pending EDT drain, even across replaced job
-identities. Each `UiJobEvents` holds at most 256 pending file-display lines, at most 2,048 characters per live
-line/status (plus a short clipping marker), one latest progress/status, and a four-slot representation of the
+identities. Each `UiJobEvents` holds at most 256 pending file-display lines; each live line/status retains at
+most 2,048 payload characters plus an additional shortening marker when clipped. It holds one latest progress/status
+and a four-slot representation of the
 engine's finite phase sequence. An unexpected future phase is coalesced in one extra slot rather than allowed to
 throw from a display callback. A drain processes at most 64 file lines, except that terminal delivery discards the
 remaining display lines and counts them as suppressed so completion is not queued behind them. The result, counters,
 exports and CLI exit policy remain engine-owned. The view checks the identity on every sink callback; after completion
-late events are ignored. `TailLog` retains at most its line limit plus its batch allowance, with a 4,096-character
-per-line cap and explicit shortening text. It is a display tail, not an archive.
+late events are ignored. `TailLog` retains at most its line limit plus its batch allowance, with at most 4,096
+payload characters per line plus an additional shortening marker when clipped. It is a display tail, not an archive.
 
 **Close/cancel.** The UI cancellation path captures and marks the current job controller before handing its process
 termination to a background thread. Close marks the engine closed and captures the controller under the existing
@@ -1274,3 +1275,27 @@ The complete run was **319 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0;
 **313 green on 3.1.3** and **313 green on 3.4.0**. A prior full run failed a timeout fixture because its fake rsync
 could hang during `--version`; the same failure was reproduced at baseline `8df7154`. The fixture's version probe
 now exits promptly, without changing its cancellation assertions. No GitHub execution or 3.2.7/3.3.0 evidence exists.
+
+### Phase 6 review correction: repeated background cancellation
+
+The owner independently found that Escape bypassed the disabled cancel button and 64 actions created 64
+`sync-ui-cancel` threads. Phase 6 acceptance remains pending; Phase 4 and Phase 5 remain accepted for their
+reviewed scopes. The push authorization remains scoped to `d9e37a4`.
+
+`cancelInBackground()` still captures and marks the intended controller immediately. A controller-owned atomic
+guard now schedules at most one background cancellation worker for that job, including calls made directly rather
+than through the button. The guard is not shared across jobs; scheduling failure resets it for retry. Close does
+not rely on the guard and performs its own cleanup; the controller's existing first-cause rule remains authoritative.
+
+The fixture holds the worker launcher rather than racing process termination. Before the fix, 64 actual Escape
+ActionMap invocations plus 64 direct background-cancel calls scheduled **128** workers; afterwards they schedule
+**one**. It then closes the engine, asserts terminal delivery and `USER_CANCELLED` first cause, checks the observed
+TERM-resistant parent and descendants are gone, and executes the delayed old worker. A second fixture starts a
+new job while the previous worker is held: running that old worker leaves the new job alive, and the new controller
+can schedule its own worker. These are headless real-process fixtures with a controlled scheduling seam; they do not
+establish rendered-window behavior or all operating-system process-tree interleavings.
+
+Validation: combined rsync 3.1.3/3.4.0 `clean verify` **321 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0.
+Whole suite pinned separately: **315 green** on 3.1.3 and **315 green** on 3.4.0. One headless combined run measured
+latest status **0.072 ms** after EDT release, cancel handler **0.393 ms**, and close handler **0.875 ms**; these
+single observations are not latency bounds. GitHub workflow execution and rsync 3.2.7/3.3.0 evidence remain absent.
