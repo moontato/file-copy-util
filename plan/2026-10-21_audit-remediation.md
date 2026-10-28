@@ -1,4 +1,7 @@
-# Audit remediation plan — File Copy Util (revision 18)
+# Audit remediation plan — File Copy Util (revision 20)
+
+> Latest status: Phase 4 remains accepted. Phase 5 remains **pending owner acceptance**; the unannounced
+> disappearance closeout is recorded at the end of this document. GitHub validation has not run.
 
 **Date:** 2026-10-21, status updated 2026-10-23
 **Input:** `AUDIT.md` (A01–A15 + hardening), owner review of revisions 2 and 3.
@@ -1210,3 +1213,24 @@ Two things for you to decide when you run it from an authenticated environment:
    `validate.yml` now runs the **whole suite** pinned to each of 3.1.3, 3.2.7, 3.3.0 and 3.4.0 (it used to name nine
    suites, which silently left the newer safety suites out). So the only remaining gap for a four-version claim is
    execution, not scope — 3.2.7 and 3.3.0 have never been built here.
+
+## Phase 5 closeout: unannounced unexplained disappearance (revision 20)
+
+The owner independently reproduced a selected source and pre-existing destination both disappearing during an
+exit-24 run without an itemize announcement. The result had no rows and no uncertain count. Phase 5 acceptance
+remains pending; Phase 4 remains accepted. This is an accounting correction, not a change to strict exit policy.
+
+- `51a2cd4` adds an `UNCERTAIN` entry when a missing source cannot meet the measured non-transfer rule and no
+  transfer entry exists; `putIfAbsent` preserves any stronger existing disposition. The warning no longer claims
+  rsync started every uncertain file.
+- The regression was red first: one name at a limit of one gave `filesUncertain=0`, no rows, and a misleading
+  completion headline. The fixture now checks one and two names, capped and uncapped; status, exit code, rows,
+  `vanishedInputs`, dispositions, headline, warning and strict exit behavior. It passes after the fix.
+- Two focused mutations in a disposable worktree based on `51a2cd4` were caught: removing the new insertion, and
+  reintroducing a warning that claims rsync started the files. Both worktrees were clean at that baseline before
+  and after; the mutation runs were targeted, not the whole suite.
+- Combined 3.1.3/3.4.0 `clean verify`: **308 tests, 0 failures, 0 errors, 1 skipped**, SpotBugs 0. Whole suite
+  pinned separately: **302 green** on 3.1.3 and **302 green** on 3.4.0.
+- The exact authorized normal push of `36851cb960bcd4809d5082728ac86d6ee0bdd990` was attempted and failed with
+  `No anonymous write access`; no push occurred. No CI URL or GitHub matrix evidence exists. 3.2.7 and 3.3.0 remain
+  unmeasured here. This push authorization does not extend to the later fix commit.
