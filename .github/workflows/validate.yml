@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y rsync
-          rsync --version | head -1
+          rsync --version | awk 'NR == 1 {print}'
 
       - name: Build and run tests
         run: mvn -B -ntp clean verify
@@ -110,9 +110,18 @@ jobs:
             esac
             tar xzf "$work/rsync-$version.tar.gz" -C "$work"
             (cd "$work/rsync-$version"
+              # Backport only poptDupArgv from upstream's popt 1.19 update (rsync PR #592,
+              # commit 4c8683c8753f2493ef13c3425fb5847960a6e305). On glibc >= 2.38 with
+              # _FORTIFY_SOURCE=3 the 3.3.0 bundled popt aborts in __strlcpy_chk even for
+              # a simple local copy (upstream issue #589). Apply only after digest verification;
+              # this does not replace the release or disable compiler protections.
+              if [ "$version" = 3.3.0 ]; then
+                patch --batch --forward -p1 < "$GITHUB_WORKSPACE/.github/patches/rsync-3.3.0-popt-fortify.patch"
+              fi
               ./configure --disable-openssl --disable-xxhash --disable-zstd --disable-lz4 > /dev/null
               make -j"$(nproc)" > /dev/null)
-            "$work/rsync-$version/rsync" --version | head -1
+            # Consume the full output: head -1 can SIGPIPE rsync under pipefail.
+            "$work/rsync-$version/rsync" --version | awk 'NR == 1 {print}'
           done
           binaries=$(ls "$work"/rsync-*/rsync | paste -sd,)
           echo "count=$(ls "$work"/rsync-*/rsync | wc -l)"
@@ -128,10 +137,29 @@ jobs:
           for version in 3.1.3 3.2.7 3.3.0 3.4.0; do
             bin="$work/rsync-$version/rsync"
             test -x "$bin" || { echo "missing rsync $version build" >&2; exit 1; }
-            "$bin" --version | head -1 | grep -q "rsync  version $version" \
-              || { echo "rsync build for $version reports something else" >&2; "$bin" --version | head -1; exit 1; }
+            "$bin" --version | awk 'NR == 1 {print}' | grep -q "rsync  version $version" \
+              || { echo "rsync build for $version reports something else" >&2; "$bin" --version | awk 'NR == 1 {print}'; exit 1; }
             echo "rsync $version built and identified"
           done
+
+      # Exercise the upstream crash directly as well as the engine's NUL-delimited files-from shape.
+      - name: Check rsync 3.3.0 local copies outside Java
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/rsync-matrix"
+          bin="$work/rsync-3.3.0/rsync"
+          probe="$work/direct-probe"
+          mkdir -p "$probe/src/sub" "$probe/simple" "$probe/selected"
+          printf 'alpha\n' > "$probe/src/#a"
+          printf 'beta\n' > "$probe/src/sub/b"
+          "$bin" -a "$probe/src/" "$probe/simple/"
+          cmp "$probe/src/#a" "$probe/simple/#a"
+          cmp "$probe/src/sub/b" "$probe/simple/sub/b"
+          printf './#a\0./sub/b\0' > "$probe/list"
+          "$bin" -a --checksum --itemize-changes --info=progress2 --from0 \
+            '--out-format=%i|%n' --files-from="$probe/list" "$probe/src" "$probe/selected"
+          cmp "$probe/src/#a" "$probe/selected/#a"
+          cmp "$probe/src/sub/b" "$probe/selected/sub/b"
 
       # The safety fixtures - names, an interrupted overwrite, the process tree, collisions, symlink
       # verdicts, the counter families - are the point of the matrix, so each version has to face them

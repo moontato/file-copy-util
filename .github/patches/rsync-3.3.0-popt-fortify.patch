@@ -1,0 +1,8 @@
+--- a/popt/poptparse.c
++++ b/popt/poptparse.c
+@@ -36,0 +37 @@
++    *dst = '\0';
+@@ -41 +42,2 @@
+-	dst += strlcpy(dst, argv[i], nb) + 1;
++	dst = stpcpy(dst, argv[i]);
++	dst++;	/* trailing NUL */
