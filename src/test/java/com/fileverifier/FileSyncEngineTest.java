@@ -1366,6 +1366,60 @@ class FileSyncEngineTest {
     }
 
     @Test
+    void unannouncedNamesGoneFromBothEndsStayInTheAccounting() throws Exception {
+        // One unexplained disappearance must retain one row; two with a one-row cap must omit exactly one.
+        // Repeat with an uncapped list to establish that the cap changes only the retained rows, not the facts.
+        for (int count : List.of(1, 2)) {
+            for (int limit : List.of(1, 10)) {
+                List<String> names = count == 1 ? List.of("gone.txt") : List.of("gone.txt", "other.txt");
+                for (String name : names) {
+                    TestSupport.write(source.resolve(name), "source\n");
+                    TestSupport.write(dest.resolve(name), "previous destination\n");
+                }
+                Path fake = TestSupport.vanishingRsyncWithoutAnnouncements(tools, "gone.txt");
+                // Extend the scripted fixture: no announcements, and both ends lose the selected names.
+                String script = Files.readString(fake).replace("exit 24\n",
+                        "dst=$(eval echo \"\\${$#}\")\n"
+                        + "rm -f \"$dst/gone.txt\" \"$src/other.txt\" \"$dst/other.txt\"\nexit 24\n");
+                Files.writeString(fake, script);
+                try (FileSyncEngine engine = new FileSyncEngine()) {
+                    engine.useRsync(fake.toString());
+                    engine.setResultLimit(limit);
+                    FileSyncEngine.JobResult result = engine.execute(TestSupport.request(source, dest,
+                            FileSyncEngine.JobType.COPY_ONLY,
+                            TestSupport.selection(names.toArray(String[]::new)), TestSupport.none()),
+                            new TestSupport.Recorder());
+                    assertAll("count=" + count + ", limit=" + limit,
+                            () -> assertEquals(FileSyncEngine.JobStatus.COMPLETED, result.status(), result.message()),
+                            () -> assertEquals(24, result.rsyncExitCode()),
+                            () -> assertEquals(count, result.filesUncertain(), result.toString()),
+                            () -> assertEquals(0, result.filesNotTransferred()),
+                            () -> assertEquals(0, result.filesCopied()),
+                            () -> assertEquals(0, result.transfersAnnounced()),
+                            () -> assertEquals(List.of(), result.vanishedInputs()),
+                            () -> assertEquals(Math.min(count, limit), result.rowsListed()),
+                            () -> assertEquals(Math.max(0, count - limit), result.rowsOmitted()),
+                            () -> assertEquals(count > limit, result.truncated()),
+                            () -> assertTrue(result.outcomes().stream().allMatch(row ->
+                                    row.transfer() == FileSyncEngine.TransferDisposition.UNCERTAIN
+                                    && row.kind().equals("UNCERTAIN")), result.outcomes().toString()),
+                            () -> assertTrue(result.message().contains("0 file(s) provably copied"), result.message()),
+                            () -> assertTrue(result.message().contains(count + " with an unconfirmed transfer"),
+                                    result.message()),
+                            () -> assertEquals(Cli.EXIT_OK, Cli.exitCode(result, true),
+                                    "strict policy does not punish uncertain observations"),
+                            () -> assertFalse(result.warnings().stream().anyMatch(w ->
+                                    w.contains("rsync started them") || w.contains("rsync announced")),
+                                    result.warnings().toString()),
+                            () -> assertTrue(result.warnings().stream().anyMatch(w ->
+                                    w.contains("gone.txt") && w.contains("cannot be confirmed")),
+                                    result.warnings().toString()));
+                }
+            }
+        }
+    }
+
+    @Test
     void progressWithNoCompletedTransferMeansNothingWasCopied() throws Exception {
         TestSupport.write(source.resolve("big.bin"), "payload\n");
 

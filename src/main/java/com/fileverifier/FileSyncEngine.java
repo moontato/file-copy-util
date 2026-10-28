@@ -1956,10 +1956,10 @@ public class FileSyncEngine implements AutoCloseable {
                     fact.getValue());
         }
         if (!unresolved.isEmpty()) {
-            warnings.add(unresolved.size() + " file(s) had a transfer that cannot be confirmed: rsync"
-                    + " started them and the job stopped before it finished, and the destination cannot show"
-                    + " whether the bytes arrived - a file that was already there, of the same size, looks"
-                    + " exactly the same either way. Re-run the job with verification to check them: "
+            warnings.add(unresolved.size() + " file(s) had a transfer that cannot be confirmed: the available"
+                    + " source and destination evidence cannot establish whether the bytes arrived. This does"
+                    + " not establish that a transfer started. Re-run the job with"
+                    + " verification to check them: "
                     + describeNames(unresolved) + ".");
         }
     }
@@ -2880,8 +2880,13 @@ public class FileSyncEngine implements AutoCloseable {
                 // unconfirmed transfer rather than vanishing from the report or being called a non-transfer.
                 transfers.putIfAbsent(rel, TransferDisposition.UNCERTAIN);
                 couldNotTell.add(rel);
+            } else {
+                // The source is absent, but the destination's before/after states do not prove a non-transfer.
+                // In particular, PRESENT -> ABSENT is an unexplained disappearance, not an empty destination.
+                // Keep any stronger attribution already established for an announced name; without an
+                // announcement there is no entry to preserve, so retain the name explicitly as uncertain.
+                transfers.putIfAbsent(rel, TransferDisposition.UNCERTAIN);
             }
-            // Otherwise something stands at that name, and the ledger's own verdict about it decides.
         }
         vanished.sort(java.util.Comparator.naturalOrder());
         if (!vanished.isEmpty()) {

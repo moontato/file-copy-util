@@ -28,6 +28,15 @@
   per-file `transfer` figure: a name `rsync` announced and did not deliver falls back to the destination evidence
   instead of being reported `COPIED`.
 
+### Fixed — unannounced unexplained disappearances remain in the report
+
+- An exit-24 run could lose a selected name from the accounting when both source and pre-existing destination
+  disappeared without an itemize announcement. The name now gets an `UNCERTAIN` outcome even if no announcement
+  created a transfer entry. It is not a confirmed vanished non-transfer: `vanishedInputs` stays empty and
+  `NOT_COPIED` is not claimed. Capped rows and the headline count it consistently; strict exit policy is unchanged.
+- The uncertainty warning no longer says rsync started every uncertain file: some names have no announcement at
+  all. It describes the lack of completion evidence without inventing a transfer start.
+
 ### Fixed — three boundary cases in that exit-24 path, found in the next review round
 
 - **A vanished input with no `rsync` announcement aborted the job.** An exit-24 run that had not itemized anything
