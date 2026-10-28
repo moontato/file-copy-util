@@ -2,10 +2,10 @@ name: build
 
 on:
   push:
-    # Tag pushes are handled by release.yml, which runs the same validation through the reusable
-    # workflow; running both would build the same commit twice.
-    tags-ignore:
-      - "v*"
+    # Explicitly include all branches, including names containing '/'. Defining only tags-ignore
+    # would disable branch pushes. Tag pushes are handled separately by release.yml.
+    branches:
+      - "**"
   pull_request:
   workflow_dispatch:
 
