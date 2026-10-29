@@ -953,6 +953,21 @@ public class FileSyncEngine implements AutoCloseable {
         cancellationWorkerLauncher = java.util.Objects.requireNonNull(launcher);
     }
 
+    private static final Runnable NO_PROBE = () -> { };
+
+    /**
+     * Runs while the job is inside the interval between its pre-spawn checks and the process it starts.
+     *
+     * <p>Test seam, empty in production. That interval is where a close lands in real runs, and repetition
+     * and sleeps cannot pin it down: {@code JobOwnershipTest} parks the job there and closes the engine
+     * around it, so the order of the two is a fact of the test rather than a property of the scheduler.
+     */
+    private volatile Runnable spawnIntervalProbe = NO_PROBE;
+
+    void setSpawnIntervalProbe(Runnable probe) {
+        spawnIntervalProbe = java.util.Objects.requireNonNull(probe);
+    }
+
     @Override
     public void close() {
         closeOnce();
@@ -1704,6 +1719,8 @@ public class FileSyncEngine implements AutoCloseable {
                             + humanDuration(jobTimeoutMillis) + " limit before rsync had started.",
                             workSet, progress, outcomes, errors, warnings, listener, verifies, control);
                 }
+
+                spawnIntervalProbe.run();
 
                 Process process = new ProcessBuilder(
                         buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))

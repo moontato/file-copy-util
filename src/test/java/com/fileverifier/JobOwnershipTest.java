@@ -808,6 +808,177 @@ class JobOwnershipTest {
         }
     }
 
+    /** What {@link #parkAStartAcrossClose} observed, so both parked-start tests read the same way. */
+    private record ParkedStart(JobResult result, Throwable thrown, Throwable closeFailure,
+                               Throwable probeFailure, boolean runningAtClose, boolean fileAtCopyGate,
+                               long closeMillis) { }
+
+    /**
+     * Park the job inside the interval between its pre-spawn cancellation checks and the process it is about
+     * to start, close the engine while it is parked, and only then let it go on.
+     *
+     * <p>This is the interleaving the 40 rounds above reach only by luck - and did reach, on this commit, on
+     * two GitHub jobs at round 28 and locally at round 38. Parking makes the order a fact of the test instead
+     * of a property of the scheduler: closing has no process to stop at that moment, so whatever the job does
+     * next happens after close() has returned.
+     */
+    private static ParkedStart parkAStartAcrossClose(FileSyncEngine engine, JobRequest job, Path dst)
+            throws InterruptedException {
+        CountDownLatch parkedAtSpawnInterval = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        AtomicReference<Throwable> probeFailure = new AtomicReference<>();
+        engine.setSpawnIntervalProbe(() -> {
+            parkedAtSpawnInterval.countDown();
+            try {
+                assertTrue(closeReturned.await(30, TimeUnit.SECONDS),
+                        "close() never returned while the job was parked before starting its process");
+            } catch (Throwable t) {
+                probeFailure.compareAndSet(null, t);
+            }
+        });
+        AtomicReference<JobResult> outcome = new AtomicReference<>();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        AtomicBoolean runningAtClose = new AtomicBoolean();
+        AtomicBoolean fileAtClose = new AtomicBoolean();
+        AtomicReference<Long> closeMillis = new AtomicReference<>();
+
+        Thread caller = new Thread(() -> {
+            try { outcome.set(engine.execute(job, null)); } catch (Throwable t) { thrown.set(t); }
+        }, "parked-spawn-caller");
+        Thread closer = new Thread(() -> {
+            try {
+                assertTrue(parkedAtSpawnInterval.await(30, TimeUnit.SECONDS),
+                        "the job never reached the interval before starting its process");
+                long at = System.nanoTime();
+                engine.closeOnce();
+                closeMillis.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at));
+                runningAtClose.set(engine.isRunning());
+                fileAtClose.set(Files.exists(dst.resolve("a.txt")));
+                Files.writeString(dst.resolve("allow-copy"), "close returned");
+            } catch (Throwable t) {
+                closeFailure.compareAndSet(null, t);
+            } finally {
+                closeReturned.countDown();
+            }
+        }, "parked-spawn-closer");
+        caller.start();
+        closer.start();
+        caller.join(30_000);
+        closer.join(30_000);
+
+        assertFalse(caller.isAlive(), "the parked job never came back after close()");
+        assertFalse(closer.isAlive(), "close() never returned");
+        return new ParkedStart(outcome.get(), thrown.get(), closeFailure.get(), probeFailure.get(),
+                runningAtClose.get(), fileAtClose.get(), closeMillis.get() == null ? -1L : closeMillis.get());
+    }
+
+    /** The assertions both parked-start tests make: refused the start, and nothing left in the destination. */
+    private void assertStartWasRefusedAcrossClose(ParkedStart parked, Path dst) throws Exception {
+        assertNull(parked.probeFailure(), "the parked job was never released: " + parked.probeFailure());
+        assertNull(parked.closeFailure(), String.valueOf(parked.closeFailure()));
+        // Closing stayed bounded even with a start parked inside the interval: the wait for a start that is
+        // already under way is capped, and a start that is too late is refused instead of chased.
+        assertTrue(parked.closeMillis() >= 0L && parked.closeMillis() < 5_000L,
+                "close() took " + parked.closeMillis() + " ms with a start parked in the interval");
+        assertFalse(parked.runningAtClose(), "engine still running when close returned");
+        assertFalse(parked.fileAtCopyGate(), "the parked job wrote before close() returned");
+
+        assertNull(parked.thrown(), String.valueOf(parked.thrown()));
+        JobResult result = parked.result();
+        assertNotNull(result, "the parked job reported nothing at all");
+        assertEquals(JobStatus.FAILED, result.status(), result.toString());
+        assertEquals(AbortCause.ENGINE_CLOSED, result.abortCause(), result.toString());
+        // The safety property: once close() has returned, no process may have been started for this job and
+        // nothing may have reached the destination.
+        assertFalse(Files.exists(dst.resolve("process.pid")),
+                "a process was started after close() had already stopped the job");
+        assertFalse(Files.exists(dst.resolve("a.txt")), "a copy appeared after close() returned");
+        assertTrue(result.message().contains("before rsync started"),
+                "the job was stopped after a process had been started, not refused one: " + result.message());
+
+        // Refusing the start still accounts for what was selected: one row, saying nothing was copied.
+        assertEquals(1, result.filesNotTransferred(), result.toString());
+        assertEquals(0, result.filesCopied(), result.toString());
+        assertEquals(1, result.outcomes().size(), result.toString());
+        assertEquals(FileSyncEngine.TransferDisposition.NOT_COPIED, result.outcomes().get(0).transfer(),
+                result.toString());
+        assertEquals("a.txt", result.outcomes().get(0).relPath(), result.toString());
+
+        TestSupport.assertNoProcessesRunning("rsync", "after refusing a start parked across close");
+        assertFalse(FileSyncEngine.destinationClaimsInUse().contains(dst.toRealPath().toString()),
+                "the refused job left its destination claim behind");
+    }
+
+    /**
+     * A job parked before it starts its process, with an rsync that only copies once a gate the test opens
+     * after close() returned exists: the copy is then direct evidence of work done after the program closed.
+     */
+    @Test
+    void aStartParkedAcrossCloseIsRefusedRatherThanWritingAfterClose(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fakeRsyncGatedUntilAfterClose(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            ParkedStart parked = parkAStartAcrossClose(engine, request(src, dst, JobType.COPY_ONLY, "a.txt"), dst);
+            assertStartWasRefusedAcrossClose(parked, dst);
+            assertFalse(engine.isRunning(), "the engine is still running after closing");
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * The same parking with an rsync that copies as soon as it runs: a start that survives close() lands a
+     * file in the destination whatever the test does next, so this is the GitHub failure with its timing
+     * forced rather than waited for.
+     */
+    @Test
+    void aStartParkedAcrossCloseNeverReachesTheDestination(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fakeRsyncCopyingAsSoonAsItRuns(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            ParkedStart parked = parkAStartAcrossClose(engine, request(src, dst, JobType.COPY_ONLY, "a.txt"), dst);
+            assertStartWasRefusedAcrossClose(parked, dst);
+            assertFalse(engine.isRunning(), "the engine is still running after closing");
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** An rsync stand-in that records its PID, announces, and copies immediately. */
+    private static Path fakeRsyncCopyingAsSoonAsItRuns(Path dir) throws IOException {
+        Path fake = dir.resolve("fake-copying-rsync");
+        String script = """
+                #!/bin/sh
+                if [ "$1" = --version ]; then echo 'rsync version 3.2.7'; exit 0; fi
+                src=$(eval echo "\\${$(($#-1))}")
+                dst=$(eval echo "\\${$#}")
+                printf '%s\\n' "$$" > "$dst/process.pid.tmp"
+                mv "$dst/process.pid.tmp" "$dst/process.pid"
+                printf '%s\\n' '>f+++++++++|a.txt'
+                cp "$src/a.txt" "$dst/a.txt"
+                exit 0
+                """;
+        Files.writeString(fake, script);
+        Files.setPosixFilePermissions(fake, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return fake;
+    }
+
     private static Path fakeRsyncGatedUntilAfterClose(Path dir) throws IOException {
         Path fake = dir.resolve("fake-gated-rsync");
         String script = """
