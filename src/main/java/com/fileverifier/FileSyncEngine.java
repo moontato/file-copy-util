@@ -144,6 +144,17 @@ public class FileSyncEngine implements AutoCloseable {
 
     /** Closing does not wait the watchdog's grace: the program is going away. */
     private static final long CLOSE_TERMINATION_MILLIS = 1_000L;
+
+    /**
+     * How long stopping a job waits for a process start that is already under way.
+     *
+     * <p>Without it, closing looks at the job's process slot, finds nothing - the job is between its
+     * pre-spawn checks and {@code start()} - stops nothing, and returns while the rsync that job then
+     * starts is still being born. A start is fork and exec, so this is a handoff rather than a grace
+     * period, and it stays well inside the existing close bounds.
+     */
+    private static final long SPAWN_HANDOFF_MILLIS = 500L;
+
     /** How long a closing program waits for a completion callback that may never return. */
     private static final long CLOSE_DELIVERY_MILLIS = 1_000L;
     /** How long an interrupted hash gets to prove it stopped before the report says a read may continue. */
@@ -577,6 +588,13 @@ public class FileSyncEngine implements AutoCloseable {
          * the one Java started leaves the other two reading the source after this program has exited.
          */
         private final AtomicReference<Process> process = new AtomicReference<>();
+        /**
+         * Serialises "may this job still start a process?" with stopping the job. Held only while fields
+         * change: never across {@code ProcessBuilder.start()}, a wait for a process to die, or a callback.
+         */
+        private final Object spawnGate = new Object();
+        /** True while a claimed start is under way, so a job being stopped knows a process is on its way. */
+        private boolean spawnClaimed;
         private final AtomicReference<List<ProcessHandle>> tree = new AtomicReference<>(List.of());
         /** The destination reservation this job holds, or null if it never got one. */
         private final AtomicReference<String> reservation = new AtomicReference<>();
@@ -691,10 +709,47 @@ public class FileSyncEngine implements AutoCloseable {
 
         /** Record the process this job started, and stop it at once if the job was already cancelled. */
         void spawn(Process spawned) {
-            process.set(spawned);
-            tree.set(snapshotTree(spawned));
+            synchronized (spawnGate) {
+                process.set(spawned);
+                tree.set(snapshotTree(spawned));
+                spawnClaimed = false;
+                spawnGate.notifyAll();
+            }
             if (cancelRequested.get()) {
                 terminate();
+            }
+        }
+
+        /**
+         * Claim the right to start this job's process, or refuse the start.
+         *
+         * <p>Checking for a cancellation and then starting is not enough, because the two are not one
+         * decision: a close that lands in between finds no process to stop, returns, and the process started
+         * a moment later writes into the destination after the program has closed. Nothing done afterwards
+         * can undo that write, so the start itself has to be the thing that is refused.
+         */
+        boolean claimSpawn() {
+            synchronized (spawnGate) {
+                if (abortRequested() || terminateRequestedAtNanos != 0L) {
+                    return false;
+                }
+                spawnClaimed = true;
+                return true;
+            }
+        }
+
+        /** False when the stop arrived while the claim was held, so the start has to be given up. */
+        boolean spawnClaimHolds() {
+            synchronized (spawnGate) {
+                return spawnClaimed && !abortRequested() && terminateRequestedAtNanos == 0L;
+            }
+        }
+
+        /** Give up a claim without starting anything, and let a waiting {@link #terminate()} return. */
+        void abandonSpawn() {
+            synchronized (spawnGate) {
+                spawnClaimed = false;
+                spawnGate.notifyAll();
             }
         }
 
@@ -723,7 +778,26 @@ public class FileSyncEngine implements AutoCloseable {
             // Hashing first: a job cancelled while it was reading the source has no process to kill, and the
             // only thing still doing work is a hash thread.
             stopHashing();
-            Process spawned = process.get();
+            Process spawned;
+            synchronized (spawnGate) {
+                // A start may be under way right now. Returning on an empty slot is what let close() finish
+                // with a live rsync nobody had stopped: wait, bounded, for that start to be registered or
+                // given up, so the process it began is the one being signalled here.
+                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SPAWN_HANDOFF_MILLIS);
+                while (spawnClaimed && process.get() == null) {
+                    long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                    if (remaining <= 0L) {
+                        break;
+                    }
+                    try {
+                        spawnGate.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                spawned = process.get();
+            }
             if (spawned == null) {
                 return;
             }
@@ -1720,12 +1794,33 @@ public class FileSyncEngine implements AutoCloseable {
                             workSet, progress, outcomes, errors, warnings, listener, verifies, control);
                 }
 
-                spawnIntervalProbe.run();
-
-                Process process = new ProcessBuilder(
-                        buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
-                        .redirectErrorStream(true)
-                        .start();
+                // A process started after closing had stopped this job would do its first write after
+                // close() returned, so the start has to be claimed and the claim re-checked at the moment of
+                // starting. Both refusals report the same thing the pre-spawn checks report: nothing ran.
+                if (!control.claimSpawn()) {
+                    return abortedBeforeTransfer("Job " + abortWords(control.cause())
+                            + " before rsync started: no file was transferred." + limitPhrase(control),
+                            workSet, progress, outcomes, errors, warnings, listener, verifies, control);
+                }
+                Process process;
+                try {
+                    spawnIntervalProbe.run();
+                    if (!control.spawnClaimHolds()) {
+                        control.abandonSpawn();
+                        return abortedBeforeTransfer("Job " + abortWords(control.cause())
+                                + " before rsync started: no file was transferred." + limitPhrase(control),
+                                workSet, progress, outcomes, errors, warnings, listener, verifies, control);
+                    }
+                    process = new ProcessBuilder(
+                            buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
+                            .redirectErrorStream(true)
+                            .start();
+                } catch (IOException | RuntimeException couldNotStart) {
+                    // Nothing was started: let go of the claim so a job being stopped is not held to the
+                    // handoff bound for a process that does not exist.
+                    control.abandonSpawn();
+                    throw couldNotStart;
+                }
                 control.spawn(process);
                 // A cancellation that landed between the check above and the spawn still has to reach this
                 // process, because the person who pressed Cancel has already been told the job stopped.
