@@ -1121,6 +1121,8 @@ class JobOwnershipTest {
         assertTrue(parked.outsiderMessage() != null
                         && parked.outsiderMessage().contains("already using the destination"),
                 "the second engine was not refused the destination: " + parked.outsiderMessage());
+        assertTrue(FileSyncEngine.unaccountedWriterClaimCount() >= 1,
+                "the engine handed a claim back without recording that a writer was unaccounted for");
     }
 
     /**
@@ -1297,6 +1299,22 @@ class JobOwnershipTest {
     private static boolean claimIsBack(Path dst) throws Exception {
         String key = dst.toRealPath().toString();
         return TestSupport.waitFor(() -> !FileSyncEngine.destinationClaimsInUse().contains(key), 20_000);
+    }
+
+    /** The controller the engine has installed for its current job. */
+    private static Object currentControlOf(FileSyncEngine engine) throws Exception {
+        java.lang.reflect.Field field = FileSyncEngine.class.getDeclaredField("currentControl");
+        field.setAccessible(true);
+        Object installed = ((java.util.concurrent.atomic.AtomicReference<?>) field.get(engine)).get();
+        assertNotNull(installed, "the engine had no current job to hold a spawn gate");
+        return installed;
+    }
+
+    /** The lock that decides whether a job's process start may go ahead. */
+    private static java.util.concurrent.locks.ReentrantLock spawnGateOf(Object control) throws Exception {
+        java.lang.reflect.Field field = control.getClass().getDeclaredField("spawnGate");
+        field.setAccessible(true);
+        return (java.util.concurrent.locks.ReentrantLock) field.get(control);
     }
 
     /** Another engine, asking for the destination the parked job still owns. Its message is the answer. */

@@ -206,9 +206,16 @@ public class FileSyncEngine implements AutoCloseable {
     /** Engines share the process default unless one of them asks for something else. */
     private volatile String rsyncOverride;
 
-    /** Destinations with a live job in this program. Released by {@link #finishJob}. */
-    private static final Set<String> DESTINATIONS_IN_USE =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * Destinations with a job in this program, mapped to the job that holds the claim.
+     *
+     * <p>Mapped rather than a bare set, for two reasons. A claim may outlive the job that made it - closing
+     * cannot hand a destination back while a process that job started, or a process start it claimed, is still
+     * unaccounted for - and whoever hands it back must be able to prove it is theirs. A set lets a late
+     * cleanup free a directory a different job is writing into; {@code remove(key, owner)} cannot.
+     */
+    private static final java.util.concurrent.ConcurrentMap<String, JobControl> DESTINATIONS_IN_USE =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * The destinations a job in this program currently holds a claim on. A seam for the lifecycle fixtures:
@@ -216,7 +223,7 @@ public class FileSyncEngine implements AutoCloseable {
      * after, with nothing alive to hand it back.
      */
     static Set<String> destinationClaimsInUse() {
-        return Set.copyOf(DESTINATIONS_IN_USE);
+        return Set.copyOf(DESTINATIONS_IN_USE.keySet());
     }
     private final AtomicReference<String> reservedDestination = new AtomicReference<>();
 
@@ -591,8 +598,10 @@ public class FileSyncEngine implements AutoCloseable {
          */
         private final AtomicReference<Process> process = new AtomicReference<>();
         /**
-         * Serialises "may this job still start a process?" with stopping the job. Held only while fields
-         * change: never across {@code ProcessBuilder.start()}, a wait for a process to die, or a callback.
+         * Serialises "may this job still start a process?" with stopping the job.
+         *
+         * Held only while fields change: never across {@code ProcessBuilder.start()}, a wait for a process to
+         * die, or a callback.
          */
         private final Object spawnGate = new Object();
         /** True while a claimed start is under way, so a job being stopped knows a process is on its way. */
@@ -715,6 +724,7 @@ public class FileSyncEngine implements AutoCloseable {
                 process.set(spawned);
                 tree.set(snapshotTree(spawned));
                 spawnClaimed = false;
+                startUnaccountedFor = false;
                 spawnGate.notifyAll();
             }
             if (cancelRequested.get()) {
@@ -736,6 +746,7 @@ public class FileSyncEngine implements AutoCloseable {
                     return false;
                 }
                 spawnClaimed = true;
+                startUnaccountedFor = true;
                 return true;
             }
         }
@@ -751,8 +762,46 @@ public class FileSyncEngine implements AutoCloseable {
         void abandonSpawn() {
             synchronized (spawnGate) {
                 spawnClaimed = false;
+                startUnaccountedFor = false;
                 spawnGate.notifyAll();
             }
+        }
+
+        /**
+         * True from the moment this job decides to start a process until either that process is registered or
+         * the start is given up: the window in which the engine cannot see what it has set in motion.
+         */
+        private volatile boolean startUnaccountedFor;
+
+        /**
+         * True while something this job owns may still write into its destination.
+         *
+         * <p>Two separate things qualify. A start that has been claimed but not accounted for, because the
+         * process it is about to create does not exist yet and nothing has stopped it. And a process this job
+         * created - or any process it spawned - that has not been confirmed gone. A job's thread being
+         * finished, or even reported on, says neither: the destination is what has to be judged.
+         *
+         * <p>{@link Process#isAlive()} is the evidence for the process itself: the JVM's own reaper records an
+         * exit without anyone calling {@code waitFor}, so a process that has died stops qualifying here even
+         * if the thread that started it never came back for the exit code.
+         */
+        boolean writerUnaccountedFor() {
+            if (startUnaccountedFor) {
+                return true;
+            }
+            Process spawned = process.get();
+            if (spawned == null) {
+                return false;
+            }
+            if (spawned.isAlive()) {
+                return true;
+            }
+            for (ProcessHandle descendant : tree.get()) {
+                if (descendant.isAlive()) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         Process process() {
@@ -780,11 +829,13 @@ public class FileSyncEngine implements AutoCloseable {
             // Hashing first: a job cancelled while it was reading the source has no process to kill, and the
             // only thing still doing work is a hash thread.
             stopHashing();
+            // A start may be under way right now. Returning on an empty slot is what let close() finish with a
+            // live rsync nobody had stopped, so this waits - bounded - for that start to be registered or given
+            // up, so that the process being signalled here is the one that job began.
+            //
+                // A start may be under way right now: wait, bounded, for it to be registered or given up.
             Process spawned;
             synchronized (spawnGate) {
-                // A start may be under way right now. Returning on an empty slot is what let close() finish
-                // with a live rsync nobody had stopped: wait, bounded, for that start to be registered or
-                // given up, so the process it began is the one being signalled here.
                 long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SPAWN_HANDOFF_MILLIS);
                 while (spawnClaimed && process.get() == null) {
                     long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
@@ -806,9 +857,16 @@ public class FileSyncEngine implements AutoCloseable {
             List<ProcessHandle> snapshot = snapshotTree(spawned);
             tree.set(snapshot);
             signalTree(spawned, snapshot, false);
-            if (!awaitTree(spawned, snapshot, TERM_GRACE_SECONDS)) {
+            boolean gone = awaitTree(spawned, snapshot, TERM_GRACE_SECONDS);
+            if (!gone) {
                 signalTree(spawned, snapshot, true);
-                awaitTree(spawned, snapshot, TERM_GRACE_SECONDS);
+                gone = awaitTree(spawned, snapshot, TERM_GRACE_SECONDS);
+            }
+            // Having proved the tree gone is the earliest moment this job's writer stops being a hazard, and it
+            // is the stop that proved it, so the stop is what hands the destination back. A job thread stuck
+            // somewhere else cannot be trusted to.
+            if (gone) {
+                releaseDestinationClaim(this);
             }
             // Close the pipes too. A reader blocked on rsync's output only sees end of file once every
             // writer has gone, and a process that left the tree (a double fork, a setsid) is not reachable
@@ -1148,6 +1206,13 @@ public class FileSyncEngine implements AutoCloseable {
                 publishTerminalResult(control, CLOSE_TERMINATION_MILLIS, Delivery.ELSEWHERE_BRIEFLY);
             }
         }
+        // The watchdog is about to be retired, so this is the last chance to answer for a claim still waiting
+        // on its writer. If the writer is gone, the claim goes with it; if it is not, closing says so in the
+        // report it has already published rather than pretending the directory is free.
+        JobControl waiting = claimAwaitingHandback.getAndSet(null);
+        if (waiting != null) {
+            releaseDestinationClaim(waiting);
+        }
         watchdog.shutdownNow();
     }
 
@@ -1176,6 +1241,72 @@ public class FileSyncEngine implements AutoCloseable {
      * result from a job that is no longer current is counted and dropped - it does not rewrite the status, the
      * result or the reservation of the job that replaced it.
      */
+    /**
+     * Hand this job's destination back, if it holds one and nothing that job owns may still write into it.
+     *
+     * <p>Saying no here is not a leak. The claim stays owned by the job that made it, and the next job that
+     * asks for that directory takes the claim over once it can see that its previous holder's writer is gone
+     * (see {@link #claimDestination}). So the directory is never open to two jobs at once, and it
+     * is never shut forever by a job that has nothing left running in it.
+     */
+    private static boolean releaseDestinationClaim(JobControl control) {
+        String held = control.reservation.get();
+        if (held == null || control.writerUnaccountedFor()) {
+            return false;
+        }
+        control.reservation.set(null);
+        DESTINATIONS_IN_USE.remove(held, control);
+        return true;
+    }
+
+    /**
+     * Claim {@code destinationKey} for {@code control}. True only if this job holds it now.
+     *
+     * <p>A holder whose writer is accounted for has nothing left to protect, and its claim is taken over. A
+     * holder that started a process closing never accounted for - or that has claimed a start it has not
+     * created yet - keeps it, because there is a writer here that has not been answered for. Failing to claim
+     * is reported as failure rather than as an absence: the last thing this needs is a directory read as free
+     * because the claim could not be taken.
+     */
+    private static boolean claimDestination(String destinationKey, JobControl control) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            JobControl holder = DESTINATIONS_IN_USE.get(destinationKey);
+            if (holder == null) {
+                if (DESTINATIONS_IN_USE.putIfAbsent(destinationKey, control) == null) {
+                    return true;
+                }
+            } else if (!holder.writerUnaccountedFor()
+                    && DESTINATIONS_IN_USE.remove(destinationKey, holder)) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** Which job, if any, holds this destination right now. */
+    private static JobControl destinationHolder(String destinationKey) {
+        return DESTINATIONS_IN_USE.get(destinationKey);
+    }
+
+    /**
+     * The job whose destination claim is still held because its writer was not accounted for yet, if any.
+     *
+     * <p>Holding such a claim is the right answer while there is a writer; keeping it after the writer is gone
+     * is just a directory locked for the rest of this program's life. The watchdog retries the hand-back, and
+     * {@link #finishClose(JobControl)} makes a last attempt for a program on its way out.
+     */
+    private final AtomicReference<JobControl> claimAwaitingHandback = new AtomicReference<>();
+
+    /** How many times a job left its destination claim behind because a writer of its's was unaccounted for. */
+    private static final java.util.concurrent.atomic.AtomicInteger unaccountedWriterClaims
+            = new java.util.concurrent.atomic.AtomicInteger();
+
+    static int unaccountedWriterClaimCount() {
+        return unaccountedWriterClaims.get();
+    }
+
     /** Where a completion callback may be run, and whether anyone may wait for it. */
     private enum Delivery {
         /** Run it here. Right for the job's own thread, which has nowhere else to be. */
@@ -1207,13 +1338,18 @@ public class FileSyncEngine implements AutoCloseable {
      */
     private JobResult finishJob(JobResult result, JobControl control, ProgressListener listener,
                                 Delivery delivery) {
+        // Decided before the engine is marked idle: a destination goes back to the pool only once nothing this
+        // job set in motion can still write into it. A job thread that cannot report is one thing; a process
+        // that thread started, and that nobody has accounted for, is another - and the second one is the reason
+        // a directory cannot be opened to a second writer just because a report got published.
+        boolean handedBack = releaseDestinationClaim(control);
         boolean mine;
         synchronized (lifecycleLock) {
             mine = currentControl.compareAndSet(control, null);
             if (mine) {
-                String reserved = control.reservation.getAndSet(null);
-                if (reserved != null) {
-                    DESTINATIONS_IN_USE.remove(reserved);
+                if (!handedBack && control.reservation.get() != null) {
+                    unaccountedWriterClaims.incrementAndGet();
+                    claimAwaitingHandback.set(control);
                 }
                 control.phase = "idle";
                 lastResult = result;
@@ -1222,12 +1358,13 @@ public class FileSyncEngine implements AutoCloseable {
             }
         }
         if (!mine) {
-            // The result is dropped, but its destination claim is not left behind: the winner may have
+            // The result is dropped, but the claim is not simply abandoned either: the winner may have
             // published the engine idle before this job got as far as claiming, and a claim belonging to no
-            // running job would keep that directory shut to every job after it.
-            String orphan = control.reservation.getAndSet(null);
-            if (orphan != null) {
-                DESTINATIONS_IN_USE.remove(orphan);
+            // running job would keep that directory shut to every job after it. While a process this job started
+            // is still running, or a start it claimed is still unaccounted for, the claim belongs to that
+            // writer: it is the only thing keeping a second job out of a directory with a live writer in it.
+            if (!releaseDestinationClaim(control) && control.reservation.get() != null) {
+                claimAwaitingHandback.set(control);
             }
             lateResultsDropped.incrementAndGet();
             return result;
@@ -1603,8 +1740,12 @@ public class FileSyncEngine implements AutoCloseable {
                     + " before rsync started: no file was transferred." + limitPhrase(control),
                     List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause());
         }
-        if (!DESTINATIONS_IN_USE.add(destinationKey)) {
+        if (!claimDestination(destinationKey, control)) {
+            JobControl holder = destinationHolder(destinationKey);
             return failure("Another job in this program is already using the destination " + destDir
+                    + (holder != null && holder.writerUnaccountedFor()
+                            ? " and a process start belonging to it has not been accounted for yet"
+                            : "")
                     + ". Wait for it to finish, or point this job at a different directory: two jobs writing"
                     + " one directory produce numbers neither of them can vouch for.",
                     List.of("destination busy: " + destinationKey), List.of(), 0);
@@ -1844,9 +1985,11 @@ public class FileSyncEngine implements AutoCloseable {
                             buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
                             .redirectErrorStream(true)
                             .start();
-                } catch (IOException | RuntimeException couldNotStart) {
+                } catch (IOException | RuntimeException | Error couldNotStart) {
                     // Nothing was started: let go of the claim so a job being stopped is not held to the
-                    // handoff bound for a process that does not exist.
+                    // handoff bound for a process that does not exist, and so that a destination is not shut to
+                    // every later job by a start that will never happen. The failure is still the caller's to
+                    // see, so it goes straight back out.
                     control.abandonSpawn();
                     throw couldNotStart;
                 }
@@ -3336,6 +3479,13 @@ public class FileSyncEngine implements AutoCloseable {
     // ---------------------------------------------------------------- watchdog
 
     private void watchdogTick() {
+        // A claim this engine handed on but could not hand back, because the job's writer was not accounted for
+        // at the time, is retried here on every tick. Without this the only thing that frees such a claim is the
+        // next job that happens to want the same directory, which is a way of never answering the question.
+        JobControl waiting = claimAwaitingHandback.get();
+        if (waiting != null && releaseDestinationClaim(waiting)) {
+            claimAwaitingHandback.compareAndSet(waiting, null);
+        }
         JobControl control = currentControl.get();
         if (control == null) {
             return;
@@ -3358,9 +3508,11 @@ public class FileSyncEngine implements AutoCloseable {
      * lets go of it. The result that thread publishes later is dropped, so it cannot overwrite this one -
      * which is only safe because each job owns its controller and its publication gate.
      *
-     * <p>The destination reservation is released here on purpose: the only thing that wrote to the destination
-     * was rsync, and that process tree has been killed by the time this runs. What may still be running is
-     * Java code reading files or calling back, which writes nothing.
+     * <p>The destination reservation is released here only once this job's writer is accounted for. The claim
+     * used to be handed back on the reasoning that the only thing writing to the destination was rsync and the
+     * watchdog had killed it - which holds when that reasoning is checked. It does not hold for a job whose
+     * process start was claimed but never became visible: here there is no process to have killed, and the
+     * directory stays this job's until a process turns up and is stopped, or the start turns out to be nothing.
      */
     private void terminalGuard(JobControl control) {
         if (!control.terminationRequested() || control.millisSinceTerminationRequested() < TERMINAL_GRACE_MILLIS) {
@@ -3384,15 +3536,36 @@ public class FileSyncEngine implements AutoCloseable {
         ProgressReporter.Counters counters = control.counters();
         AbortCause why = control.cause() == AbortCause.NONE ? AbortCause.USER_CANCELLED : control.cause();
         long seconds = Math.max(1L, graceMillis / 1000L);
+        // What this report is entitled to claim. "The process is gone, so nothing more is being written" is a
+        // statement about a process, and it is only true if the process is actually known to be gone: a job can
+        // have claimed a start that never became visible, or can have created a process that outlived the wait
+        // for it. Saying the confident sentence in those cases is how a program ends up reporting a closed job
+        // while a file lands in the destination afterwards.
+        boolean writerOutstanding = control.writerUnaccountedFor();
+        String aboutTheProcess = writerOutstanding
+                ? " A process start belonging to this job had not been accounted for when this was reported,"
+                        + " so a file may still reach the destination after this report. That destination stays"
+                        + " claimed by this job until the writer is accounted for, and these figures do not"
+                        + " cover what it writes."
+                : " the process it was running is gone, so nothing more is being written.";
         String message = "Job stopped (" + abortWords(why) + ") while " + control.phase
                 + " and its own thread had not finished within " + seconds
                 + " s of its process being stopped. The figures below are as far as that thread had got;"
-                + " the process it was running is gone, so nothing more is being written.";
+                + aboutTheProcess;
+        List<String> warnings = new java.util.ArrayList<>(List.of(
+                "the job's own thread was still finishing when this was reported; per-file results"
+                        + " from it are not included"));
+        if (writerOutstanding) {
+            String destination = control.reservation.get();
+            warnings.add("a process start of this job's had not been accounted for when this was reported"
+                    + (destination == null ? "" : " (destination " + destination + ")")
+                    + ": it may still write there, and that destination stays claimed to this job until it"
+                    + " is accounted for");
+        }
         JobResult forced = new JobResult(JobStatus.FAILED, message, counters.matched(),
                 counters.mismatched(), counters.missing(), counters.extra(), 0, 0, 0, 0, counters.copied(),
                 Math.max(0, counters.rsyncTransfers()), counters.processed(), 0, List.of(), List.of(),
-                List.of("the job's own thread was still finishing when this was reported; per-file results"
-                        + " from it are not included"),
+                List.copyOf(warnings),
                 counters.rowCount(), why, control.selectedButAbsent(), control.vanishedInputs());
         finishJob(forced, control, control.listener(), delivery);
     }
