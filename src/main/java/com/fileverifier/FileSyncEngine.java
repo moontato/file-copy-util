@@ -151,9 +151,11 @@ public class FileSyncEngine implements AutoCloseable {
      * <p>Without it, closing looks at the job's process slot, finds nothing - the job is between its
      * pre-spawn checks and {@code start()} - stops nothing, and returns while the rsync that job then
      * starts is still being born. A start is fork and exec, so this is a handoff rather than a grace
-     * period, and it stays well inside the existing close bounds.
+     * period, and it stays well inside the existing close bounds. It is a bound, not a prevention: what it
+     * guarantees is that a stop looks for an in-flight start for this long, not that the start finishes inside
+     * it. {@code JobOwnershipTest} holds a start past it on purpose and asserts what each side then owes.
      */
-    private static final long SPAWN_HANDOFF_MILLIS = 500L;
+    static final long SPAWN_HANDOFF_MILLIS = 500L;
 
     /** How long a closing program waits for a completion callback that may never return. */
     private static final long CLOSE_DELIVERY_MILLIS = 1_000L;
@@ -1027,18 +1029,42 @@ public class FileSyncEngine implements AutoCloseable {
         cancellationWorkerLauncher = java.util.Objects.requireNonNull(launcher);
     }
 
-    private static final Runnable NO_PROBE = () -> { };
+    /**
+     * The three points inside one job's process start that a test may hold that job at.
+     *
+     * <p>They are not interchangeable. A stop seen at {@link SpawnPhase#BEFORE_FINAL_CHECK} can be refused
+     * before anything exists; a stop seen at {@link SpawnPhase#AFTER_FINAL_CHECK_BEFORE_CREATE} arrives after
+     * the job decided to start, and one at {@link SpawnPhase#AFTER_CREATE_BEFORE_REGISTER} arrives when a live
+     * process exists that the engine has not yet taken ownership of. Each has its own guarantee, so each needs
+     * its own test.
+     */
+    enum SpawnPhase {
+        /** The start is claimed; the last cancellation check has not run yet. */
+        BEFORE_FINAL_CHECK,
+        /** That check passed. Nothing has been created yet. */
+        AFTER_FINAL_CHECK_BEFORE_CREATE,
+        /** The process is created; the engine has not registered it as this job's yet. */
+        AFTER_CREATE_BEFORE_REGISTER
+    }
+
+    /** Called once at each {@link SpawnPhase}, with the process once one exists. Empty in production. */
+    interface SpawnIntervalProbe {
+        void at(SpawnPhase phase, Process created);
+    }
+
+    private static final SpawnIntervalProbe NO_PROBE = (phase, created) -> { };
 
     /**
-     * Runs while the job is inside the interval between its pre-spawn checks and the process it starts.
+     * Runs at each point of the interval between a job's pre-spawn checks and the process it starts.
      *
      * <p>Test seam, empty in production. That interval is where a close lands in real runs, and repetition
-     * and sleeps cannot pin it down: {@code JobOwnershipTest} parks the job there and closes the engine
-     * around it, so the order of the two is a fact of the test rather than a property of the scheduler.
+     * and sleeps cannot pin it down: {@code JobOwnershipTest} parks the job at a chosen point in it and closes
+     * the engine around it, so the order of the two is a fact of the test rather than a property of the
+     * scheduler.
      */
-    private volatile Runnable spawnIntervalProbe = NO_PROBE;
+    private volatile SpawnIntervalProbe spawnIntervalProbe = NO_PROBE;
 
-    void setSpawnIntervalProbe(Runnable probe) {
+    void setSpawnIntervalProbe(SpawnIntervalProbe probe) {
         spawnIntervalProbe = java.util.Objects.requireNonNull(probe);
     }
 
@@ -1804,13 +1830,16 @@ public class FileSyncEngine implements AutoCloseable {
                 }
                 Process process;
                 try {
-                    spawnIntervalProbe.run();
+                    spawnIntervalProbe.at(SpawnPhase.BEFORE_FINAL_CHECK, null);
                     if (!control.spawnClaimHolds()) {
                         control.abandonSpawn();
                         return abortedBeforeTransfer("Job " + abortWords(control.cause())
                                 + " before rsync started: no file was transferred." + limitPhrase(control),
                                 workSet, progress, outcomes, errors, warnings, listener, verifies, control);
                     }
+                    // Past the last check: from here the job has decided to start, and a stop that arrives now
+                    // cannot be answered by refusing. Held here, the job is holding a claim with no process.
+                    spawnIntervalProbe.at(SpawnPhase.AFTER_FINAL_CHECK_BEFORE_CREATE, null);
                     process = new ProcessBuilder(
                             buildRsyncCommand(sourceDir, destDir, filesFrom, options, dryRun))
                             .redirectErrorStream(true)
@@ -1821,7 +1850,13 @@ public class FileSyncEngine implements AutoCloseable {
                     control.abandonSpawn();
                     throw couldNotStart;
                 }
-                control.spawn(process);
+                // A process exists now. A probe that throws must not leave it unregistered, so registration is
+                // in the finally and the engine always owns what it created.
+                try {
+                    spawnIntervalProbe.at(SpawnPhase.AFTER_CREATE_BEFORE_REGISTER, process);
+                } finally {
+                    control.spawn(process);
+                }
                 // A cancellation that landed between the check above and the spawn still has to reach this
                 // process, because the person who pressed Cancel has already been told the job stopped.
                 if (control.abortRequested()) {

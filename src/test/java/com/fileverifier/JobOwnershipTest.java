@@ -14,7 +14,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -827,7 +829,10 @@ class JobOwnershipTest {
         CountDownLatch parkedAtSpawnInterval = new CountDownLatch(1);
         CountDownLatch closeReturned = new CountDownLatch(1);
         AtomicReference<Throwable> probeFailure = new AtomicReference<>();
-        engine.setSpawnIntervalProbe(() -> {
+        engine.setSpawnIntervalProbe((phase, created) -> {
+            if (phase != FileSyncEngine.SpawnPhase.BEFORE_FINAL_CHECK) {
+                return;
+            }
             parkedAtSpawnInterval.countDown();
             try {
                 assertTrue(closeReturned.await(30, TimeUnit.SECONDS),
@@ -955,6 +960,379 @@ class JobOwnershipTest {
         } finally {
             engine.close();
         }
+    }
+
+    // ------------------------------------------------- the intervals after the final cancellation check
+
+    /**
+     * What one parked interval looked like from the outside: what {@code close()} answered with, and what was
+     * still true of this program's destination claim, the job's process, and another engine's attempt at the
+     * same destination at the moment {@code close()} returned.
+     */
+    /** Milliseconds of clock granularity allowed when judging whether a park outlasted the handoff bound. */
+    private static final long HANDOFF_MEASUREMENT_TOLERANCE_MILLIS = 25L;
+
+    private record ParkedInterval(JobResult result, Throwable thrown, Throwable closeFailure,
+                                  Throwable probeFailure, long closeMillis, boolean runningAtClose,
+                                  boolean fileAtClose, boolean claimHeldAtClose, boolean processAtCloseAlive,
+                                  long processAtClosePid, String outsiderMessage, boolean outsiderCopied,
+                                  long handoffMillis, Path destination, long processTheJobDidStart,
+                                  String terminalMessage) { }
+
+    /**
+     * Park the job at {@code phase} inside its own process start, close the engine while it is parked, ask a
+     * second engine for the same destination while the park is still held, and only then let the job go on.
+     *
+     * <p>The park is released only after {@code close()} has returned, so the interval is longer than
+     * {@link FileSyncEngine#SPAWN_HANDOFF_MILLIS} by construction: the stop cannot find a registered process,
+     * and whatever the job does next happens after the program has closed. Nothing here depends on the
+     * scheduler, on a sleep, or on how long fork and exec happen to take on this machine.
+     *
+     * @param outsiderTry run on the closer's thread, after {@code close()} returned and while the job is still
+     *                    parked; whatever it returns is recorded as this program's answer to another engine
+     *                    asking for the same destination.
+     */
+    private ParkedInterval parkAtPhaseAcrossClose(FileSyncEngine engine, JobRequest job, Path dst,
+                                                  FileSyncEngine.SpawnPhase phase, boolean asynchronous,
+                                                  Supplier<String> outsiderTry) throws Exception {
+        Path key = dst.toRealPath();
+        CountDownLatch parked = new CountDownLatch(1);
+        CountDownLatch releasePark = new CountDownLatch(1);
+        AtomicReference<Process> parkedProcess = new AtomicReference<>();
+        // The engine's own handle for the process the job went on to create, whenever it creates one. Read from
+        // the engine rather than from a file the stand-in writes, because a process stopped quickly may never
+        // get as far as writing anything at all.
+        AtomicReference<Process> processTheJobDidStart = new AtomicReference<>();
+        AtomicReference<Throwable> probeFailure = new AtomicReference<>();
+        engine.setSpawnIntervalProbe((seen, created) -> {
+            if (created != null) {
+                processTheJobDidStart.compareAndSet(null, created);
+            }
+            if (seen != phase) {
+                return;
+            }
+            parkedProcess.compareAndSet(null, created);
+            parked.countDown();
+            try {
+                assertTrue(releasePark.await(30, TimeUnit.SECONDS),
+                        "the job was never released from the parked interval " + phase);
+            } catch (Throwable t) {
+                probeFailure.compareAndSet(null, t);
+            }
+        });
+
+        AtomicReference<JobResult> outcome = new AtomicReference<>();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        AtomicReference<Boolean> runningAtClose = new AtomicReference<>();
+        AtomicReference<Boolean> fileAtClose = new AtomicReference<>();
+        AtomicReference<Boolean> claimHeldAtClose = new AtomicReference<>();
+        AtomicReference<Boolean> processAtCloseAlive = new AtomicReference<>();
+        AtomicReference<Long> processAtClosePid = new AtomicReference<>();
+        AtomicReference<String> outsiderMessage = new AtomicReference<>();
+        AtomicReference<Boolean> outsiderCopied = new AtomicReference<>();
+        AtomicReference<Long> closeMillis = new AtomicReference<>();
+        Recorder outsider = new Recorder();
+
+        Thread caller = new Thread(() -> {
+            try {
+                if (asynchronous) {
+                    assertTrue(engine.start(job, null), "the asynchronous job was never admitted");
+                } else {
+                    outcome.set(engine.execute(job, null));
+                }
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        }, "parked-" + phase.name().toLowerCase(Locale.ROOT));
+        Thread closer = new Thread(() -> {
+            try {
+                assertTrue(parked.await(30, TimeUnit.SECONDS),
+                        "the job never reached the parked interval " + phase);
+                long at = System.nanoTime();
+                engine.closeOnce();
+                closeMillis.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at));
+                runningAtClose.set(engine.isRunning());
+                fileAtClose.set(Files.exists(dst.resolve("a.txt")));
+                claimHeldAtClose.set(FileSyncEngine.destinationClaimsInUse().contains(key.toString()));
+                Process held = parkedProcess.get();
+                if (held != null) {
+                    processAtClosePid.set(held.pid());
+                    processAtCloseAlive.set(ProcessHandle.of(held.pid()).map(ProcessHandle::isAlive).orElse(false));
+                }
+                outsiderMessage.set(outsiderTry.get());
+                outsiderCopied.set(Files.exists(dst.resolve("outsider.txt")));
+                // Anything the parked job's process does after this point does it after close() returned.
+                Files.writeString(dst.resolve("allow-copy"), "close returned");
+            } catch (Throwable t) {
+                closeFailure.compareAndSet(null, t);
+            } finally {
+                releasePark.countDown();
+            }
+        }, "parked-" + phase.name().toLowerCase(Locale.ROOT) + "-closer");
+        caller.start();
+        closer.start();
+        caller.join(30_000);
+        closer.join(60_000);
+        assertFalse(caller.isAlive(), "the parked job never came back after " + phase);
+        assertFalse(closer.isAlive(), "the closer never came back after " + phase);
+        if (asynchronous) {
+            // The submitting thread is long gone by now; the job runs on the engine's own worker, and that
+            // worker is the one that starts (or refuses) the process once the park is released.
+            TestSupport.waitFor(() -> processTheJobDidStart.get() != null, 15_000);
+        }
+        return new ParkedInterval(outcome.get(), thrown.get(), closeFailure.get(), probeFailure.get(),
+                closeMillis.get() == null ? -1L : closeMillis.get(),
+                Boolean.TRUE.equals(runningAtClose.get()), Boolean.TRUE.equals(fileAtClose.get()),
+                Boolean.TRUE.equals(claimHeldAtClose.get()), Boolean.TRUE.equals(processAtCloseAlive.get()),
+                processAtClosePid.get() == null ? -1L : processAtClosePid.get(),
+                outsiderMessage.get(), Boolean.TRUE.equals(outsiderCopied.get()),
+                FileSyncEngine.SPAWN_HANDOFF_MILLIS, dst,
+                processTheJobDidStart.get() == null ? -1L : processTheJobDidStart.get().pid(),
+                engine.lastResult() == null ? "(nothing reported)" : engine.lastResult().message());
+    }
+
+    /**
+     * The assertions both intervals share: the park outlasted the handoff bound, {@code close()} stayed
+     * bounded, the destination this job was writing into was not handed to anybody while it could still be
+     * written, and the report said what was actually known rather than what closing would have liked.
+     */
+    private void assertIntervalHeldAcrossClose(ParkedInterval parked, Path dst) {
+        assertNull(parked.probeFailure(), "the parked job was never released: " + parked.probeFailure());
+        assertNull(parked.closeFailure(), String.valueOf(parked.closeFailure()));
+        // The park has to outlast the handoff, or the run proves nothing about what happens when it does. The
+        // tolerance is clock granularity in the wait's own remaining-time arithmetic, not slack about the bound.
+        assertTrue(parked.closeMillis() >= parked.handoffMillis() - HANDOFF_MEASUREMENT_TOLERANCE_MILLIS,
+                "close() came back in " + parked.closeMillis() + " ms, under the " + parked.handoffMillis()
+                        + " ms it is willing to wait for a start already under way: the park was not held past"
+                        + " the handoff bound, so this run says nothing about that bound");
+        assertTrue(parked.closeMillis() < 8_000L,
+                "close() took " + parked.closeMillis() + " ms with a start parked in the interval");
+        assertFalse(parked.runningAtClose(), "engine still running when close returned");
+
+        // The ownership property. Until this job's start is accounted for, the directory it was writing into is
+        // still this job's: another engine must not be let in to write beside a process nobody has accounted for.
+        assertTrue(parked.claimHeldAtClose(),
+                "close() handed the destination back while the job's start was still unaccounted for; what"
+                        + " it reported while doing so was: " + parked.terminalMessage());
+        assertFalse(parked.outsiderCopied(),
+                "another engine copied into a destination whose previous job could still write: "
+                        + parked.outsiderMessage());
+        assertTrue(parked.outsiderMessage() != null
+                        && parked.outsiderMessage().contains("already using the destination"),
+                "the second engine was not refused the destination: " + parked.outsiderMessage());
+    }
+
+    /**
+     * Where both intervals end up once the parked job is let go: the process it set in motion is stopped, and
+     * the destination is given back. The waits are the engine's own bounds for a stopped job's tree, not a guess
+     * at when things settle down.
+     */
+    private void assertWriterStoppedAndClaimReleased(ParkedInterval parked, long pid)
+            throws Exception {
+        if (pid > 0L) {
+            assertTrue(TestSupport.waitFor(() -> ProcessHandle.of(pid).map(p -> !p.isAlive()).orElse(true),
+                    20_000), "the process this job set in motion was never stopped: " + pid);
+        }
+        assertTrue(claimIsBack(parked.destination()),
+                "the destination stayed claimed after its writer had been accounted for");
+        TestSupport.assertNoProcessesRunning("rsync", "after a start parked across close() resolved");
+    }
+
+    /** What the engine itself reported for the job it could not account for, and what it must not have said. */
+    private void assertReportDoesNotClaimMoreThanIsKnown(FileSyncEngine engine, Path dst) {
+        JobResult forced = engine.lastResult();
+        assertNotNull(forced, "the closing engine reported nothing for the job it let go");
+        assertEquals(JobStatus.FAILED, forced.status(), forced.toString());
+        assertFalse(forced.message().contains("nothing more is being written"),
+                "the report closed the job by claiming nothing more was being written, while its process start"
+                        + " had not been accounted for: " + forced.message());
+        assertTrue(forced.message().contains("not been accounted for")
+                        || forced.warnings().stream().anyMatch(w -> w.contains("not been accounted for")),
+                "the report says nothing about the process start it could not account for: " + forced);
+    }
+
+    /**
+     * A stop that arrives after the job's last cancellation check, while it holds the claim but has created
+     * nothing: closing cannot stop a process that does not exist, and the job is not going to refuse a start it
+     * has already decided on. What closing does owe is that the destination stays this job's until the start
+     * is accounted for, and that its report says so.
+     */
+    @Test
+    void aStopAfterTheFinalSpawnCheckKeepsTheDestinationWithTheJobItBelongsTo(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path other = Files.createDirectories(tmp.resolve("other-src"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        TestSupport.write(other.resolve("outsider.txt"), "outsider\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fakeRsyncGatedUntilAfterClose(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            ParkedInterval parked = parkAtPhaseAcrossClose(engine,
+                    request(src, dst, JobType.COPY_ONLY, "a.txt"), dst,
+                    FileSyncEngine.SpawnPhase.AFTER_FINAL_CHECK_BEFORE_CREATE, false,
+                    () -> outsiderAsksFor(other, dst));
+
+            assertIntervalHeldAcrossClose(parked, dst);
+            // Nothing existed at that moment: the park was before creation, so the process slot was empty and
+            // there was nothing for closing to stop.
+            assertEquals(-1L, parked.processAtClosePid(), "a process existed before the parked creation point");
+            assertFalse(parked.fileAtClose(), "the destination was written before the process was even created");
+            assertReportDoesNotClaimMoreThanIsKnown(engine, dst);
+
+            // Released after close() returned, the job goes ahead and creates its process: closing could not
+            // prevent that, and this test does not pretend otherwise. What it did prevent is anybody else
+            // getting in beside it, and what it owes is that the process is stopped and the claim handed back.
+            assertTrue(parked.processTheJobDidStart() > 0L,
+                    "the released job never started a process, so this run proves nothing about one");
+            assertNull(parked.thrown(), String.valueOf(parked.thrown()));
+            assertNotNull(parked.result(), "the synchronous job never reported");
+            assertEquals(JobStatus.FAILED, parked.result().status(), parked.result().toString());
+            assertWriterStoppedAndClaimReleased(parked, parked.processTheJobDidStart());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * A stop that arrives once the process exists but before the engine has taken ownership of it: there is a
+     * live, writable process and no registered one. The same ownership rule applies, and the process has to be
+     * stopped by the registration path rather than left running.
+     */
+    @Test
+    void aProcessCreatedAcrossCloseIsNotLeftUnownedAndUnstopped(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path other = Files.createDirectories(tmp.resolve("other-src"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        TestSupport.write(other.resolve("outsider.txt"), "outsider\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fakeRsyncWritesThenHoldsOpen(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            ParkedInterval parked = parkAtPhaseAcrossClose(engine,
+                    request(src, dst, JobType.COPY_ONLY, "a.txt"), dst,
+                    FileSyncEngine.SpawnPhase.AFTER_CREATE_BEFORE_REGISTER, false,
+                    () -> outsiderAsksFor(other, dst));
+
+            assertIntervalHeldAcrossClose(parked, dst);
+            // Here a live process did exist, and had already written: not after close() returned, but while
+            // closing was still waiting on a registration this park was holding back. That is exactly why a
+            // destination cannot be handed over on the strength of a report having been published.
+            assertTrue(parked.processAtClosePid() > 0L, "no process was held at the creation point");
+            assertTrue(parked.processAtCloseAlive(),
+                    "the process held between creation and registration was not alive: "
+                            + parked.processAtClosePid());
+            assertTrue(parked.fileAtClose(),
+                    "a live, unregistered process did not write, so this run proves nothing about what such a"
+                            + " writer is entitled to do");
+            assertReportDoesNotClaimMoreThanIsKnown(engine, dst);
+
+            assertNull(parked.thrown(), String.valueOf(parked.thrown()));
+            assertNotNull(parked.result(), "the synchronous job never reported");
+            assertEquals(JobStatus.FAILED, parked.result().status(), parked.result().toString());
+            assertWriterStoppedAndClaimReleased(parked, parked.processAtClosePid());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * The same two intervals on the asynchronous path, where closing also waits briefly for the job's own
+     * thread. The bound on that wait must not become the thing that decides who owns the destination.
+     */
+    @Test
+    void anAsynchronousJobParkedInEitherIntervalAcrossCloseStillHoldsItsDestination(@TempDir Path tmp)
+            throws Exception {
+        assumeRealRsync();
+        for (FileSyncEngine.SpawnPhase phase
+                : List.of(FileSyncEngine.SpawnPhase.AFTER_FINAL_CHECK_BEFORE_CREATE,
+                          FileSyncEngine.SpawnPhase.AFTER_CREATE_BEFORE_REGISTER)) {
+            Path tmpRoot = Files.createDirectories(tmp.resolve(phase.name()));
+            Path src = Files.createDirectories(tmpRoot.resolve("src"));
+            Path dst = Files.createDirectories(tmpRoot.resolve("dst"));
+            Path other = Files.createDirectories(tmpRoot.resolve("other-src"));
+            TestSupport.write(src.resolve("a.txt"), "a\n");
+            TestSupport.write(other.resolve("outsider.txt"), "outsider\n");
+            FileSyncEngine engine = new FileSyncEngine();
+            try {
+                boolean createdPhase = phase == FileSyncEngine.SpawnPhase.AFTER_CREATE_BEFORE_REGISTER;
+                Path fakeDir = Files.createDirectories(tmpRoot.resolve("fake"));
+                engine.useRsync((createdPhase ? fakeRsyncWritesThenHoldsOpen(fakeDir)
+                        : fakeRsyncGatedUntilAfterClose(fakeDir)).toString());
+                engine.setJobTimeoutMillis(60_000L);
+                ParkedInterval parked = parkAtPhaseAcrossClose(engine,
+                        request(src, dst, JobType.COPY_ONLY, "a.txt"), dst, phase, true,
+                        () -> outsiderAsksFor(other, dst));
+
+                assertIntervalHeldAcrossClose(parked, dst);
+                assertReportDoesNotClaimMoreThanIsKnown(engine, dst);
+                long pid = parked.processAtClosePid();
+                if (createdPhase) {
+                    assertTrue(pid > 0L && parked.processAtCloseAlive(),
+                            phase + ": no live process was held across the asynchronous close");
+                    assertTrue(parked.fileAtClose(),
+                            phase + ": the live unregistered process did not write, so nothing was proved about"
+                                    + " what closing had to hold back");
+                } else {
+                    assertEquals(-1L, pid, phase + ": a process existed before the parked creation point");
+                    assertTrue(parked.processTheJobDidStart() > 0L,
+                            phase + ": the released job never started a process, so nothing was proved about"
+                                    + " one that started after close() had returned");
+                    pid = parked.processTheJobDidStart();
+                }
+                assertWriterStoppedAndClaimReleased(parked, pid);
+            } finally {
+                engine.close();
+            }
+        }
+    }
+
+    /** True once this program has given the destination back, whoever it was that handed it back. */
+    private static boolean claimIsBack(Path dst) throws Exception {
+        String key = dst.toRealPath().toString();
+        return TestSupport.waitFor(() -> !FileSyncEngine.destinationClaimsInUse().contains(key), 20_000);
+    }
+
+    /** Another engine, asking for the destination the parked job still owns. Its message is the answer. */
+    private static String outsiderAsksFor(Path source, Path dst) {
+        try (FileSyncEngine outsider = new FileSyncEngine()) {
+            return outsider.execute(request(source, dst, JobType.COPY_ONLY, "outsider.txt"), null).message();
+        } catch (IOException couldNotAsk) {
+            throw new java.io.UncheckedIOException(couldNotAsk);
+        }
+    }
+
+    /**
+     * An rsync stand-in that records its PID, writes the file it was asked to copy, and then stays alive. Both
+     * the write and the survival are things this test causes rather than waits for: a process held between
+     * creation and registration has done its write, and is still there to be accounted for.
+     */
+    private static Path fakeRsyncWritesThenHoldsOpen(Path dir) throws IOException {
+        Path fake = dir.resolve("fake-writing-rsync");
+        String script = """
+                #!/bin/sh
+                if [ "$1" = --version ]; then echo 'rsync version 3.2.7'; exit 0; fi
+                src=$(eval echo "\\${$(($#-1))}")
+                dst=$(eval echo "\\${$#}")
+                cp "$src/a.txt" "$dst/a.txt"
+                printf '%s\\n' "$$" > "$dst/process.pid.tmp"
+                mv "$dst/process.pid.tmp" "$dst/process.pid"
+                printf '%s\\n' '>f+++++++++|a.txt'
+                sleep 120
+                exit 0
+                """;
+        Files.writeString(fake, script);
+        Files.setPosixFilePermissions(fake, java.util.EnumSet.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        return fake;
     }
 
     /** An rsync stand-in that records its PID, announces, and copies immediately. */
@@ -1256,6 +1634,10 @@ class JobOwnershipTest {
             assertEquals(0, forced.rowsListed(), forced.toString());
             assertEquals(1, forced.rowsOmitted(),
                     "the report that replaced the stuck thread says how many rows it left out: " + forced);
+            // The confident half of the same sentence: here the process tree really had been stopped and waited
+            // for, so the report is entitled to say nothing more is being written.
+            assertTrue(forced.message().contains("nothing more is being written"),
+                    "a report made with the process known gone no longer says so: " + forced.message());
             assertTrue(forced.truncated(), forced.toString());
         } finally {
             released.countDown();
