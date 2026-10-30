@@ -600,10 +600,16 @@ public class FileSyncEngine implements AutoCloseable {
         /**
          * Serialises "may this job still start a process?" with stopping the job.
          *
-         * Held only while fields change: never across {@code ProcessBuilder.start()}, a wait for a process to
-         * die, or a callback.
+         * <p>Held only while fields change - never across {@code ProcessBuilder.start()}, a walk of the process
+         * table, a wait for a process to die, or a callback - so that holding it is always brief. A lock held
+         * while somebody's process table is being read is a lock a stop can be queued behind, and a stop with a
+         * deadline cannot afford to be queued at all: hence {@link #terminate()} takes it with a bounded
+         * {@code tryLock} and says so when it cannot get in.
          */
-        private final Object spawnGate = new Object();
+        private final java.util.concurrent.locks.ReentrantLock spawnGate
+                = new java.util.concurrent.locks.ReentrantLock();
+        /** Signalled when a claimed start is registered or given up, so a waiting stop can look again. */
+        private final java.util.concurrent.locks.Condition spawnSettled = spawnGate.newCondition();
         /** True while a claimed start is under way, so a job being stopped knows a process is on its way. */
         private boolean spawnClaimed;
         private final AtomicReference<List<ProcessHandle>> tree = new AtomicReference<>(List.of());
@@ -720,12 +726,20 @@ public class FileSyncEngine implements AutoCloseable {
 
         /** Record the process this job started, and stop it at once if the job was already cancelled. */
         void spawn(Process spawned) {
-            synchronized (spawnGate) {
+            // Walked outside the gate on purpose: {@code descendants()} is a trip through the process table,
+            // and this gate's whole job is deciding whether a start may happen - a stop waiting on it would be
+            // queued behind somebody else's process table. The snapshot is a moment older than one taken inside
+            // the lock, and {@link #terminate()} takes its own, later, before it signals anything.
+            List<ProcessHandle> descendants = snapshotTree(spawned);
+            tree.set(descendants);
+            spawnGate.lock();
+            try {
                 process.set(spawned);
-                tree.set(snapshotTree(spawned));
                 spawnClaimed = false;
                 startUnaccountedFor = false;
-                spawnGate.notifyAll();
+                spawnSettled.signalAll();
+            } finally {
+                spawnGate.unlock();
             }
             if (cancelRequested.get()) {
                 terminate();
@@ -741,29 +755,38 @@ public class FileSyncEngine implements AutoCloseable {
          * can undo that write, so the start itself has to be the thing that is refused.
          */
         boolean claimSpawn() {
-            synchronized (spawnGate) {
+            spawnGate.lock();
+            try {
                 if (abortRequested() || terminateRequestedAtNanos != 0L) {
                     return false;
                 }
                 spawnClaimed = true;
                 startUnaccountedFor = true;
                 return true;
+            } finally {
+                spawnGate.unlock();
             }
         }
 
         /** False when the stop arrived while the claim was held, so the start has to be given up. */
         boolean spawnClaimHolds() {
-            synchronized (spawnGate) {
+            spawnGate.lock();
+            try {
                 return spawnClaimed && !abortRequested() && terminateRequestedAtNanos == 0L;
+            } finally {
+                spawnGate.unlock();
             }
         }
 
         /** Give up a claim without starting anything, and let a waiting {@link #terminate()} return. */
         void abandonSpawn() {
-            synchronized (spawnGate) {
+            spawnGate.lock();
+            try {
                 spawnClaimed = false;
                 startUnaccountedFor = false;
-                spawnGate.notifyAll();
+                spawnSettled.signalAll();
+            } finally {
+                spawnGate.unlock();
             }
         }
 
@@ -833,24 +856,45 @@ public class FileSyncEngine implements AutoCloseable {
             // live rsync nobody had stopped, so this waits - bounded - for that start to be registered or given
             // up, so that the process being signalled here is the one that job began.
             //
-                // A start may be under way right now: wait, bounded, for it to be registered or given up.
-            Process spawned;
-            synchronized (spawnGate) {
-                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SPAWN_HANDOFF_MILLIS);
-                while (spawnClaimed && process.get() == null) {
-                    long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
-                    if (remaining <= 0L) {
-                        break;
-                    }
-                    try {
-                        spawnGate.wait(remaining);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-                spawned = process.get();
+            // A start may be under way right now. Returning on an empty slot is what let close() finish with a
+            // live rsync nobody had stopped, so this waits - bounded - for that start to be registered or given
+            // up, so that the process signalled here is the one that job began.
+            //
+            // Getting in to look is bounded too. An unbounded monitor entry puts a stop in a queue whose length
+            // is somebody else's decision - the same failure as waiting on the process table, and the reason a
+            // close's duration used to be a fact about a different thread. If this cannot get the gate, or
+            // cannot see the start settle inside the bound, it stops what it can see and leaves the start
+            // accounted-for-by-name: {@link #startUnaccountedFor} stays set, which is what keeps the destination
+            // claimed and the report honest about what is still unknown.
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SPAWN_HANDOFF_MILLIS);
+            boolean looked;
+            try {
+                looked = spawnGate.tryLock(SPAWN_HANDOFF_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                looked = false;
             }
+            if (looked) {
+                try {
+                    while (spawnClaimed && process.get() == null) {
+                        long remaining = deadline - System.nanoTime();
+                        if (remaining <= 0L) {
+                            break;
+                        }
+                        try {
+                            spawnSettled.await(remaining, TimeUnit.NANOSECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                } finally {
+                    spawnGate.unlock();
+                }
+            }
+            // Read outside the gate either way: the slot is an atomic reference, and a stop that could not wait
+            // is better off signalling the process it can see than signalling nothing.
+            Process spawned = process.get();
             if (spawned == null) {
                 return;
             }

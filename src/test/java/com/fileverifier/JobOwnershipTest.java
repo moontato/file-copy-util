@@ -1301,6 +1301,121 @@ class JobOwnershipTest {
         return TestSupport.waitFor(() -> !FileSyncEngine.destinationClaimsInUse().contains(key), 20_000);
     }
 
+    /**
+     * A stop must not have to queue behind the lock that decides whether a start may happen.
+     *
+     * <p>The job is parked inside its own spawn interval and the gate is then held by this test for longer than
+     * the whole handoff bound. A stop that entered that lock without a bound would sit here until this test
+     * decided to let it go - the same failure mode as waiting on somebody's process table, and the same one
+     * that used to make a close's duration a fact about a different thread. With the bound in place, closing
+     * stops what it can see, says the start is unaccounted for, keeps the destination claimed, and comes back.
+     */
+    @Test
+    void aStopIsNeverQueuedBehindTheDecisionAboutWhetherAStartMayHappen(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        CountDownLatch parked = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FileSyncEngine engine = new FileSyncEngine();
+        Object gate = null;
+        try {
+            engine.useRsync(fakeRsyncCopyingAsSoonAsItRuns(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            engine.setSpawnIntervalProbe((phase, created) -> {
+                if (phase != FileSyncEngine.SpawnPhase.BEFORE_FINAL_CHECK) {
+                    return;
+                }
+                parked.countDown();
+                try {
+                    release.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            AtomicReference<JobResult> outcome = new AtomicReference<>();
+            Thread caller = new Thread(() -> {
+                try {
+                    outcome.set(engine.execute(request(src, dst, JobType.COPY_ONLY, "a.txt"), null));
+                } catch (Throwable refused) {
+                    // Read back from the outcome below; a refusal here is not the thing under test.
+                }
+            }, "gate-held-caller");
+            caller.start();
+            assertTrue(parked.await(30, TimeUnit.SECONDS), "the job never reached its spawn interval");
+
+            gate = spawnGateOf(currentControlOf(engine));
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            AtomicReference<Long> closeMillis = new AtomicReference<>();
+            AtomicReference<Boolean> claimAtClose = new AtomicReference<>();
+            AtomicReference<String> messageAtClose = new AtomicReference<>();
+            // Held for the whole of this, whatever kind of lock the engine's gate happens to be: the point is
+            // that a stop has to be able to look at an in-flight start without standing in a queue.
+            holdingSpawnGate(gate, () -> {
+            Thread closer = new Thread(() -> {
+                try {
+                    long at = System.nanoTime();
+                    engine.closeOnce();
+                    closeMillis.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at));
+                    claimAtClose.set(FileSyncEngine.destinationClaimsInUse()
+                            .contains(dst.toRealPath().toString()));
+                    messageAtClose.set(engine.lastResult() == null ? "(nothing reported)"
+                            : engine.lastResult().message());
+                } catch (Throwable t) {
+                    closeFailure.compareAndSet(null, t);
+                }
+            }, "gate-held-closer");
+            closer.start();
+            closer.join(10_000);
+            assertFalse(closer.isAlive(),
+                    "close() sat in the queue for the spawn gate for 10 s while a test held it");
+            assertNull(closeFailure.get(), String.valueOf(closeFailure.get()));
+            long took = closeMillis.get() == null ? -1L : closeMillis.get();
+            assertTrue(took >= FileSyncEngine.SPAWN_HANDOFF_MILLIS - HANDOFF_MEASUREMENT_TOLERANCE_MILLIS
+                            && took < 2_500L,
+                    "close() took " + took + " ms while the spawn gate was held elsewhere; looking at an"
+                            + " in-flight start is bounded at " + FileSyncEngine.SPAWN_HANDOFF_MILLIS + " ms");
+            assertTrue(Boolean.TRUE.equals(claimAtClose.get()),
+                    "the destination was handed back while a start could not even be looked at: "
+                            + messageAtClose.get());
+            assertTrue(messageAtClose.get().contains("not been accounted for"),
+                    "closing described a start it could not reach as though it had reached it: "
+                            + messageAtClose.get());
+            });
+        } finally {
+            release.countDown();
+            engine.close();
+        }
+        TestSupport.assertNoProcessesRunning("rsync", "after a close that could not reach the spawn gate");
+    }
+
+    /** Something a test does while a lock is held, and which may be interrupted doing it. */
+    @FunctionalInterface
+    private interface WhileHeld {
+        void run() throws InterruptedException;
+    }
+
+    /**
+     * Run {@code inside} with the engine's spawn gate held, whichever kind of lock that gate happens to be:
+     * the property under test is about holding it, not about which primitive the engine chose.
+     */
+    private static void holdingSpawnGate(Object gate, WhileHeld inside) throws InterruptedException {
+        if (gate instanceof java.util.concurrent.locks.ReentrantLock lock) {
+            lock.lock();
+            try {
+                inside.run();
+            } finally {
+                lock.unlock();
+            }
+        } else {
+            synchronized (gate) {
+                inside.run();
+            }
+        }
+    }
+
     /** The controller the engine has installed for its current job. */
     private static Object currentControlOf(FileSyncEngine engine) throws Exception {
         java.lang.reflect.Field field = FileSyncEngine.class.getDeclaredField("currentControl");
@@ -1311,10 +1426,10 @@ class JobOwnershipTest {
     }
 
     /** The lock that decides whether a job's process start may go ahead. */
-    private static java.util.concurrent.locks.ReentrantLock spawnGateOf(Object control) throws Exception {
+    private static Object spawnGateOf(Object control) throws Exception {
         java.lang.reflect.Field field = control.getClass().getDeclaredField("spawnGate");
         field.setAccessible(true);
-        return (java.util.concurrent.locks.ReentrantLock) field.get(control);
+        return field.get(control);
     }
 
     /** Another engine, asking for the destination the parked job still owns. Its message is the answer. */
