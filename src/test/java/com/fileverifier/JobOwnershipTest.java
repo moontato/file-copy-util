@@ -1245,6 +1245,74 @@ class JobOwnershipTest {
     }
 
     /**
+     * The limitation, pinned down instead of argued about. A process that was created but never registered is
+     * invisible to closing: there is no handle to signal, and the bounded handoff has already expired while the
+     * park held the registration back. So this job can still write into its destination after {@code close()}
+     * has returned, and nothing in this engine can stop it happening. What the engine does control is who else
+     * may be writing there at that moment, and what its report is willing to say.
+     *
+     * <p>The stand-in writes only once a release file appears, and that file is written by this test after
+     * {@code close()} returned, so any write it causes is a write after the program closed - no timing
+     * assumption involved. The outsider engine asks first, in the same moment, so the ownership answer and the
+     * write are observed against the same parked state.
+     */
+    @Test
+    void aStartNobodyCouldAccountForCanStillWriteIntoItsDestinationAfterCloseReturns(@TempDir Path tmp)
+            throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path other = Files.createDirectories(tmp.resolve("other-src"));
+        TestSupport.write(src.resolve("a.txt"), "a\n");
+        TestSupport.write(other.resolve("outsider.txt"), "outsider\n");
+        FileSyncEngine engine = new FileSyncEngine();
+        try {
+            engine.useRsync(fakeRsyncGatedUntilAfterClose(
+                    Files.createDirectories(tmp.resolve("fake"))).toString());
+            engine.setJobTimeoutMillis(60_000L);
+            ParkedInterval parked = parkAtPhaseAcrossClose(engine,
+                    request(src, dst, JobType.COPY_ONLY, "a.txt"), dst,
+                    FileSyncEngine.SpawnPhase.AFTER_CREATE_BEFORE_REGISTER, false, () -> {
+                        String refusal = outsiderAsksFor(other, dst);
+                        try {
+                            Files.writeString(dst.resolve("allow-copy"), "close has returned");
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                        boolean wrote;
+                        try {
+                            wrote = TestSupport.waitFor(() -> Files.exists(dst.resolve("a.txt")), 5_000);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            wrote = false;
+                        }
+                        return refusal + (wrote
+                                ? " | and the parked process wrote once close had returned"
+                                : " | and the parked process never got as far as writing");
+                    });
+
+            assertIntervalHeldAcrossClose(parked, dst);
+            // The order this test is about: nothing had been written when close() came back, and something was
+            // written afterwards, by a process this engine had no handle for.
+            assertFalse(parked.fileAtClose(),
+                    "this run does not separate the write from close(): the file was already there");
+            assertTrue(parked.processAtCloseAlive(),
+                    "the unregistered process was not alive when close() returned: " + parked.processAtClosePid());
+            assertTrue(parked.outsiderMessage().contains("the parked process wrote once close had returned"),
+                    "the write after close() did not happen, so this run does not pin the limitation: "
+                            + parked.outsiderMessage());
+            // And the two things the engine does control, in the same moment: the destination stayed this job's
+            // (assertIntervalHeldAcrossClose), and its report did not promise the writing had stopped.
+            assertReportDoesNotClaimMoreThanIsKnown(engine, dst);
+
+            assertNull(parked.thrown(), String.valueOf(parked.thrown()));
+            assertWriterStoppedAndClaimReleased(parked, parked.processAtClosePid());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
      * The same two intervals on the asynchronous path, where closing also waits briefly for the job's own
      * thread. The bound on that wait must not become the thing that decides who owns the destination.
      */
