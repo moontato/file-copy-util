@@ -16,19 +16,19 @@ counters) and [CHANGELOG.md](CHANGELOG.md) for what changed between 1.1.0 and 1.
 - **Verify only** — Compares SHA-256 hashes of the selected files between source and destination without
   running `rsync` at all: the only job that looks at a destination without touching it
 - **File Selection** — Recursively scans directories and displays all files with checkboxes to include/exclude
-- **Explicit Selection Semantics** — A job only ever touches the files you ticked; unticking everything means *nothing*, never *everything*
+- **Explicit Selection Semantics** — Copy follows the selected source work set; unticking everything means *nothing*, never *everything*. Scanning, preflight and reporting may inspect other paths
 - **Scan Options** — Ignore patterns (globs, e.g. `.git, node_modules, *.bin`), include/exclude hidden files, and a symlink policy (skip / copy as link / follow target); options apply on the next **Scan Files**, never silently behind your back
 - **Filter Boxes** — Narrow each list by substring without changing what is ticked
-- **One Job At A Time** — The engine owns a single job: while it runs, Browse/Scan/mode controls are disabled and **Cancel** becomes available; cancelling terminates `rsync` (and its children) and reports the partial progress reached
-- **Job Timeout** — An optional per-job timeout (default: none) kills a runaway `rsync` instead of hanging forever
+- **One Job At A Time** — The engine owns a single job: while it runs, Browse/Scan/mode controls are disabled and **Cancel** becomes available; cancellation requests termination of the observed `rsync` process tree and reports progress reached, subject to the limits below
+- **Job Timeout** — An optional per-job timeout (default: none) requests a stop; blocked or uninterruptible I/O can outlive it
 - **Measured Reporting** — Copied/matched/mismatched/missing counts come from rsync's itemized output and from hashing exactly the selected files
 - **Progress Tracking** — Progress bar against the selected work set, driven by `rsync --info=progress2` percentages (so a single huge file moves the bar), plus a "still running, last activity Ns ago" status when rsync is silent
-- **Results Table and Export** — Every outcome listed with status, path and full SHA-256 on both sides, an *Only problems* filter, destination-only (`EXTRA`) detection, and CSV/JSON export
+- **Results Table and Export** — Observed outcomes with status, path and available SHA-256 values, an *Only problems* filter, destination-only (`EXTRA`) detection, and CSV/JSON export. Result limits and forced terminal reporting can omit rows
 - **Preflight Checks** — Source readable, destination writable, source not equal to or containing the destination, and `rsync` present, all checked before anything is touched
 - **Safe Scanning** — Unreadable subdirectories become warnings instead of aborting the scan; symlink cycles are reported, not followed
 - **Bounded Log** — The on-screen log keeps its newest 5000 lines; the export is the archive
 - **Dry Run** — *Dry run (write nothing)* runs `rsync --dry-run` and still compares hashes: you see what the job would copy and what already mismatches, and nothing is written
-- **Partial-Transfer Reporting** — after a cancelled or timed-out copy, the engine looks for the hidden partial files `rsync` left behind and names them with their sizes; it never deletes them
+- **Partial-Transfer Reporting** — after a cancelled or timed-out copy, the engine looks for matching hidden partial-file names and reports what it finds; it never deletes them. This is not proof of every partial file or its ownership
 - **Bandwidth Cap** — `--bwlimit KB/s` caps the transfer rate
 - **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode and extra-file detection are restored in the next window
 - **Smart Directory Selection** — The chooser starts in the directory already in that field (falling back to the other field, then home) and takes the directory you actually clicked
@@ -104,7 +104,7 @@ files are used exactly as written; a file that is not valid UTF-8 is refused rat
 | 1 | the job failed: preflight problem, rsync error, cancellation |
 | 2 | bad command line — **including a report path that is already taken, in a directory that does not exist, named by both `--csv` and `--json`, or inside the copied files without `--allow-report-in-tree`**. Report paths are checked before the job starts, so these runs copy nothing |
 | 3 | job completed, but files mismatched or were missing at the destination (for `--dry-run`: files that *would* be mismatched or missing) |
-| 4 | the job succeeded, but a report could not be written (refused, or the write failed) — the copies happened, the record of them did not |
+| 4 | the job succeeded, but a report could not be written (refused, or the write failed). The job may have copied files, or may have been Verify Only; the requested report was not written |
 | 5 | only with `--strict`: the job completed and found nothing wrong, but a name this run was given had no file behind it |
 
 Other CLI options: `--verify-only`, `--no-verify` (copy without comparing; the two flags contradict each
@@ -178,8 +178,8 @@ the old one. The version of the program is printed in muted text at the bottom r
 
 | Mode | What it does | Which files it covers |
 |------|--------------|------------------------|
-| **Copy** (verify ticked) | Copies files with `rsync` (`-a --checksum --itemize-changes --info=progress2 --files-from=<selection>`), then compares SHA-256 hashes | the files ticked in the **source** list |
-| **Copy** (verify unticked) | Copies files with `rsync` and hashes nothing at all; each written file is reported as `COPIED` | the files ticked in the **source** list |
+| **Copy** (verify ticked) | Copies files with `rsync` (`-a --checksum --itemize-changes --info=progress2 --from0 --files-from=<selection>`), then compares SHA-256 hashes | the files ticked in the **source** list |
+| **Copy** (verify unticked) | Copies files with `rsync` and hashes nothing; transfer outcomes reflect the evidence available | the files ticked in the **source** list |
 | **Verify only** | Compares SHA-256 hashes without copying | files ticked in the **source** list, minus rows you explicitly unticked in the destination list, plus (optionally) destination-only files |
 
 A file that has no row in the destination list was not unticked there — it is absent, and Verify Only reports it as `MISSING`. A destination list that is out of date never silently excludes a file from verification.
@@ -189,9 +189,9 @@ An empty selection is refused rather than treated as "all files": use **Select A
 ### Reading the results
 
 ```
-Copy & Verify Complete: 512 file(s) checked, 3 copied, 509 matched, 0 mismatched, 0 missing
-Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0 extra=0
-  transfers: copied=3 would-copy=0 uncertain=0 not-transferred=0, rsync announced=3, rsync said it completed=3; rows reported=512
+Copy & Verify Complete: 509 file(s) checked, 3 copied, 509 matched, 0 mismatched, 0 missing
+Totals: checked=509 copied=3 matched=509 mismatched=0 missing=0 extra=0
+  transfers: copied=3 would-copy=0 uncertain=0 not-transferred=0, rsync announced=3, rsync said it completed=3; rows reported=509
 ```
 
 - **checked** — the files a verdict answered something about: `checked = matched + mismatched + missing`. A
@@ -200,14 +200,15 @@ Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0 extra=0
 - **copied** — files this run can **show** it wrote: a file that was not at the destination before and is
   afterwards, at the size its source had, or one rsync replaced outright (a copied symbolic link counts, an
   unchanged file does not)
-- **uncertain** — transfers `rsync` started that the destination cannot account for. A file that was already there,
-  of the same size, looks the same whether the copy finished or never did, so those transfers are reported as
-  uncertain rather than claimed as copies. Re-run with verification to settle them
+- **uncertain** — selected names whose transfers the destination cannot account for. A file that was already there,
+  of the same size, can look the same whether the copy finished or never did, so such transfers are reported as
+  uncertain rather than claimed as copies. An uncertainty may also concern an unannounced name. Re-run with
+  verification to compare the current contents; that comparison does not prove which run wrote them
 - **would-copy** — files a `--dry-run` would have written. A dry run never reports `copied`
 - **rsync announced / rsync said it completed** — `rsync`'s own counts (the itemize lines, and its `xfr#` figure).
   They are reported beside this program's figures, never merged into them: an announcement says a transfer started.
-  Where they disagree with what the destination shows, the message says so — "announced 3, completed 1 of them" —
-  and the files in between are listed as uncertain
+  Where they disagree with what the destination shows, the message says so — "announced 3, completed 1 of them".
+  A count alone cannot identify which files completed; per-file outcomes use the available evidence
 - **mismatch** — present at both ends with different SHA-256 (`src=` / `dst=` prefixes are shown)
 - **missing** — selected in the source, not present at the destination
 - **destination-only** (`EXTRA`) — present at the destination, not in the source selection (Verify Only, when *Report destination-only files* is on)
@@ -221,18 +222,19 @@ Totals: checked=512 copied=3 matched=509 mismatched=0 missing=0 extra=0
   announced 2).` — the headline's number is the same figure as `copied=` in the totals, and `rsync announced N` is
   stated as rsync's claim
 
-A **failed** job (cancelled, timed out, or an rsync error) reports the partial counters it reached rather than zeros.
+A **failed** job (cancelled, timed out, or an rsync error) reports the counters it reached; those can be zero if no counters were yet published.
 
 `rsync` exit code 24 ("some files vanished before they could be transferred") is reported as a warning, not a failure; any other non-zero exit code fails the job and `rsync`'s own error lines are logged.
 
-An interrupted transfer is written to a hidden temporary name (`.big.bin.QafPvi`) that is renamed only when the transfer completes. After a cancelled or timed-out copy the engine reports what it finds:
+In the tested local rsync fixtures, a transfer uses a hidden temporary name (`.big.bin.QafPvi`) that is renamed on completion. After a cancelled or timed-out copy the engine reports matching names it finds:
 
 ```
 warning: 1 partial rsync file(s) left in the destination: .big.bin.QafPvi (for big.bin, 3.8 MB).
          They are incomplete transfers - delete them or re-run the copy to finish them.
 ```
 
-or, when rsync cleaned up after itself, `No partial rsync file was left in the destination.` The engine never deletes them: whether a hidden file in your directory is junk is your call.
+or `No partial rsync file was left in the destination.` This search is not proof that no partial exists, or that
+a matching hidden file belongs to this job. The engine never deletes them: deciding what is junk is your call.
 
 ## Scale
 
@@ -258,11 +260,12 @@ metadata calls can be several times slower, which is why the snapshot is cancell
 stops the job rather than walking the whole list, and the files it had not reached are reported as
 unconfirmable rather than assumed.
 
-Time scales linearly. Memory is the constraint, and it is deliberately bounded: results are decided one
-file at a time (no digest map per side), the destination is scanned only when destination-only reporting
-is on, and the results list is capped at 50000 entries — raise it with `--max-results N` when the export
-has to list every file, and the counters stay exact either way. If a selection is too large for the JVM,
-the job fails with that advice rather than crashing.
+These are historical observations, not a scaling or latency guarantee. Results are decided one file at a
+time, the destination is scanned for extras only when requested, and the results list is capped at 50000
+entries — raise it with `--max-results N` if needed. A cap does not change the counters of an ordinarily
+reconciled job, but a forced terminal result can only report facts observed so far. If a selection exceeds
+the available heap, the program attempts to report that condition; resource exhaustion is not guaranteed to
+be recoverable.
 
 ## Tests
 
@@ -270,10 +273,10 @@ the job fails with that advice rather than crashing.
 mvn test
 ```
 
-297 tests, headless (no display needed): counter truth (a destination-only file is reported without being
+The ordinary suite runs headlessly (no display needed). See the [claim-to-evidence map](DESIGN.md#claim-to-evidence-map) for named tests and untested boundaries. Coverage includes: counter truth (a destination-only file is reported without being
 counted as checked, `checked = matched + mismatched + missing`, a copied-and-verified file counted once in each
 family, dry runs reporting would-copy and never copied, an interrupted transfer reported uncertain rather than
-copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation with no orphaned `rsync`, timeout, partial-transfer reporting), the process tree of a cancelled, closed or completed copy (a local `rsync` run is three processes; none may survive), and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
+copied, and the JSON export carrying the same figures as the job it describes), scanner and scan options, hasher, copy/verify semantics against real `rsync` (selection rules, symlink policies, the itemize-line grammar, dry runs, preflight), the job lifecycle (single-job guard, cancellation, timeout, partial-transfer reporting), and observed process trees of cancelled, closed or completed test copies, and the live copy status (the file in flight, its own percentage, `xfr#` completed transfers), symlink verdicts (under LINK a link is judged by its kind and its link text with nothing read through it, dangling
 and directory links are carried as objects, FOLLOW compares bytes and says so, and a link in the destination is
 never followed), name fidelity end to end (comment-looking names, whitespace, newline and control-character names, exact
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
@@ -285,13 +288,13 @@ ticks that were on screen when Run was pressed), job ownership (a cancelled, tim
 of the three it was; one job's cancel flag cannot be read as another job's; a job whose own thread never returns
 is reported stopped and cannot block, stop, or rewrite the job after it - including when the program closes while
 a callback is blocked, and with a second job's time limit still enforced behind a blocked callback; cancelling a
-large read stops the thread that was doing it, and an interrupted comparison is never reported as a mismatch or a
+cooperative large read stops the thread that was doing it, and an interrupted comparison is never reported as a mismatch or a
 missing file; a job asked for at the same moment the program is closing is either refused or captured and stopped -
-never admitted behind a close that already returned - and a job stopped mid-admission gives its destination back;
-cleanup runs once and the command line's shutdown hook is taken back afterwards), the CLI
+never admitted behind a close that already returned - with destination release conditional on unresolved starts and observed writers;
+cleanup runs once and the command line's shutdown hook is taken back afterwards, subject to the limits below), the CLI
 front end, the bounded log buffer, the CSV/JSON report exporter, and the scale limits (the results
 bound, result ordering under parallel hashing, a file that exists but cannot be read). The rsync-dependent tests are skipped automatically if `rsync` is not installed. Tests that kill a transfer throttle `rsync` with `--bwlimit` so they write only a few megabytes. rsync output parsing (itemize lines, `--info=progress2` percentages, `xfr#` completed-transfer counts) is
-checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; CI builds the non-distro ones from source. Point
+checked against rsync 3.1.3, 3.2.7, 3.3.0 and 3.4.0; the CI workflow builds all four from pinned source. A local pass is not a GitHub CI result. Point
 `FCU_RSYNC_BINARIES=path,path` at other binaries to extend the matrix, or `FCU_RSYNC=/path/to/rsync` to run
 the whole suite against one specific build — which is what CI does per matrix entry, and a pinned binary that
 cannot run fails the run instead of skipping the rsync tests.
@@ -390,7 +393,9 @@ status,path,source_sha256,destination_sha256,transfer,verification
 ```
 
 Anything already parsing the columns and rows needs one change: skip the lines starting with `#` to find the
-columns row. The counts in that block are the whole job's counts, not the counts of the rows that survived.
+columns row. For an ordinarily completed or reconciled job, the counts describe observations accounted for, not just the
+rows retained. A forced terminal result can contain only counters published so far; unread facts and rows
+cannot be named or counted.
 
 **JSON** carries the same facts as fields: `status`, `abortCause`, `truncated`, `rowsListed`, `rowsOmitted`, a
 `totals` object with every figure, plus the `errors` and `warnings` arrays in full.
@@ -417,14 +422,15 @@ on disk, apostrophe-free — adding one to a file would be a different file.
 
 ## When a copy is interrupted
 
-rsync writes each file as a hidden temporary in the destination and renames it when that transfer completes,
-so a stopped copy does not leave a half-written file carrying your file's name. What it cannot tell you is
-whether one particular transfer finished: if the destination already held a file of the same size as the
-source, then after an interrupted overwrite it holds the old bytes, the old inode and the same size —
-indistinguishable from a file the job never touched. So a stopped job names every file it started and marks
-each one `COPIED`, `WOULD_COPY` (dry run) or `UNCERTAIN`; a verifying job stopped before the comparison says
-`PENDING`. `UNCERTAIN` is not an error, it is the honest answer: re-run the job with verification on and
-that file will be compared.
+In the tested local rsync fixtures, a regular file is written to a hidden temporary and renamed on completion;
+this is not a guarantee against every failure, filesystem or external writer. The engine reconciles the
+known selection against observed transfer and destination evidence. It can report `COPIED`, `WOULD_COPY`,
+`NOT_COPIED` or `UNCERTAIN`, and a comparison not reached can be `PENDING`. A forced terminal result may omit
+unread rows and cannot count or name facts never observed.
+
+Attribution assumes this program is the destination's sole writer. An interrupted overwrite of a same-sized
+file can remain `UNCERTAIN`; filesystems without reliable identity may also prevent attribution. Verification
+compares current contents, not who wrote them, and neither completion nor comparison proves durability.
 
 ## Troubleshooting
 
@@ -497,7 +503,8 @@ overwrites nothing.
 
 A selected name reaches a file outside the tree the job is working on — either it carries `..`, or it looks
 contained and leaves through a linked directory on the way (`dest/sub` being a link is enough). The job refuses
-and writes nothing. Fix the name, or remove that link from the destination.
+at preflight. Fix the name, or remove that link from the destination. Containment is check-then-open, not
+race-proof against someone changing the path after the check.
 
 Containment judges the **directories** a name would land in: a linked directory counts as where the write or read
 actually goes, and a name for a file that does not exist yet is judged by the directories above it. **Verify Only
@@ -546,11 +553,12 @@ file manager hides, and appears at the end of its transfer, not the start. Show 
 names the file in flight and how much of it has landed. The window logs this once per copy job.
 
 ### The source drive keeps reading after I cancelled or closed the window
-It should not. A local `rsync` copy is three processes (parent, child, grandchild). Cancelling, a job timeout, or closing the
-window snapshots that whole tree *before* signalling it, sends `rsync` SIGTERM so it deletes the partial file it was writing, and
-SIGKILLs anything that survives; a completed copy sweeps the tree as well, because `rsync`'s parent can exit while a child is still
-finishing. A job cancelled while the source is still being hashing never starts `rsync` at all. If you see `rsync` processes that
-outlive the program, that is a bug: report it with `ps` output and what you were copying.
+Cancellation, timeout and close signal the process tree the engine observed and attempt to stop survivors;
+partial files can remain. Detached or never-observed descendants are not guaranteed to be found. A process
+already created but not yet registered can even write after `close()` returns; the bounded spawn handoff is
+not strict prevention. Blocked or uninterruptible I/O can also outlive cancellation. SIGKILL of the JVM and
+power loss are outside shutdown-hook guarantees. Report unexpected survivors with process details and the job
+configuration, but do not assume the engine can reach every descendant.
 
 ### "Another job in this program is already using the destination"
 
@@ -559,11 +567,12 @@ warning can name a file the other job is still writing. The second job stops ins
 one program — two windows, or a window and a CLI run in the same JVM. Two *separate* processes are not guarded;
 don't run two copies into the same destination at once.
 
-### A file name containing a carriage return is not copied
+### A file name containing a newline or carriage return
 
-rsync's file list is a line list, so a name containing a newline, a carriage return or a NUL byte cannot be
-passed safely. Such names are refused before anything is written, listed in the warnings, and reported as not
-transferred. Rename them if you need them copied.
+The rsync selection file is NUL-delimited, so representable newline and carriage-return names can be copied.
+For CLI list files use `--files-from0` (and the corresponding `--exclude-from0` or `--exclude-dest-from0`);
+the newline-delimited forms cannot unambiguously represent all such names. POSIX names cannot contain NUL,
+and arbitrary undecodable filename bytes are not supported by the JVM path model.
 
 ### "A read of a source file is still running after being asked to stop"
 
@@ -580,11 +589,11 @@ the timeout field in the window) and run it again. The log heading says `=== JOB
 
 ### "the job's own thread was still finishing when this was reported"
 
-A job was stopped and its processes were killed, but the thread that had been reading `rsync`'s output or
-hashing files did not come back within five seconds — usually because it is inside a call that is itself
-blocked. The program does not pretend to be still running: it reports the figures that thread had reached,
-marks the job stopped, and lets another job start. The per-file rows from that thread are deliberately absent,
-and anything it tries to report afterwards is ignored rather than mixed into a later job's results.
+The job thread did not return within the terminal-reporting grace period, often because it is blocked. The
+program reports the figures published so far and ignores a late result. Per-file rows not yet read may be absent;
+the report cannot count facts it never observed. The engine can accept another job, but the same destination
+may remain reserved while a start or observed writer is unaccounted for; cleanup or a later admission may retry
+release.
 
 ### "No display available" error
 

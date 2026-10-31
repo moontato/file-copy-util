@@ -139,5 +139,6 @@ jobs:
             java -jar file-copy-util-VERSION.jar --cli --source DIR --dest DIR --all   # headless
             ```
 
-            Exit codes: 0 nothing to report, 1 job failed, 2 bad command line, 3 files mismatched or missing.
+            Exit codes: 0 nothing to report, 1 job failed, 2 bad command line, 3 files mismatched or missing,
+            4 report failure, 5 strict-mode absent or vanished input. See README.md for the complete exit-code table.
             See CHANGELOG.md for what changed in this version and DESIGN.md for the guarantees.

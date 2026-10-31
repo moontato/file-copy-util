@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased — audit remediation, first phases
+## Unreleased — audit remediation
+
+### Consolidated claims and limits
+
+- Names use NUL-delimited internal rsync lists; representable newline and carriage-return names are supported.
+  Newline-delimited CLI list files cannot represent all such names; use the `*from0` channels. Arbitrary
+  undecodable POSIX bytes are outside the JVM path model (`AuditNameFidelityTest`).
+- Destination containment is a preflight check, not race-proof against a concurrent path change. Collision
+  acknowledgment is not proof of safety; real case-insensitive and network destinations remain untested here
+  (`WriteSafetyTest`, `FileVerifierViewTest`).
+- An active destination reservation is per JVM, and a terminal claim can remain until cleanup or a later
+  admission accounts for an in-flight start or observed writer. A process already created but not registered
+  can write after `close()` returns: the bounded handoff is not a child-side gate (`JobOwnershipTest`).
+  Only observed process trees are tracked; detached or never-observed descendants and blocked I/O may outlive
+  cancellation. SIGKILL and power loss are outside shutdown-hook guarantees.
+- Interrupted attribution assumes a sole destination writer; unreliable file identity may leave `UNCERTAIN`.
+  A completion or verification result is not proof of durability. Forced terminal results may omit unread
+  rows and cannot name or count facts never observed (`InterruptedOverwriteTest`, `JobOwnershipTest`).
+- Optional theme fallback and the actual packaged thin jar are exercised headlessly in `ThinJarIT` after package;
+  this is not a display-backed window test. Dependency update configuration is not evidence that GitHub alerts
+  are enabled. Release concurrency has static checks, not a dispatched release test.
+
+Earlier release entries are historical descriptions and measurements, not a substitute for the current limits
+and named evidence in [DESIGN.md](DESIGN.md#claim-to-evidence-map).
 
 ### Changed — live GUI responsiveness
 
@@ -163,8 +186,8 @@ lock at all. So a job could pass its checks, wait its turn, and be admitted *aft
 seen nothing to stop - and it then copied files, finished, and reported `COMPLETED` while the program was closed and
 its watchdog had been retired. Asking for the engine and marking it closed now happen in one critical section, so
 either the close was marked first and the job is refused, or the job got in and the close captured and stopped it.
-A job whose result arrives too late to be published also gives its destination claim back, rather than leaving that
-directory claimed forever with no job alive to release it.
+A late result cannot overwrite a newer job. Subsequent corrections retain the destination claim while an
+in-flight start or observed writer remains unaccounted for; cleanup or later admission can retry release.
 
 ### Fixed — four lifecycle holes an independent review found in that work
 
@@ -202,12 +225,11 @@ directory claimed forever with no job alive to release it.
   thread read a clean slate that belonged to another job: it could run on believing it had never been cancelled,
   or kill the process of the job that had just started. Each job now owns its own state, and a result from a job
   the engine had already let go is dropped and counted instead of rewriting the next job's facts.
-- **A job whose own thread cannot finish no longer holds the program open.** The engine marks the job stopped
-  about five seconds after its process tree was killed, reports the counters that thread had published, releases
-  the destination, and can start another job; the abandoned thread's late result reaches nobody. Jobs run on
-  their own thread, so an abandoned one cannot block the next job behind it in a queue.
-- **A timed-out copy leaves no `rsync` reading the source.** Cancellation and closing were checked for this;
-  the time limit was not.
+- **A job whose own thread cannot finish can be reported stopped.** The engine reports counters published so
+  far and drops the abandoned thread's late result. The destination can remain reserved while a start or
+  observed writer is unresolved; blocked I/O and unobserved descendants can outlive the report.
+- **A timed-out copy requests process cleanup.** The timed-out fixture checks that its observed rsync process
+  stops; it does not prove every possible descendant can be found.
 - **A stopped job's reader is not left waiting forever.** Terminating a job closes `rsync`'s output pipes too,
   because a process that left the process tree (a double fork, a `setsid`) holds them open and no signal can
   reach it.
