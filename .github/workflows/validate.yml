@@ -19,10 +19,11 @@ on:
 permissions:
   contents: read
 
+# Pin the OS release for the historical rsync source matrix: ubuntu-latest migrations can change its toolchain.
 jobs:
   build-and-test:
     name: compile, tests, static analysis, packaged jar
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -74,7 +75,7 @@ jobs:
 
   rsync-matrix:
     name: rsync 3.1.3 / 3.2.7 / 3.3.0 / 3.4.0
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
