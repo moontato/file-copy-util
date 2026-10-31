@@ -335,13 +335,15 @@ corners, focus rings, alternating table rows, tab styling, segmented buttons. `U
 short list of FlatLaf style keys after `setup()`, because installing a look-and-feel replaces the
 defaults `UIManager` held before.
 
-Theme changes are applied live with `FlatLaf.updateUI()` plus `UiTheme.restyle(root)`: colours chosen at
-construction time would otherwise survive the switch, which is how "dark mode support" usually ends up
-half working. Every widget `UiTheme` creates is tagged with a client property, and `restyle` walks for
-those tags.
+Theme changes are applied live by `UiTheme.refresh(root)` and `UiTheme.restyle(root)`: the refresh
+updates Swing component trees without requiring FlatLaf, and restyling updates colours chosen at
+construction time. Every widget `UiTheme` creates is tagged with a client property, and `restyle` walks
+for those tags.
 
 The theme is presentation only. The engine has no dependency on it, `--cli` never loads it, and the thin
-jar (`original-*.jar`) runs the same program in the platform look and feel.
+jar (`original-*.jar`) falls back to the platform look and feel while retaining the application's light and
+dark palettes. The post-package thin-jar test exercises a headless view and theme changes without FlatLaf;
+it is not a desktop-window test.
 
 ## 13. Failure honesty
 

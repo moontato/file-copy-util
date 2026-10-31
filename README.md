@@ -57,8 +57,21 @@ mvn clean package
 ```
 
 Output: `target/file-copy-util-1.4.0.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
-`target/original-file-copy-util-1.4.0.jar` is the same program without the theme: it still runs, in the
-platform look and feel.
+`target/original-file-copy-util-1.4.0.jar` is the same program without FlatLaf: the GUI falls back to the
+platform look and feel, with the application's light/dark palettes. `mvn clean verify` tests a headless
+view and theme switching in a separate JVM against that actual thin jar; it does not test a desktop window.
+
+### Dependency updates and advisories
+
+`.github/dependabot.yml` configures weekly Maven and GitHub Actions version-update pull requests; it does
+not configure automatic merging. Review each update, including that action references remain pinned to full
+commit SHAs, and require the normal validation gates before merging. Dependabot operates from the default
+branch once the configuration is present there; this branch alone does not establish active monitoring.
+
+A repository owner should check the dependency graph and Dependabot alerts in the repository's security
+settings, enable available alerts if appropriate, and configure who receives and triages notifications.
+Organization policy and GitHub availability can affect those settings. Check their actual status in GitHub;
+the configuration here does not assert that alerts are enabled, and update PRs are not a vulnerability audit.
 
 ## Usage
 
