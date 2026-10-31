@@ -18,10 +18,10 @@ on:
         description: "Existing tag to release, e.g. v1.2.0"
         required: true
 
-# One release at a time per tag, and never cancelled midway: a half-published release is worse than a
-# failed one.
+# A tag push and a manual dispatch for the same tag share a group. Running releases are not cancelled;
+# GitHub may replace a pending run when another run enters the group, so this is not a FIFO queue.
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
