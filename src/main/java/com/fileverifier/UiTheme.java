@@ -1,9 +1,5 @@
 package com.fileverifier;
 
-import com.formdev.flatlaf.FlatDarkLaf;
-import com.formdev.flatlaf.FlatLaf;
-import com.formdev.flatlaf.FlatLightLaf;
-
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
@@ -17,6 +13,8 @@ import javax.swing.plaf.ColorUIResource;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
 import javax.swing.UIManager;
+import javax.swing.SwingUtilities;
+import javax.swing.UnsupportedLookAndFeelException;
 import javax.swing.border.Border;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.EmptyBorder;
@@ -25,6 +23,7 @@ import java.awt.Color;
 import java.awt.Component;
 import java.awt.Container;
 import java.awt.Font;
+import java.awt.Window;
 
 /**
  * Every colour, font, and gap the window is allowed to use, in one place.
@@ -122,14 +121,47 @@ public final class UiTheme {
      * palette current. Safe to call again on a theme change.
      */
     public static void install(boolean dark) {
-        if (dark) {
-            FlatDarkLaf.setup();
-        } else {
-            FlatLightLaf.setup();
+        install(dark, dark ? "com.formdev.flatlaf.FlatDarkLaf" : "com.formdev.flatlaf.FlatLightLaf");
+    }
+
+    /** A class name also lets the failure path be exercised without breaking the bundled dependency. */
+    static void install(boolean dark, String lookAndFeel) {
+        try {
+            UIManager.setLookAndFeel(lookAndFeel);
+        } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
+                 | UnsupportedLookAndFeelException | RuntimeException failure) {
+            installPlatformFallback(failure);
+        } catch (NoClassDefFoundError missing) {
+            // An incomplete FlatLaf is optional too; do not hide linkage errors in unrelated code.
+            if (missing.getMessage() == null || !missing.getMessage().startsWith("com/formdev/flatlaf/")) {
+                throw missing;
+            }
+            installPlatformFallback(missing);
         }
         previous = active;
         active = dark ? DARK : LIGHT;
         applyStyleKeys();
+    }
+
+    private static void installPlatformFallback(Throwable reason) {
+        System.err.println("Theme unavailable (" + reason.getClass().getSimpleName()
+            + "): " + reason.getMessage() + " - trying the platform look and feel.");
+        try {
+            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+        } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
+                 | UnsupportedLookAndFeelException | RuntimeException failure) {
+            throw new IllegalStateException("No usable platform look and feel", failure);
+        }
+    }
+
+    /** Refresh every live window, plus a detached headless view, without depending on FlatLaf. */
+    public static void refresh(Container root) {
+        for (Window window : Window.getWindows()) {
+            SwingUtilities.updateComponentTreeUI(window);
+        }
+        if (SwingUtilities.getWindowAncestor(root) == null) {
+            SwingUtilities.updateComponentTreeUI(root);
+        }
     }
 
     /**

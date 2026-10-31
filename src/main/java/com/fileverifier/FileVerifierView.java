@@ -596,7 +596,7 @@ public final class FileVerifierView extends JPanel {
     /** Re-installs the look-and-feel and re-themes the window that is already on screen. */
     private void applyTheme(boolean dark) {
         UiTheme.install(dark);
-        com.formdev.flatlaf.FlatLaf.updateUI();
+        UiTheme.refresh(this);
         UiTheme.restyle(this);
         sourceList.repaint();
         destList.repaint();

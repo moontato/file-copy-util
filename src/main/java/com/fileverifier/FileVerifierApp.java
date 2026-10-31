@@ -22,22 +22,12 @@ public class FileVerifierApp {
         }
         try {
             UiTheme.install(prefsDarkDefault());
-        } catch (Throwable t) {
-            // FlatLaf is bundled in the shaded jar. If it cannot load - or is absent because someone
-            // ran the thin jar - the window should still open in the platform look and feel.
-            System.err.println("Theme unavailable (" + t.getClass().getSimpleName() + "): "
-                + t.getMessage() + " - trying the platform look and feel.");
-            try {
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            } catch (Throwable fallback) {
-                // Both paths need the AWT toolkit, so this is the "no display here" case: point at the
-                // CLI instead of printing a stack trace the user cannot act on.
-                System.err.println("No usable look and feel on this machine ("
-                    + fallback.getClass().getSimpleName() + ": " + fallback.getMessage() + ").");
-                System.err.println("Run without a display: java -jar file-copy-util.jar --cli "
-                    + "--source DIR --dest DIR --all");
-                System.exit(1);
-            }
+        } catch (IllegalStateException failure) {
+            System.err.println("No usable look and feel on this machine: " + failure.getMessage());
+            System.err.println("Run without a display: java -jar file-copy-util.jar --cli "
+                + "--source DIR --dest DIR --all");
+            System.exit(1);
+            return;
         }
         SwingUtilities.invokeLater(() -> {
             try {

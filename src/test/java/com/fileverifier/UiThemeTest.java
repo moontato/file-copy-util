@@ -11,6 +11,7 @@ import java.awt.Color;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -61,11 +62,47 @@ class UiThemeTest {
     void installingSelectsTheMatchingPaletteAndStylesWidgets() {
         UiTheme.install(true);
         assertEquals(UiTheme.DARK, UiTheme.palette());
+        assertEquals("com.formdev.flatlaf.FlatDarkLaf", javax.swing.UIManager.getLookAndFeel().getClass().getName());
         assertEquals(Boolean.FALSE, javax.swing.UIManager.get("Table.showGrid"));
 
         UiTheme.install(false);
         assertEquals(UiTheme.LIGHT, UiTheme.palette());
+        assertEquals("com.formdev.flatlaf.FlatLightLaf", javax.swing.UIManager.getLookAndFeel().getClass().getName());
         assertEquals(Boolean.FALSE, javax.swing.UIManager.get("Table.showGrid"));
+    }
+
+    @Test
+    void unavailableOrUnsupportedThemeFallsBackButFatalErrorsEscape() {
+        try {
+            UiTheme.install(true, "not.present.Theme");
+            assertEquals(javax.swing.UIManager.getSystemLookAndFeelClassName(),
+                javax.swing.UIManager.getLookAndFeel().getClass().getName());
+            assertEquals(UiTheme.DARK, UiTheme.palette());
+
+            UiTheme.install(false, UnsupportedTheme.class.getName());
+            assertEquals(javax.swing.UIManager.getSystemLookAndFeelClassName(),
+                javax.swing.UIManager.getLookAndFeel().getClass().getName());
+            assertEquals(UiTheme.LIGHT, UiTheme.palette());
+            assertThrows(AssertionError.class, () -> UiTheme.install(false, FatalTheme.class.getName()));
+            assertThrows(NoClassDefFoundError.class, () -> UiTheme.install(false, UnrelatedLinkageTheme.class.getName()));
+        } finally {
+            UiTheme.install(false);
+        }
+    }
+
+    public static final class UnsupportedTheme extends javax.swing.plaf.metal.MetalLookAndFeel {
+        private static final long serialVersionUID = 1L;
+        @Override public boolean isSupportedLookAndFeel() { return false; }
+    }
+
+    public static final class FatalTheme extends javax.swing.plaf.metal.MetalLookAndFeel {
+        private static final long serialVersionUID = 1L;
+        @Override public boolean isSupportedLookAndFeel() { throw new AssertionError("fatal"); }
+    }
+
+    public static final class UnrelatedLinkageTheme extends javax.swing.plaf.metal.MetalLookAndFeel {
+        private static final long serialVersionUID = 1L;
+        @Override public boolean isSupportedLookAndFeel() { throw new NoClassDefFoundError("other/Dependency"); }
     }
 
     @Test

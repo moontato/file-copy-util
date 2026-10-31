@@ -98,6 +98,21 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+                <executions>
+                    <!-- The original thin jar does not exist until shade runs in package. -->
+                    <execution>
+                        <id>thin-jar-integration</id>
+                        <phase>integration-test</phase>
+                        <goals><goal>test</goal></goals>
+                        <configuration>
+                            <includes><include>**/ThinJarIT.java</include></includes>
+                            <systemPropertyVariables>
+                                <thinJar>${project.build.directory}/original-${project.build.finalName}.jar</thinJar>
+                                <testClasses>${project.build.testOutputDirectory}</testClasses>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <!-- 5.7: bytecode-level analysis on every build, at the level where style complaints
