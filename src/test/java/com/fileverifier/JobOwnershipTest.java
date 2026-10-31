@@ -60,6 +60,56 @@ class JobOwnershipTest {
         assertActiveJobKeepsDestinationAtPhase(tmp, "verifying");
     }
 
+    @Test
+    void closeDoesNotWaitForAnotherDestinationOwnershipInspection(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "first job\n");
+        CountDownLatch reached = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        ProgressListener listener = new ProgressListener() {
+            @Override public void onPhase(String phase) {
+                if ("copying".equals(phase)) {
+                    reached.countDown();
+                    try { resume.await(30, TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+            }
+            @Override public void onCompletion(JobResult result) { }
+        };
+        FileSyncEngine engine = new FileSyncEngine();
+        Thread caller = new Thread(() -> engine.execute(requestUnchecked(src, dst), listener));
+        java.lang.reflect.Field field = FileSyncEngine.class.getDeclaredField("DESTINATION_OWNERSHIP_LOCK");
+        field.setAccessible(true);
+        java.util.concurrent.locks.ReentrantLock lock = (java.util.concurrent.locks.ReentrantLock) field.get(null);
+        try {
+            caller.start();
+            assertTrue(reached.await(30, TimeUnit.SECONDS));
+            lock.lock();
+            try {
+                Thread closer = new Thread(engine::close);
+                closer.start();
+                closer.join(5_000);
+                assertFalse(closer.isAlive(), "close queued behind destination inspection");
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            resume.countDown();
+            caller.join(30_000);
+            engine.close();
+        }
+        assertFalse(caller.isAlive());
+        assertTrue(claimIsBack(dst));
+        assertFalse(Files.exists(dst.resolve("a.txt")), "terminal worker started a new writer");
+    }
+
+    private static JobRequest requestUnchecked(Path src, Path dst) {
+        try { return request(src, dst, JobType.COPY_ONLY, "a.txt"); }
+        catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+    }
+
     private void assertActiveJobKeepsDestinationAtPhase(Path tmp, String phase) throws Exception {
         assumeRealRsync();
         Path src = Files.createDirectories(tmp.resolve("src"));

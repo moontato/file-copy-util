@@ -1300,10 +1300,14 @@ public class FileSyncEngine implements AutoCloseable {
      * (see {@link #claimDestination}). So the directory is never open to two jobs at once, and it
      * is never shut forever by a job that has nothing left running in it.
      */
-    private static final Object DESTINATION_OWNERSHIP_LOCK = new Object();
+    private static final java.util.concurrent.locks.ReentrantLock DESTINATION_OWNERSHIP_LOCK =
+            new java.util.concurrent.locks.ReentrantLock();
 
     private static boolean releaseDestinationClaim(JobControl control) {
-        synchronized (DESTINATION_OWNERSHIP_LOCK) {
+        // A closing thread must not queue behind another owner's liveness inspection. Leaving a claim
+        // behind is safe; the watchdog, a late worker, or the next admission can reclaim it.
+        if (!DESTINATION_OWNERSHIP_LOCK.tryLock()) return false;
+        try {
             String held = control.reservation.get();
             if (held == null || (control.ownershipState.get() & JobControl.TERMINAL) == 0
                     || control.writerUnaccountedFor()) {
@@ -1312,6 +1316,8 @@ public class FileSyncEngine implements AutoCloseable {
             control.reservation.set(null);
             DESTINATIONS_IN_USE.remove(held, control);
             return true;
+        } finally {
+            DESTINATION_OWNERSHIP_LOCK.unlock();
         }
     }
 
@@ -1319,12 +1325,13 @@ public class FileSyncEngine implements AutoCloseable {
      * Claim {@code destinationKey} for {@code control}. True only if this job holds it now.
      *
      * <p>An active holder keeps its claim even when no process is running, including before spawn and during
-     * verification. A terminal holder keeps it while a start or writer remains unresolved. Terminal publication,
-     * reservation assignment and removal are coordinated here; claimSpawn atomically arbitrates against the
-     * terminal bit, so a terminal holder cannot acquire a new start after the claim is handed back.
+     * verification. A terminal holder keeps it while a start or writer remains unresolved. Reservation
+     * assignment and removal are coordinated here; claimSpawn atomically arbitrates against the terminal bit,
+     * so a terminal holder cannot acquire a new start after the claim is handed back.
      */
     private static boolean claimDestination(String destinationKey, JobControl control) {
-        synchronized (DESTINATION_OWNERSHIP_LOCK) {
+        DESTINATION_OWNERSHIP_LOCK.lock();
+        try {
             if ((control.ownershipState.get() & JobControl.TERMINAL) != 0) return false;
             JobControl holder = DESTINATIONS_IN_USE.get(destinationKey);
             if (holder != null) {
@@ -1335,7 +1342,16 @@ public class FileSyncEngine implements AutoCloseable {
             }
             control.reservation.set(destinationKey);
             DESTINATIONS_IN_USE.put(destinationKey, control);
+            // Terminal publication can race admission without waiting for this lock. If it won, this
+            // job is forbidden to spawn; undo its new claim before returning to the old worker.
+            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0) {
+                DESTINATIONS_IN_USE.remove(destinationKey, control);
+                control.reservation.set(null);
+                return false;
+            }
             return true;
+        } finally {
+            DESTINATION_OWNERSHIP_LOCK.unlock();
         }
     }
 
@@ -1396,11 +1412,10 @@ public class FileSyncEngine implements AutoCloseable {
         // job set in motion can still write into it. A job thread that cannot report is one thing; a process
         // that thread started, and that nobody has accounted for, is another - and the second one is the reason
         // a directory cannot be opened to a second writer just because a report got published.
-        // Coordinate terminal publication with reservation admission. The atomic state also arbitrates
-        // against claimSpawn(): after terminal wins, this job can never become a new writer.
-        synchronized (DESTINATION_OWNERSHIP_LOCK) {
-            control.ownershipState.getAndUpdate(state -> state | JobControl.TERMINAL);
-        }
+        // Atomic with claimSpawn(): after terminal wins, this job can never become a new writer.
+        // Admission checks this state on both sides of publishing a reservation, so it need not wait
+        // for the destination lock when a closing thread publishes the terminal result.
+        control.ownershipState.getAndUpdate(state -> state | JobControl.TERMINAL);
         boolean handedBack = releaseDestinationClaim(control);
         boolean mine;
         synchronized (lifecycleLock) {
