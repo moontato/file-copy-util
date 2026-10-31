@@ -232,10 +232,21 @@ class InterruptedOverwriteTest {
 
         AtomicReference<FileSyncEngine> engineRef = new AtomicReference<>();
         AtomicBoolean sawInFlight = new AtomicBoolean();
+        AtomicBoolean overwriteAnnounced = new AtomicBoolean();
+        ProgressListener observed = new ProgressListener() {
+            @Override public void onFileProcessed(String path, String kind, String sourceHash, String destHash) {
+                if ("b-overwrite.bin".equals(path) && "TRANSFERRING".equals(kind)) {
+                    overwriteAnnounced.set(true);
+                }
+            }
+            @Override public void onCompletion(JobResult result) { }
+        };
         Thread watcher = new Thread(() -> {
             long deadline = System.currentTimeMillis() + 60_000;
             while (System.currentTimeMillis() < deadline) {
-                if (hiddenTemporaryFor(dst, "b-overwrite.bin") != null) {
+                // Require both filesystem evidence of an in-flight overwrite and the reader having
+                // consumed its announcement, so the earlier rows are not racing the output reader.
+                if (overwriteAnnounced.get() && hiddenTemporaryFor(dst, "b-overwrite.bin") != null) {
                     sawInFlight.set(true);
                     engineRef.get().cancel();
                     return;
@@ -258,7 +269,7 @@ class InterruptedOverwriteTest {
             result = engine.execute(TestSupport.request(src, dst, JobType.COPY_ONLY,
                 TestSupport.selection("a-small.txt", "a-link.bin", "b-overwrite.bin"), Selection.none(),
                 new ScanOptions(ScanOptions.DEFAULTS.ignorePatterns(), true,
-                    ScanOptions.SymlinkPolicy.LINK), false), SILENT);
+                    ScanOptions.SymlinkPolicy.LINK), false), observed);
         }
 
         assertTrue(sawInFlight.get(), result.message());

@@ -615,6 +615,10 @@ public class FileSyncEngine implements AutoCloseable {
         private final AtomicReference<List<ProcessHandle>> tree = new AtomicReference<>(List.of());
         /** The destination reservation this job holds, or null if it never got one. */
         private final AtomicReference<String> reservation = new AtomicReference<>();
+        // Atomic with the decision to claim a start: a terminal job must never become a new writer.
+        private static final int TERMINAL = 1;
+        private static final int START_IN_FLIGHT = 2;
+        private final java.util.concurrent.atomic.AtomicInteger ownershipState = new java.util.concurrent.atomic.AtomicInteger();
         /** The running job's counters, so a stop forced from outside can still report what was done. */
         private final AtomicReference<ProgressReporter> progress = new AtomicReference<>();
         /** The thread running this job, named for the job, so a stuck one can be identified in a dump. */
@@ -737,6 +741,7 @@ public class FileSyncEngine implements AutoCloseable {
                 process.set(spawned);
                 spawnClaimed = false;
                 startUnaccountedFor = false;
+                ownershipState.getAndUpdate(state -> state & ~START_IN_FLIGHT);
                 spawnSettled.signalAll();
             } finally {
                 spawnGate.unlock();
@@ -757,7 +762,8 @@ public class FileSyncEngine implements AutoCloseable {
         boolean claimSpawn() {
             spawnGate.lock();
             try {
-                if (abortRequested() || terminateRequestedAtNanos != 0L) {
+                if (abortRequested() || terminateRequestedAtNanos != 0L
+                        || !ownershipState.compareAndSet(0, START_IN_FLIGHT)) {
                     return false;
                 }
                 spawnClaimed = true;
@@ -784,6 +790,7 @@ public class FileSyncEngine implements AutoCloseable {
             try {
                 spawnClaimed = false;
                 startUnaccountedFor = false;
+                ownershipState.getAndUpdate(state -> state & ~START_IN_FLIGHT);
                 spawnSettled.signalAll();
             } finally {
                 spawnGate.unlock();
@@ -809,7 +816,7 @@ public class FileSyncEngine implements AutoCloseable {
          * if the thread that started it never came back for the exit code.
          */
         boolean writerUnaccountedFor() {
-            if (startUnaccountedFor) {
+            if ((ownershipState.get() & START_IN_FLIGHT) != 0 || startUnaccountedFor) {
                 return true;
             }
             Process spawned = process.get();
@@ -1293,40 +1300,43 @@ public class FileSyncEngine implements AutoCloseable {
      * (see {@link #claimDestination}). So the directory is never open to two jobs at once, and it
      * is never shut forever by a job that has nothing left running in it.
      */
+    private static final Object DESTINATION_OWNERSHIP_LOCK = new Object();
+
     private static boolean releaseDestinationClaim(JobControl control) {
-        String held = control.reservation.get();
-        if (held == null || control.writerUnaccountedFor()) {
-            return false;
+        synchronized (DESTINATION_OWNERSHIP_LOCK) {
+            String held = control.reservation.get();
+            if (held == null || (control.ownershipState.get() & JobControl.TERMINAL) == 0
+                    || control.writerUnaccountedFor()) {
+                return false;
+            }
+            control.reservation.set(null);
+            DESTINATIONS_IN_USE.remove(held, control);
+            return true;
         }
-        control.reservation.set(null);
-        DESTINATIONS_IN_USE.remove(held, control);
-        return true;
     }
 
     /**
      * Claim {@code destinationKey} for {@code control}. True only if this job holds it now.
      *
-     * <p>A holder whose writer is accounted for has nothing left to protect, and its claim is taken over. A
-     * holder that started a process closing never accounted for - or that has claimed a start it has not
-     * created yet - keeps it, because there is a writer here that has not been answered for. Failing to claim
-     * is reported as failure rather than as an absence: the last thing this needs is a directory read as free
-     * because the claim could not be taken.
+     * <p>An active holder keeps its claim even when no process is running, including before spawn and during
+     * verification. A terminal holder keeps it while a start or writer remains unresolved. Terminal publication,
+     * reservation assignment and removal are coordinated here; claimSpawn atomically arbitrates against the
+     * terminal bit, so a terminal holder cannot acquire a new start after the claim is handed back.
      */
     private static boolean claimDestination(String destinationKey, JobControl control) {
-        for (int attempt = 0; attempt < 3; attempt++) {
+        synchronized (DESTINATION_OWNERSHIP_LOCK) {
+            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0) return false;
             JobControl holder = DESTINATIONS_IN_USE.get(destinationKey);
-            if (holder == null) {
-                if (DESTINATIONS_IN_USE.putIfAbsent(destinationKey, control) == null) {
-                    return true;
-                }
-            } else if (!holder.writerUnaccountedFor()
-                    && DESTINATIONS_IN_USE.remove(destinationKey, holder)) {
-                continue;
-            } else {
-                return false;
+            if (holder != null) {
+                if ((holder.ownershipState.get() & JobControl.TERMINAL) == 0
+                        || holder.writerUnaccountedFor()) return false;
+                DESTINATIONS_IN_USE.remove(destinationKey, holder);
+                holder.reservation.set(null);
             }
+            control.reservation.set(destinationKey);
+            DESTINATIONS_IN_USE.put(destinationKey, control);
+            return true;
         }
-        return false;
     }
 
     /** Which job, if any, holds this destination right now. */
@@ -1386,6 +1396,11 @@ public class FileSyncEngine implements AutoCloseable {
         // job set in motion can still write into it. A job thread that cannot report is one thing; a process
         // that thread started, and that nobody has accounted for, is another - and the second one is the reason
         // a directory cannot be opened to a second writer just because a report got published.
+        // Coordinate terminal publication with reservation admission. The atomic state also arbitrates
+        // against claimSpawn(): after terminal wins, this job can never become a new writer.
+        synchronized (DESTINATION_OWNERSHIP_LOCK) {
+            control.ownershipState.getAndUpdate(state -> state | JobControl.TERMINAL);
+        }
         boolean handedBack = releaseDestinationClaim(control);
         boolean mine;
         synchronized (lifecycleLock) {
@@ -1794,8 +1809,6 @@ public class FileSyncEngine implements AutoCloseable {
                     + " one directory produce numbers neither of them can vouch for.",
                     List.of("destination busy: " + destinationKey), List.of(), 0);
         }
-        control.reservation.set(destinationKey);
-
         Selection src = normalize(request.sourceSelection());
         Selection dst = normalize(request.destinationSelection());
         ScanOptions options = request.scanOptions();

@@ -50,6 +50,68 @@ class JobOwnershipTest {
         assumeTrue(TestSupport.rsyncAvailable(), "rsync not installed");
     }
 
+    @Test
+    void activeJobKeepsDestinationBeforeItsProcessStart(@TempDir Path tmp) throws Exception {
+        assertActiveJobKeepsDestinationAtPhase(tmp, "copying");
+    }
+
+    @Test
+    void activeJobKeepsDestinationDuringVerificationAfterProcessExit(@TempDir Path tmp) throws Exception {
+        assertActiveJobKeepsDestinationAtPhase(tmp, "verifying");
+    }
+
+    private void assertActiveJobKeepsDestinationAtPhase(Path tmp, String phase) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        Path other = Files.createDirectories(tmp.resolve("other"));
+        TestSupport.write(src.resolve("a.txt"), "first job\n");
+        TestSupport.write(other.resolve("outsider.txt"), "second job\n");
+        CountDownLatch reached = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicReference<JobResult> result = new AtomicReference<>();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        ProgressListener listener = new ProgressListener() {
+            @Override public void onPhase(String name) {
+                if (phase.equals(name)) {
+                    reached.countDown();
+                    try {
+                        if (!resume.await(30, TimeUnit.SECONDS)) throw new AssertionError("phase not released");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                }
+            }
+            @Override public void onCompletion(JobResult ignored) { }
+        };
+        FileSyncEngine engine = new FileSyncEngine();
+        Thread caller = new Thread(() -> {
+            try {
+                result.set(engine.execute(request(src, dst, JobType.COPY_AND_VERIFY, "a.txt"), listener));
+            } catch (Throwable e) {
+                thrown.set(e);
+            }
+        }, "reservation-" + phase);
+        try {
+            caller.start();
+            assertTrue(reached.await(30, TimeUnit.SECONDS), "job never reached " + phase);
+            String answer = outsiderAsksFor(other, dst);
+            assertTrue(answer.contains("already using the destination"), answer);
+            assertFalse(Files.exists(dst.resolve("outsider.txt")), "outsider wrote beside an active job");
+        } finally {
+            resume.countDown();
+            caller.join(30_000);
+            engine.close();
+        }
+        assertFalse(caller.isAlive(), "job did not finish");
+        assertNull(thrown.get(), String.valueOf(thrown.get()));
+        assertNotNull(result.get());
+        assertEquals(JobStatus.COMPLETED, result.get().status(), result.get().message());
+        assertTrue(claimIsBack(dst), "completed job retained its destination");
+        assertFalse(outsiderAsksFor(other, dst).contains("already using the destination"));
+    }
+
     // ------------------------------------------------------------------ why a job stopped
 
     @Test
