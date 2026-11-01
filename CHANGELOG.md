@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — audit remediation
+## 1.4.0 — 2026-11-01
 
 ### Consolidated claims and limits
 
@@ -516,7 +516,7 @@ the collision acceptance being asked again for another directory pair and a larg
 each guard: Run's authority check out — 5 of 21 fail; the stale-scan discard out — 2 fail; acceptance not bound to
 the job — 2 fail across the view, write-safety and collision suites.
 
-## 1.4.0 — verification is a switch, not a mode
+### Added — verification is a switch, not a mode
 
 - **The mode control is now `Copy | Verify only`, with a `Verify after copying` checkbox beside it**
   (default: on). Instead of choosing between three modes you choose whether the job copies, and separately
