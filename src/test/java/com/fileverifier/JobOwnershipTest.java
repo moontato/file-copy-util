@@ -105,6 +105,77 @@ class JobOwnershipTest {
         assertFalse(Files.exists(dst.resolve("a.txt")), "terminal worker started a new writer");
     }
 
+    @Test
+    void terminalAdmissionIsNotReportedAsDestinationContention(@TempDir Path tmp) throws Exception {
+        assumeRealRsync();
+        Path src = Files.createDirectories(tmp.resolve("src"));
+        Path dst = Files.createDirectories(tmp.resolve("dst"));
+        TestSupport.write(src.resolve("a.txt"), "data\n");
+        Path marker = tmp.resolve("spawned");
+        Path wrapper = tmp.resolve("rsync-wrapper");
+        Files.writeString(wrapper, "#!/bin/sh\nif [ \"$1\" = --version ]; then exec rsync --version; fi\n"
+                + "touch '" + marker + "'\nexec rsync \"$@\"\n");
+        assertTrue(wrapper.toFile().setExecutable(true));
+        FileSyncEngine engine = new FileSyncEngine();
+        engine.useRsync(wrapper.toString());
+        java.lang.reflect.Field lockField = FileSyncEngine.class.getDeclaredField("DESTINATION_OWNERSHIP_LOCK");
+        java.lang.reflect.Field ownersField = FileSyncEngine.class.getDeclaredField("DESTINATIONS_IN_USE");
+        java.lang.reflect.Field currentField = FileSyncEngine.class.getDeclaredField("currentControl");
+        lockField.setAccessible(true);
+        ownersField.setAccessible(true);
+        currentField.setAccessible(true);
+        var lock = (java.util.concurrent.locks.ReentrantLock) lockField.get(null);
+        var owners = (java.util.Map<?, ?>) ownersField.get(null);
+        var current = (AtomicReference<?>) currentField.get(engine);
+        String key = dst.toRealPath().toString();
+        AtomicReference<JobResult> outcome = new AtomicReference<>();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread caller = new Thread(() -> {
+            try { outcome.set(engine.execute(requestUnchecked(src, dst), null)); }
+            catch (Throwable t) { thrown.set(t); }
+        }, "terminal-admission-caller");
+        lock.lock();
+        try {
+            caller.start();
+            assertTrue(TestSupport.waitFor(() -> lock.hasQueuedThread(caller), 30_000),
+                    "job did not reach claim acquisition after its abort check");
+            Object requestingOwner = current.get();
+            assertNotNull(requestingOwner);
+            assertNull(owners.get(key), "destination was already claimed before close");
+            Thread closer = new Thread(engine::close);
+            closer.start();
+            closer.join(30_000);
+            assertFalse(closer.isAlive(), "close did not publish while claim lock was held");
+            assertNull(owners.get(key), "closing a job that never claimed must not install an owner");
+            var stateField = requestingOwner.getClass().getDeclaredField("ownershipState");
+            var terminalField = requestingOwner.getClass().getDeclaredField("TERMINAL");
+            var reservationField = requestingOwner.getClass().getDeclaredField("reservation");
+            stateField.setAccessible(true);
+            terminalField.setAccessible(true);
+            reservationField.setAccessible(true);
+            int state = ((AtomicInteger) stateField.get(requestingOwner)).get();
+            assertTrue((state & terminalField.getInt(null)) != 0, "terminal state was not published");
+            assertNull(((AtomicReference<?>) reservationField.get(requestingOwner)).get());
+            System.out.println("terminal admission: requesting controller=" + requestingOwner
+                    + "; owner before close=null; owner after terminal publication=" + owners.get(key)
+                    + "; terminal=true; requesting reservation=null");
+        } finally {
+            lock.unlock();
+            caller.join(30_000);
+            engine.close();
+        }
+        assertFalse(caller.isAlive());
+        assertNull(thrown.get(), String.valueOf(thrown.get()));
+        assertNotNull(outcome.get());
+        assertNull(owners.get(key), "terminal admission retained a claim");
+        assertFalse(Files.exists(marker), "terminal admission started a transfer process");
+        assertFalse(Files.exists(dst.resolve("a.txt")));
+        assertEquals(AbortCause.ENGINE_CLOSED, outcome.get().abortCause(), outcome.get().message());
+        assertTrue(outcome.get().message().contains("before rsync started"), outcome.get().message());
+        assertFalse(outcome.get().message().contains("already using the destination"), outcome.get().message());
+        assertEquals(0, outcome.get().filesCopied());
+    }
+
     private static JobRequest requestUnchecked(Path src, Path dst) {
         try { return request(src, dst, JobType.COPY_ONLY, "a.txt"); }
         catch (IOException e) { throw new java.io.UncheckedIOException(e); }

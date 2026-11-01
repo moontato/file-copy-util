@@ -1541,22 +1541,28 @@ public class FileSyncEngine implements AutoCloseable {
         }
     }
 
+    private enum DestinationClaim { CLAIMED, CONTENDED, STOPPED }
+
     /**
-     * Claim {@code destinationKey} for {@code control}. True only if this job holds it now.
+     * Claim {@code destinationKey} for {@code control}, or distinguish contention from stopped admission.
      *
      * <p>An active holder keeps its claim even when no process is running, including before spawn and during
      * verification. A terminal holder keeps it while a start or writer remains unresolved. Reservation
      * assignment and removal are coordinated here; claimSpawn atomically arbitrates against the terminal bit,
      * so a terminal holder cannot acquire a new start after the claim is handed back.
      */
-    private static boolean claimDestination(String destinationKey, JobControl control) {
+    private static DestinationClaim claimDestination(String destinationKey, JobControl control) {
         DESTINATION_OWNERSHIP_LOCK.lock();
         try {
-            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0) return false;
+            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0 || control.abortRequested()) {
+                return DestinationClaim.STOPPED;
+            }
             JobControl holder = DESTINATIONS_IN_USE.get(destinationKey);
             if (holder != null) {
                 if ((holder.ownershipState.get() & JobControl.TERMINAL) == 0
-                        || holder.writerUnaccountedFor()) return false;
+                        || holder.writerUnaccountedFor()) {
+                    return control.abortRequested() ? DestinationClaim.STOPPED : DestinationClaim.CONTENDED;
+                }
                 DESTINATIONS_IN_USE.remove(destinationKey, holder);
                 holder.reservation.set(null);
             }
@@ -1564,12 +1570,12 @@ public class FileSyncEngine implements AutoCloseable {
             DESTINATIONS_IN_USE.put(destinationKey, control);
             // Terminal publication can race admission without waiting for this lock. If it won, this
             // job is forbidden to spawn; undo its new claim before returning to the old worker.
-            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0) {
+            if ((control.ownershipState.get() & JobControl.TERMINAL) != 0 || control.abortRequested()) {
                 DESTINATIONS_IN_USE.remove(destinationKey, control);
                 control.reservation.set(null);
-                return false;
+                return DestinationClaim.STOPPED;
             }
-            return true;
+            return DestinationClaim.CLAIMED;
         } finally {
             DESTINATION_OWNERSHIP_LOCK.unlock();
         }
@@ -2044,7 +2050,14 @@ public class FileSyncEngine implements AutoCloseable {
                     List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause(),
                     control.digestBasis());
         }
-        if (!claimDestination(destinationKey, control)) {
+        DestinationClaim claim = claimDestination(destinationKey, control);
+        if (claim == DestinationClaim.STOPPED) {
+            return abortedBeforeTransfer("Job " + abortWords(control.cause())
+                    + " before rsync started: no file was transferred." + limitPhrase(control),
+                    List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause(),
+                    control.digestBasis());
+        }
+        if (claim == DestinationClaim.CONTENDED) {
             JobControl holder = destinationHolder(destinationKey);
             return failure("Another job in this program is already using the destination " + destDir
                     + (holder != null && holder.writerUnaccountedFor()
