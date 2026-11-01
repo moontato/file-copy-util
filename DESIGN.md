@@ -22,8 +22,10 @@ or platform guarantees.
 | Job admission, close and per-JVM reservation | `JobOwnershipTest.aJobAskedForWhileTheProgramIsClosingIsEitherRefusedOrStopped`, `activeJobKeepsDestinationBeforeItsProcessStart`, `activeJobKeepsDestinationDuringVerificationAfterProcessExit`, `aStartNobodyCouldAccountForCanStillWriteIntoItsDestinationAfterCloseReturns`, `aStopIsNeverQueuedBehindTheDecisionAboutWhetherAStartMayHappen`. Cross-JVM exclusion and strict prevention of writes after close are **not provided**. A retained claim can await cleanup or a later admission. |
 | Stop, observed processes and blocked reads | `CancellationAndProcessTreeTest.aCancelledCopyLeavesNoRsyncReadingTheSource`, `JobOwnershipTest.aCancelledSourceHashStopsTheThreadReadingTheFile`, `aForcedReportNamesTheRowsItLeftOut`. Detached or never-observed descendants and uninterruptible I/O are **not guaranteed stopped**; SIGKILL of the JVM and power loss are outside shutdown-hook guarantees. |
 | Symlink verdicts and UI delivery | `SymlinkVerdictTest.followPolicyDoesNotCallTwoLinksWithTheSameTextAMatch`, `UiJobEventsTest.saturationCoalescesStatusBoundsTheQueueAndNeverLosesCompletion`, `UiCancellationTest.closingTermResistantProcessLeavesEdtAvailableUntilCleanupFinishes`. A display-backed desktop window is **untested here**. |
+| A verdict that turns on what two objects **are** is made without opening either one, and a read that has finished releases the task that did it | `KindBeforeContentTest` (a file opposite a destination link under either policy, a destination file opposite a `LINK` source link, two `LINK` links, an extra link, a directory and a FIFO standing where a file belongs: same verdict, same empty digest columns, no read attempted - measured through a file its own owner cannot read, whose attempted read can only fail and be named, and through a FIFO, whose attempted read cannot end at all; the `FOLLOW` mirror case is asserted to **still** read both sides; a pair whose kind changed while it waited is judged from the objects as they are when its row is written), `RetainedHashTaskTest` (what the cancellation registry holds mid-job, at its busiest and at the end of a job; the reads a stopped job still owes remain registered). "Nothing was read" is a statement about **this program's** reads, not about what `rsync` or the kernel read. The kind probe is metadata read on the job thread, as the scan is: a stat a filesystem will not answer is **not** interruptible by a cancel, and a FIFO reached through a `FOLLOW` source link can still occupy a worker. |
 | Packaging and rsync versions | `ThinJarIT.headlessViewAndLiveThemeSwitchWorkWithoutFlatLaf`, `thinJarCliHelpRunsWithoutDependencies` run after package; `RsyncVersionMatrixTest.theSameTreeProducesTheSameCountersOnEveryRsyncVersion` exercises configured binaries. GitHub release dispatch and tag concurrency are **not exercised by these local tests**. |
 | Which source digest a verdict was compared against, and what each basis may claim | `PostCopyVerificationTest` (both bases give the same verdicts in work-set order; only the pre-copy basis can report a file as one that moved; a dry run and a Verify Only job record `BOTH_SIDES_AT_VERIFICATION`; an unreadable source is `MISMATCH` and not `MISSING`; links are judged by the same rule whenever the source was hashed; the queue and worker counts stay inside their stated bounds; a cancelled comparison produces `PENDING` rows and never an invented `MISMATCH`/`MISSING`; a basis that only describes a finished job is refused as a choice), `CliTest.aCopyCanChooseWhichDigestItsVerdictsAreComparedAgainstAndTheChoiceTravelsIntoReports`, `FileVerifierViewTest.theHashBasisChoiceIsOnTheCopyJobAndTravelsIntoTheJobThatStarts`. Timing figures are same-overlay measurements on one container (§21), **not** independent-drive or larger-than-RAM results; neither basis is a filesystem snapshot. |
+| A verdict that turns on what two objects **are** is made without opening either one, and a finished read releases its task | `KindBeforeContentTest` (a regular file opposite a destination link under either policy, a destination file opposite a `LINK` source link, two `LINK` links, an extra link, a directory and a FIFO standing in the destination: the verdict, the digest columns and the warning are the ones this program has always produced, with no read attempted - measured through a file its own owner cannot read, whose attempted read can only fail and be reported, and through a FIFO, whose attempted read cannot end at all; the `FOLLOW` mirror case is asserted to **still** read both sides; a pair whose kind changed while it waited is judged from the objects as they are when its row is written), `RetainedHashTaskTest` (what the cancellation registry holds mid-job, at its busiest, and at the end of a job; the reads a stopped job still owes remain registered). "No read attempted" is evidence about this program's own reads, **not** about what `rsync` or the kernel read; the kind probe is metadata read on the job thread, like the scan, so a stat a filesystem will not answer is **not** interruptible by a cancel, and a FIFO reached through a `FOLLOW` source link can still block a worker. |
 
 ## 1. One path identity
 
@@ -102,6 +104,26 @@ each unit of work.
   `FOLLOW` hands over the target's contents (`rsync --copy-links`) and compares bytes, and says so in the
   warnings: that verdict is about the contents at the end of a link, and a link pointing outside the two
   directories takes the read outside them.
+- **Kind is settled before content is read, and a digest is asked for only where a side's own kind has content to
+  give.** `verdictFromKinds` answers every case that turns on what the two objects are - a regular file opposite
+  a link, two links under `LINK`, an extra object that is a link - and only a pair it cannot settle reaches the
+  digest comparison in `classify`, which is one rule layered over the other rather than a second rule. A read is
+  skipped for an object that is not there, for a link no policy reads through on that side, and for an object
+  that is neither a link nor a regular file: a directory, FIFO, socket or device is recognised as what it is
+  instead of being opened, failed on and reported as an unreadable file. The verdicts and the digest columns are
+  the ones this program produced before for the same pairs; what changed is that getting them opens nothing, and
+  `contentIsReadable` is re-checked inside the read itself rather than trusted from the earlier probe
+  (`KindBeforeContentTest`).
+
+- Kind is settled before content is read, and a digest is asked for only where a side's own kind has content to
+  give. `verdictFromKinds` answers every case that turns on what the two objects are - a regular file opposite a
+  link, two links under `LINK`, an extra object that is a link - and only a pair it cannot settle reaches the
+  digest comparison in `classify`. Nothing is opened for an object that is not there, nothing through a link this
+  policy does not follow, and nothing for an object that is neither a link nor a regular file: a directory, a
+  FIFO, a socket or a device is recognised as what it is, instead of being opened and reported as an unreadable
+  file (a destination directory) or being blocked on (a destination FIFO). The verdicts are unchanged, including
+  which digest columns are empty; a source link under `FOLLOW`, whose verdict is about the bytes at the end of it,
+  is still digested on both sides (`KindBeforeContentTest`).
 
 ## 4. rsync, and how its output is read
 
@@ -337,6 +359,14 @@ filtered view for the filter boxes.
   after that digest. A post-copy comparison reads both sides afterwards and can only say they read alike
   during verification. A real point-in-time guarantee would need a filesystem snapshot or immutability the
   filesystem is not providing here (§21).
+- Kinds are read as metadata before any digest is queued, and a pair the kinds settle is digested on neither
+  side. On the post-copy loop that probe runs on the job thread, as the tree scan does: a stat a filesystem
+  will not answer blocks that loop, and a stat is not a read the digest loop can interrupt. The probe decides
+  what to read; the verdict is decided from kinds read again when the row is written, so a kind that changed
+  in between is judged from the later facts and the content it then needs is read then
+  (`KindBeforeContentTest.aPairSettledByKindIsLookedAtAgainBeforeItsVerdictIsWritten`). What is *not* removed by
+  this is the hazard at the end of a followed link: a `FOLLOW` source link whose target is a FIFO can still
+  occupy a worker on a read that will not end.
 - The post-copy basis is opt-in, and its cost is not uniform: measured on one container's overlay
   filesystem it was 33–42% shorter for a single 256 MiB file and 4–6% **longer** for a tree of 2000
   four-KiB files (§21). Those figures say nothing about a disk, a network filesystem, or a tree larger
@@ -743,7 +773,13 @@ loop never looked for a cancellation. Now:
   refuses to stop - a stalled mount, an unreadable device - is reported as what it is: "A read of a source file
   is still running after being asked to stop, and cannot be interrupted... It writes nothing: hashing only
   reads; but it may still be holding the disk busy." Forced reporting is a last resort, not a substitute for
-  cancelling a cooperative read.
+  cancelling a cooperative read;
+- owning them does not mean holding them for ever. A task is **retired** from the registry at the point its
+  result has been taken delivery of or found to be cancelled, in each of the three passes that register one, so
+  a job does not carry a finished task - and the digest, pair of side facts or verdict hanging off it - through
+  the rest of its run. A task that has answered cannot be interrupted, so a retired one is nothing a stop needs.
+  What is still queued or still reading stays registered, and a job stopped mid-tree is measured still holding it
+  (`RetainedHashTaskTest`).
 
 Measured here, on rsync 3.4.0 and 3.1.3, with a 300 MB throttled transfer in flight: `cancel()` to completion
 is about **400-500 ms** on both versions. A job whose thread cannot finish is reported stopped about **5.5 s**
@@ -935,7 +971,16 @@ cancellation into a finding
 (`PostCopyVerificationTest.aCancelledComparisonReportsPendingRowsInsteadOfInventingVerdicts`).
 
 Queue depth and worker count are recorded per job (`peakVerificationQueue()`, `peakVerificationWorkers()`)
-so "bounded" is a measured ceiling rather than an intention, and the tests assert against them.
+so "bounded" is a measured ceiling rather than an intention, and the tests assert against them. So is what the
+cancellation registry **holds** rather than what it has queued (`retainedHashTasks()`,
+`peakRetainedHashTasks()`): a task is retired once its result has been taken delivery of, so a completed read
+stops costing the job anything, while work still owed stays registered for a stop to reach. Measured on this
+machine: a 300-file post-copy job peaks at 16 registered tasks and ends with 0, the same tree under the default
+basis peaks at 300 rather than at the 600 its two passes registered together and ends with 0, and a 400-file
+Verify Only - which still queues every file it has work for - ends with 0
+(`RetainedHashTaskTest`; the pre-fix figures for the same probe are in
+`ci-followup-evidence/kind-and-retention/RETENTION.md`). These are counts of this program's own tasks, not
+memory measurements.
 
 One thing deliberately did not change: the identity a collision acceptance is tied to (§16) is still the two
 directories, the kind of job and the files it was asked to handle. The verification basis changes what the job

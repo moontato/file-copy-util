@@ -15,6 +15,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -173,20 +174,25 @@ public class FileSyncEngine implements AutoCloseable {
     private static final int MAX_HASH_THREADS = 4;
 
     /**
-     * How many files the post-copy verification loop may have queued at once, each contributing one source
-     * read and one destination read (one for a destination-only file). Bounded on purpose: a 300k-file job
-     * must not hold a future for every file it has not read yet, and a job being stopped has this much queued
-     * reading to drop rather than a queue as long as the tree.
+     * How many files the post-copy verification loop may have queued at once. Each contributes at most one
+     * source read and one destination read - one for a destination-only file, and none at all for a pair whose
+     * two kinds settle the verdict. Bounded on purpose: a 300k-file job must not hold a future for every file
+     * it has not read yet, it must not hold one for every file it has already reported either, and a job being
+     * stopped has this much queued reading to drop rather than a queue as long as the tree.
      */
     static final int VERIFY_WINDOW_FILES = 8;
 
     /**
      * What the last verification actually ran with, recorded rather than inferred: the most hash tasks this
-     * engine had queued at once, and the most it ran at the same time. A claim that bounded work is bounded
-     * should be a measurement of this program's own behaviour, and these are that measurement.
+     * engine had queued at once, the most it ran at the same time, and the most its cancellation registry ever
+     * held. A claim that bounded work is bounded should be a measurement of this program's own behaviour, and
+     * these are that measurement. The third is the one that speaks to retention rather than to queueing: a
+     * task the job has taken delivery of is retired, so what the registry holds is the work still owed.
      */
     private volatile int peakVerificationQueue;
     private volatile int peakVerificationWorkers;
+    /** The busiest the running job's cancellation registry was, recorded from the job's own counter. */
+    private volatile int peakRetainedHashTasks;
 
     /** The worker ceiling a verification pool gets: {@link #MAX_HASH_THREADS}, or fewer cores if there are fewer. */
     static int verificationWorkerBound() {
@@ -199,6 +205,21 @@ public class FileSyncEngine implements AutoCloseable {
 
     int peakVerificationWorkers() {
         return peakVerificationWorkers;
+    }
+
+    /**
+     * How many hash tasks the current job's cancellation registry holds right now. Read from a progress
+     * callback this says what a job retains while it works; read after one it says what the job left behind.
+     * The queue figures above say how much work is waiting; this says how much finished work is still held.
+     */
+    int retainedHashTasks() {
+        JobControl control = currentControl.get();
+        return control == null ? 0 : control.retainedHashTasks();
+    }
+
+    /** The most hash tasks the current job's cancellation registry held at once. */
+    int peakRetainedHashTasks() {
+        return peakRetainedHashTasks;
     }
 
     /** rsync progress line, e.g. "  1,500,000,006  99%  975.13MB/s  0:00:01 (xfr#2, to-chk=2/4)". */
@@ -784,7 +805,23 @@ public class FileSyncEngine implements AutoCloseable {
          * 40 GiB file for nobody.
          */
         private final ConcurrentLinkedQueue<ExecutorService> hashPools = new ConcurrentLinkedQueue<>();
-        private final ConcurrentLinkedQueue<Future<?>> hashFutures = new ConcurrentLinkedQueue<>();
+        /**
+         * The hash tasks this job still has to answer for.
+         *
+         * <p>A Set and not a queue, because a task leaves it: {@link #retire(Future)} drops a task the moment
+         * its result has been consumed. A task that has answered cannot be interrupted, so keeping it here
+         * buys a stop nothing, while keeping it does cost the job something - the task object, and the result
+         * hanging off it (a digest, a pair of side facts, a whole verdict) stays reachable for as long as this
+         * registry holds it. A 300k-file job that never let go of a task held a result per file it had already
+         * reported, for the whole of the job, across every phase of the job.
+         *
+         * <p>Only the job thread registers and retires, so {@link #retainedHashTasks()} and
+         * {@link #peakRetainedHashTasks()} are exact for a job rather than an estimate: a stop reading them
+         * from another thread sees a count from somewhere on that timeline, which is what a counter is for.
+         */
+        private final Set<Future<?>> hashFutures = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        /** The busiest this job's registry ever was. Updated on registration, which only the job thread does. */
+        private volatile int peakRetainedHashTasks;
 
         /** Take ownership of a hash pool so a stop can shut it down. */
         void adopt(ExecutorService pool) {
@@ -794,12 +831,38 @@ public class FileSyncEngine implements AutoCloseable {
         /** Take ownership of a queued hash task so a stop can drop or interrupt it. */
         void adopt(Future<?> future) {
             hashFutures.add(future);
+            peakRetainedHashTasks = Math.max(peakRetainedHashTasks, hashFutures.size());
+        }
+
+        /**
+         * Give up ownership of a task whose result this job has already taken delivery of. Only a task that
+         * has answered may be retired - a task still queued or still reading is exactly what a stop needs to
+         * find here - and every call site of this is a point where the result has been read out of the future
+         * or the future has been found to be cancelled, and so cannot be running any more.
+         */
+        void retire(Future<?> future) {
+            if (future != null) {
+                hashFutures.remove(future);
+            }
+        }
+
+        /** How many hash tasks this job's registry holds right now. */
+        int retainedHashTasks() {
+            return hashFutures.size();
+        }
+
+        /** The most hash tasks this job's registry held at once. */
+        int peakRetainedHashTasks() {
+            return peakRetainedHashTasks;
         }
 
         /**
          * Stop the hashing this job started: queued work is dropped, running tasks are interrupted. A local
          * read checks for interruption between buffers, so this ends it; a read that the kernel will not
          * interrupt keeps going, which the caller reports as a warning rather than as a completed stop.
+         *
+         * <p>Nothing is retired here. A cancelled task is not necessarily finished - a read the kernel will not
+         * interrupt is still going, and its task is still the handle on it.
          */
         void stopHashing() {
             for (Future<?> future : hashFutures) {
@@ -1432,6 +1495,7 @@ public class FileSyncEngine implements AutoCloseable {
         markActivity(control, "starting: " + request.jobType());
         peakVerificationQueue = 0;
         peakVerificationWorkers = 0;
+        peakRetainedHashTasks = 0;
         return control;
     }
 
@@ -2902,42 +2966,50 @@ public class FileSyncEngine implements AutoCloseable {
             }
         }
 
-        for (Future<Verdict> future : futures) {
+        for (int i = 0; i < futures.size(); i++) {
             if (control.abortRequested()) {
                 break;
             }
+            Future<Verdict> future = futures.get(i);
             Verdict verdict;
+            // Both releases happen whether this verdict arrived, was cancelled, or never decided anything:
+            // in all three cases the task is done, and its result is the last thing the job was holding on to.
             try {
-                verdict = future.get();
-            } catch (CancellationException stopped) {
-                // The job stopped this comparison; the file is simply not among the files that were checked.
-                continue;
-            } catch (ExecutionException e) {
-                if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
-                    throw algorithmException;
+                try {
+                    verdict = future.get();
+                } catch (CancellationException stopped) {
+                    // The job stopped this comparison; the file is simply not among the files that were checked.
+                    continue;
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                        throw algorithmException;
+                    }
+                    // A task that could not decide is not a verdict; the read problem it recorded (if any)
+                    // is reported below.
+                    continue;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
-                // A task that could not decide is not a verdict; the read problem it recorded (if any)
-                // is reported below.
-                continue;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+                if (verdict == null) {
+                    continue;
+                }
+                markActivity(control, "verified " + verdict.relPath());
+                switch (verdict.kind()) {
+                    case "OK" -> progress.countMatched();
+                    case "MISSING" -> progress.countMissing();
+                    case "MISMATCH" -> progress.countMismatched();
+                    default -> progress.countExtra();
+                }
+                verifiedNames.add(verdict.relPath());
+                recordOutcome(progress, outcomes, listener, verdict.relPath(), verdict.kind(),
+                        verdict.sourceHash(), verdict.destHash(),
+                        transfers.getOrDefault(verdict.relPath(), TransferDisposition.NOT_COPIED));
+                progress.verifiedFile(!verifyOnly, verdict.relPath());
+            } finally {
+                futures.set(i, null);
+                control.retire(future);
             }
-            if (verdict == null) {
-                continue;
-            }
-            markActivity(control, "verified " + verdict.relPath());
-            switch (verdict.kind()) {
-                case "OK" -> progress.countMatched();
-                case "MISSING" -> progress.countMissing();
-                case "MISMATCH" -> progress.countMismatched();
-                default -> progress.countExtra();
-            }
-            verifiedNames.add(verdict.relPath());
-            recordOutcome(progress, outcomes, listener, verdict.relPath(), verdict.kind(),
-                    verdict.sourceHash(), verdict.destHash(),
-                    transfers.getOrDefault(verdict.relPath(), TransferDisposition.NOT_COPIED));
-            progress.verifiedFile(!verifyOnly, verdict.relPath());
         }
 
         emitVerificationWarnings(warnings, readProblems, sourceMoved, kindChanges, comparedByBytes);
@@ -2945,12 +3017,20 @@ public class FileSyncEngine implements AutoCloseable {
         // recorded so the difference against the bounded post-copy loop is a measured one, not an assertion.
         peakVerificationQueue = Math.max(peakVerificationQueue, futures.size());
         peakVerificationWorkers = Math.max(peakVerificationWorkers, peakRunning.get());
+        peakRetainedHashTasks = Math.max(peakRetainedHashTasks, control.peakRetainedHashTasks());
         return verifiedNames;
     }
 
-    /** One file waiting to be decided, with the two reads that decide it. */
-    private record PendingPair(int index, String relPath, Future<SideFacts> source, Future<SideFacts> destination,
-                               int tasks) {
+    /**
+     * One file waiting to be decided: what its two sides are, the digest reads those kinds still call for,
+     * which of the two sides were read, and how many reads are in flight for it.
+     *
+     * <p>A pair with no read in it is one whose kinds settled the question - a link opposite a file, two
+     * links, an extra link - and no content was wanted for it. The verdict is still decided when the pair is
+     * consumed, on kinds read afresh then, and not from the older ones recorded here.
+     */
+    private record PendingPair(int index, String relPath,
+                               Future<SideFacts> sourceSide, Future<SideFacts> destinationSide, int tasks) {
     }
 
     /**
@@ -3005,45 +3085,42 @@ public class FileSyncEngine implements AutoCloseable {
         int next = 0;
         int queuedTasks = 0;
         int peakQueuedTasks = 0;
+        // The probe below decides only what to read. The warnings the verdict rule writes belong to the verdict
+        // that is actually recorded, which is the one decided when this pair is consumed, so the probe writes
+        // into a scratch set that is emptied every time it is used: a probe that settled a pair and a consume
+        // that settled it again would otherwise accumulate a copy of every kind warning this job reports.
+        Set<String> probeOnlyKindChanges = new HashSet<>();
         try {
             while (true) {
                 while (next < total && pending.size() < VERIFY_WINDOW_FILES && !control.abortRequested()) {
                     final int index = next++;
                     final boolean destinationOnly = index >= workSet.size();
                     final FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
-                    final String rel = destinationOnly
-                            ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+                    final String rel = relOf(index, workSet, extras);
                     final Path destPath = destDir.resolve(rel);
-                    Future<SideFacts> sourceTask = destinationOnly ? null : pool.submit(() -> {
-                        if (control.abortRequested()) {
-                            return null;
+                    // Kinds first, on this thread, because they are what decides whether any content is read at
+                    // all. These are metadata reads - the same lstat-and-stat the read tasks were doing for
+                    // themselves - and a pair they settles queues no read whatever.
+                    final SideFacts sourceShape = destinationOnly ? null
+                            : shapeOf(sourceEntry.absolutePath(), linkPolicy, false);
+                    final SideFacts destinationShape = shapeOf(destPath, linkPolicy, true);
+                    boolean settledByKind = verdictFromKinds(index, workSet, extras, sourceShape,
+                            destinationShape, probeOnlyKindChanges, linkPolicy) != null;
+                    probeOnlyKindChanges.clear();
+                    Future<SideFacts> sourceSide = null;
+                    Future<SideFacts> destinationSide = null;
+                    if (!settledByKind) {
+                        if (sourceShape != null && contentIsReadable(sourceShape, linkPolicy, false)) {
+                            sourceSide = submitSideTask(control, pool, rel, linkPolicy, false,
+                                    sourceEntry.absolutePath(), readProblems, running, peakRunning);
                         }
-                        int live = running.incrementAndGet();
-                        peakRunning.accumulateAndGet(live, Math::max);
-                        try {
-                            return readSourceSide(sourceEntry, rel, linkPolicy, null, readProblems);
-                        } finally {
-                            running.decrementAndGet();
+                        if (contentIsReadable(destinationShape, linkPolicy, true)) {
+                            destinationSide = submitSideTask(control, pool, rel, linkPolicy, true, destPath,
+                                    readProblems, running, peakRunning);
                         }
-                    });
-                    Future<SideFacts> destinationTask = pool.submit(() -> {
-                        if (control.abortRequested()) {
-                            return null;
-                        }
-                        int live = running.incrementAndGet();
-                        peakRunning.accumulateAndGet(live, Math::max);
-                        try {
-                            return readDestinationSide(destPath, rel, readProblems);
-                        } finally {
-                            running.decrementAndGet();
-                        }
-                    });
-                    if (sourceTask != null) {
-                        control.adopt(sourceTask);
                     }
-                    control.adopt(destinationTask);
-                    int tasks = sourceTask == null ? 1 : 2;
-                    pending.addLast(new PendingPair(index, rel, sourceTask, destinationTask, tasks));
+                    int tasks = (sourceSide == null ? 0 : 1) + (destinationSide == null ? 0 : 1);
+                    pending.addLast(new PendingPair(index, rel, sourceSide, destinationSide, tasks));
                     queuedTasks += tasks;
                     peakQueuedTasks = Math.max(peakQueuedTasks, queuedTasks);
                 }
@@ -3057,13 +3134,20 @@ public class FileSyncEngine implements AutoCloseable {
                     // or MISMATCH for a digest that was never taken would invent a finding out of a cancellation.
                     break;
                 }
-                SideFacts source;
-                SideFacts destination;
+                boolean destinationOnly = pair.index() >= workSet.size();
+                SideFacts source = null;
+                SideFacts destination = null;
                 try {
-                    destination = pair.destination().get();
-                    source = pair.source() == null ? null : pair.source().get();
+                    if (pair.destinationSide() != null) {
+                        destination = pair.destinationSide().get();
+                    }
+                    if (pair.sourceSide() != null) {
+                        source = pair.sourceSide().get();
+                    }
                 } catch (CancellationException stopped) {
                     // The job stopped this comparison; the file is simply not among the files that were checked.
+                    control.retire(pair.sourceSide());
+                    control.retire(pair.destinationSide());
                     continue;
                 } catch (ExecutionException e) {
                     if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
@@ -3071,13 +3155,46 @@ public class FileSyncEngine implements AutoCloseable {
                     }
                     // A side that could not be read recorded its problem (if any) in readProblems; a verdict
                     // is not the place to guess at what it would have been.
+                    control.retire(pair.sourceSide());
+                    control.retire(pair.destinationSide());
                     continue;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 }
-                if (source == null || destination == null) {
-                    continue;
+                control.retire(pair.sourceSide());
+                control.retire(pair.destinationSide());
+                // A side this pair queued no read for is looked at again here, at the moment its row is written.
+                // The probe decided what to read; this is where the finding is made, and a file that became a
+                // link, a directory or nothing at all while its pair waited is judged as the object it has
+                // become - which is where the older code judged it, having read the kind inside the read task.
+                // A side that was read is not looked at again: its facts came out of that read.
+                if (!destinationOnly && source == null) {
+                    source = shapeOf(workSet.get(pair.index()).absolutePath(), linkPolicy, false);
+                }
+                if (destination == null) {
+                    destination = shapeOf(destDir.resolve(pair.relPath()), linkPolicy, true);
+                }
+                // Only a pair whose kinds no longer settle it has to go and read something. A pair that the
+                // probe settled, and that the fresh kinds settle again, is decided without a read - which is the
+                // whole point of looking at kinds first, and the reason this is a check here rather than an
+                // unconditional read of whatever is left.
+                boolean needsContent = verdictFromKinds(pair.index(), workSet, extras, source, destination,
+                        probeOnlyKindChanges, linkPolicy) == null;
+                probeOnlyKindChanges.clear();
+                if (needsContent && !control.abortRequested()) {
+                    // A pair the probe queued no read for has turned into one that needs content. It is read
+                    // here, on the same pool and under the same interruption rules, which makes this the one
+                    // case where the loop waits for a read it queued outside its window.
+                    if (!destinationOnly && source != null && pair.sourceSide() == null
+                            && contentIsReadable(source, linkPolicy, false)) {
+                        source = awaitSide(control, submitSideTask(control, pool, pair.relPath(), linkPolicy, false,
+                                workSet.get(pair.index()).absolutePath(), readProblems, running, peakRunning));
+                    }
+                    if (pair.destinationSide() == null && contentIsReadable(destination, linkPolicy, true)) {
+                        destination = awaitSide(control, submitSideTask(control, pool, pair.relPath(), linkPolicy,
+                                true, destDir.resolve(pair.relPath()), readProblems, running, peakRunning));
+                    }
                 }
                 Verdict verdict = classify(control, pair.index(), workSet, extras, source, destination,
                         kindChanges, comparedByBytes, linkPolicy);
@@ -3107,7 +3224,53 @@ public class FileSyncEngine implements AutoCloseable {
         emitVerificationWarnings(warnings, readProblems, sourceMoved, kindChanges, comparedByBytes);
         peakVerificationQueue = Math.max(peakVerificationQueue, peakQueuedTasks);
         peakVerificationWorkers = Math.max(peakVerificationWorkers, peakRunning.get());
+        peakRetainedHashTasks = Math.max(peakRetainedHashTasks, control.peakRetainedHashTasks());
         return verifiedNames;
+    }
+
+    /** One side of one file, read on this loop's pool and registered with the job so a stop can reach it. */
+    private Future<SideFacts> submitSideTask(JobControl control, ExecutorService pool, String rel,
+                                             ScanOptions.SymlinkPolicy linkPolicy, boolean destinationSide,
+                                             Path path, Set<String> readProblems, AtomicInteger running,
+                                             AtomicInteger peakRunning) {
+        Future<SideFacts> task = pool.submit(() -> {
+            if (control.abortRequested()) {
+                return null;
+            }
+            int live = running.incrementAndGet();
+            peakRunning.accumulateAndGet(live, Math::max);
+            try {
+                return readSideNow(path, rel, linkPolicy, destinationSide, readProblems);
+            } finally {
+                running.decrementAndGet();
+            }
+        });
+        control.adopt(task);
+        return task;
+    }
+
+    /**
+     * Take delivery of one side's read and let go of the task that produced it. A task that has answered cannot
+     * be interrupted, so there is nothing left for the job's registry to hold on to - and the digest, the pair of
+     * side facts or the whole verdict hanging off it is what a long job should not be carrying.
+     */
+    private SideFacts awaitSide(JobControl control, Future<SideFacts> task)
+            throws NoSuchAlgorithmException, InterruptedException {
+        if (task == null) {
+            return null;
+        }
+        try {
+            return task.get();
+        } catch (CancellationException stopped) {
+            return null;
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                throw algorithmException;
+            }
+            return null;
+        } finally {
+            control.retire(task);
+        }
     }
 
     /**
@@ -3164,66 +3327,120 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /**
-     * The source side of one file.
+     * What one side of a file <i>is</i>: there or not, a link and the text it carries, and whether a regular
+     * file is reached. No content is read to answer this, and for a link nothing ever is - under LINK a link's
+     * own properties are its kind and its text, and under FOLLOW it is the object at the end of the link that
+     * the digest stage is asked to compare.
      *
-     * <p>Under LINK a link is judged by its kind and its text and is never opened. Opening it follows it: a
-     * link to a directory fails the open with "Is a directory", a link to a FIFO blocks the job on a read it
-     * was never asked to make, and a link outside the two trees gets a digest of something the job has no
-     * business reading. Under FOLLOW the verdict is about the bytes at the end of the link, and the
-     * {@code comparedByBytes} warning is what says so out loud.
-     *
-     * @param knownHash the digest this job took before the copy, or null when this side has to be read now
+     * <p>These are the facts the verdict rule's kind cases turn on, which is why they are read first: a verdict
+     * settled by kind needs no content at all, so a pair whose two sides are different kinds is judged without
+     * opening either one. One {@code lstat} answers all three questions for an ordinary file, which is fewer
+     * metadata calls than the read this probe replaces; a link needs its text read, and a source link under
+     * FOLLOW needs the kind of what it reaches, exactly as the older read asked for it.
      */
-    private SideFacts readSourceSide(FileEntry entry, String rel, ScanOptions.SymlinkPolicy linkPolicy,
-                                     String knownHash, Set<String> readProblems)
-            throws NoSuchAlgorithmException {
-        Path path = entry.absolutePath();
+    private static SideFacts shapeOf(Path path, ScanOptions.SymlinkPolicy linkPolicy, boolean destinationSide) {
+        try {
+            java.nio.file.attribute.BasicFileAttributes attrs = Files.readAttributes(path,
+                    java.nio.file.attribute.BasicFileAttributes.class,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            if (attrs.isSymbolicLink()) {
+                // A destination link is never read through under any policy; a source link is, but only under
+                // FOLLOW, and then "regular file" means the object the link reaches - which is what the verdict
+                // rule's own tests of this property have always meant by it.
+                boolean readThroughTheLink = !destinationSide && linkPolicy == ScanOptions.SymlinkPolicy.FOLLOW;
+                return new SideFacts(true, true, readLink(path),
+                        readThroughTheLink && Files.isRegularFile(path), null);
+            }
+            return new SideFacts(true, false, null, attrs.isRegularFile(), null);
+        } catch (java.nio.file.NoSuchFileException absent) {
+            return new SideFacts(false, false, null, false, null);
+        } catch (IOException statFailed) {
+            // A path that cannot be stat-ed for any other reason is not a path that is not there. Fall back to
+            // the older three questions, which answer "not a link, not present, not a file" for it, so a
+            // filesystem that answers oddly is handled as it always was rather than by a new guess.
+            return shapeTheSlowWay(path, linkPolicy, destinationSide);
+        }
+    }
+
+    private static SideFacts shapeTheSlowWay(Path path, ScanOptions.SymlinkPolicy linkPolicy,
+                                             boolean destinationSide) {
         boolean link = Files.isSymbolicLink(path);
         boolean present = Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS);
-        if (link && linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
-            return new SideFacts(present, true, readLink(path), false, null);
-        }
-        String hash = knownHash != null ? knownHash : hashFile(path, rel, readProblems);
-        return new SideFacts(present, link, link ? readLink(path) : null, Files.isRegularFile(path), hash);
-    }
-
-    /**
-     * The destination side of one file. A link standing in the destination is never read through, under any
-     * policy: a copy replaces it (measured), and reading through it would compare an object that belongs to
-     * neither directory this job was given.
-     */
-    private SideFacts readDestinationSide(Path destPath, String rel, Set<String> readProblems)
-            throws NoSuchAlgorithmException {
-        boolean link = Files.isSymbolicLink(destPath);
-        boolean present = Files.exists(destPath, java.nio.file.LinkOption.NOFOLLOW_LINKS);
         if (link) {
-            return new SideFacts(true, true, readLink(destPath), false, null);
+            boolean readThroughTheLink = !destinationSide && linkPolicy == ScanOptions.SymlinkPolicy.FOLLOW;
+            return new SideFacts(present, true, readLink(path),
+                    readThroughTheLink && Files.isRegularFile(path), null);
         }
-        return new SideFacts(present, false, null, Files.isRegularFile(destPath),
-                hashFile(destPath, rel, readProblems));
+        return new SideFacts(present, false, null, Files.isRegularFile(path), null);
+    }
+
+    /** The same side, now carrying the digest taken for it. */
+    private static SideFacts digested(SideFacts shape, String hash) {
+        return shape == null ? null
+                : new SideFacts(shape.present(), shape.link(), shape.linkText(), shape.regularFile(), hash);
     }
 
     /**
-     * One file's verdict, decided from what its two sides are. This is the whole verdict rule, and it reads
-     * nothing itself.
+     * Whether this side's own kind leaves any content to digest.
      *
-     * <p>The object is judged before any content is. A link's own properties are its kind and its text: under
-     * LINK that is the whole comparison, and nothing is read through a link, because its target may sit
-     * outside the two directories this job was given. Under FOLLOW the verdict is about the bytes at the end of
-     * a source link, and the report says so. A link standing in the destination is never followed under any
-     * policy: a copy replaces it (measured), and reading through it would compare an object that belongs to
-     * neither directory.
+     * <p>Three answers need no reading: an object that is not there; a link on the destination side or a link
+     * under LINK, neither of which this program reads through; and an object that is neither a link nor a
+     * regular file - a directory, a FIFO, a socket, a device - which has no content this comparison could
+     * digest. That last one used to be attempted regardless: opening a directory is what reported a directory
+     * as an unreadable file, and opening a FIFO is what blocked a job on a read it had never been asked to
+     * make. A source link under FOLLOW is the one link case that does have content, because under FOLLOW the
+     * verdict is about the bytes at the end of it.
      *
-     * <p>Answering null is a verdict of its own: this comparison was interrupted rather than decided, and
-     * answering MISSING or MISMATCH for a file whose digest was never taken would invent a finding out of a
-     * cancellation.
+     * <p>Answering false is not a verdict. It says only that there is nothing to read; what the verdict is stays
+     * the verdict rule's business, and it calls a destination that is a directory MISSING in the same case it
+     * always has.
      */
-    private Verdict classify(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
-                             SideFacts source, SideFacts dest, Set<String> kindChanges,
-                             Set<String> comparedByBytes, ScanOptions.SymlinkPolicy linkPolicy) {
+    private static boolean contentIsReadable(SideFacts side, ScanOptions.SymlinkPolicy linkPolicy,
+                                             boolean destinationSide) {
+        if (!side.present()) {
+            return false;
+        }
+        if (side.link()) {
+            return !destinationSide && linkPolicy == ScanOptions.SymlinkPolicy.FOLLOW && side.regularFile();
+        }
+        return side.regularFile();
+    }
+
+    /**
+     * One side read now: its kind as it is at this moment, and its digest if that kind has content.
+     *
+     * <p>The kind is asked again here rather than carried over from the probe that decided to queue this read.
+     * A pair's kinds are probed when the file enters the verification window, and a file may have become a
+     * link, a directory or nothing at all while its own reads waited; this is the last moment at which the
+     * program can still avoid opening the wrong object, so it does not trust the earlier answer.
+     */
+    private SideFacts readSideNow(Path path, String rel, ScanOptions.SymlinkPolicy linkPolicy,
+                                  boolean destinationSide, Set<String> readProblems)
+            throws NoSuchAlgorithmException {
+        SideFacts fresh = shapeOf(path, linkPolicy, destinationSide);
+        return digested(fresh, contentIsReadable(fresh, linkPolicy, destinationSide)
+                ? hashFile(path, rel, readProblems) : null);
+    }
+
+    /** What one file is called in the work set: its own entry, or the extra object standing in its place. */
+    private static String relOf(int index, List<FileEntry> workSet, List<FileEntry> extras) {
+        return index < workSet.size() ? workSet.get(index).relPath() : extras.get(index - workSet.size()).relPath();
+    }
+
+    /**
+     * The part of the verdict rule that needs nothing but what the two sides are, and, for two links under
+     * LINK, what they say to each other.
+     *
+     * <p>Answering null is not a verdict either: it says this pair is not settled by kind, and that a decision
+     * about it needs the bytes. Answering a verdict means no content could change the answer, which is why a
+     * verdict from here carries no digest on either side - the same rows the older code produced for these
+     * cases, produced now without having read anything to produce them.
+     */
+    private Verdict verdictFromKinds(int index, List<FileEntry> workSet, List<FileEntry> extras,
+                                     SideFacts source, SideFacts dest, Set<String> kindChanges,
+                                     ScanOptions.SymlinkPolicy linkPolicy) {
         boolean destinationOnly = index >= workSet.size();
-        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath()
-                : workSet.get(index).relPath();
+        String rel = relOf(index, workSet, extras);
         boolean destLink = dest.link();
         boolean sourceLink = source != null && source.link();
 
@@ -3275,7 +3492,38 @@ public class FileSyncEngine implements AutoCloseable {
                     + " These are different objects, so this is a mismatch in kind rather than in content.");
             return new Verdict("MISMATCH", rel, null, null);
         }
-        if (sourceLink) {
+        return null;
+    }
+
+    /**
+     * One file's verdict, decided from what its two sides are. This is the whole verdict rule, and it reads
+     * nothing itself.
+     *
+     * <p>The object is judged before any content is, and this method is where that is defined: {@link
+     * #verdictFromKinds} answers every case that turns on kind and link text alone, and only a pair it cannot
+     * settle reaches the digest comparison below. The callers read kinds first for the same reason, so a file
+     * whose sides are different kinds is decided without opening either one.
+     *
+     * <p>A link's own properties are its kind and its text: under LINK that is the whole comparison, and
+     * nothing is read through a link, because its target may sit outside the two directories this job was
+     * given. Under FOLLOW the verdict is about the bytes at the end of a source link, and the report says so.
+     * A link standing in the destination is never followed under any policy: a copy replaces it (measured),
+     * and reading through it would compare an object that belongs to neither directory.
+     *
+     * <p>Answering null is a verdict of its own: this comparison was interrupted rather than decided, and
+     * answering MISSING or MISMATCH for a file whose digest was never taken would invent a finding out of a
+     * cancellation.
+     */
+    private Verdict classify(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
+                             SideFacts source, SideFacts dest, Set<String> kindChanges,
+                             Set<String> comparedByBytes, ScanOptions.SymlinkPolicy linkPolicy) {
+        Verdict byKind = verdictFromKinds(index, workSet, extras, source, dest, kindChanges, linkPolicy);
+        if (byKind != null) {
+            return byKind;
+        }
+        boolean destinationOnly = index >= workSet.size();
+        String rel = relOf(index, workSet, extras);
+        if (source != null && source.link()) {
             comparedByBytes.add(rel);
         }
 
@@ -3305,8 +3553,12 @@ public class FileSyncEngine implements AutoCloseable {
 
     /**
      * One file's verdict where the source digest was already taken before the copy, or where both sides are
-     * read in this file's own task (Verify Only). The destination is the only side this task has left to read
-     * for a copy; the source side is still inspected, because a link is judged before any content is.
+     * read in this file's own task (Verify Only).
+     *
+     * <p>The kinds are read first, and a pair they settles is decided there: this task opens nothing for a
+     * source standing opposite a link, nothing for a destination link, and nothing for an object that is
+     * neither a link nor a file. The destination is the only side this task has left to read for a copy; the
+     * source side is still inspected, because a link is judged before any content is.
      */
     private Verdict verdict(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
                             Path destDir,
@@ -3319,12 +3571,30 @@ public class FileSyncEngine implements AutoCloseable {
         }
         boolean destinationOnly = index >= workSet.size();
         FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
-        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
-        SideFacts dest = readDestinationSide(destDir.resolve(rel), rel, readProblems);
+        String rel = relOf(index, workSet, extras);
+        Path destPath = destDir.resolve(rel);
+        SideFacts destination = shapeOf(destPath, linkPolicy, true);
         SideFacts source = destinationOnly ? null
-                : readSourceSide(sourceEntry, rel, linkPolicy, knownSourceHashes.get(rel), readProblems);
-        Verdict verdict = classify(control, index, workSet, extras, source, dest, kindChanges,
-                comparedByBytes, linkPolicy);
+                : shapeOf(sourceEntry.absolutePath(), linkPolicy, false);
+        Verdict byKind = verdictFromKinds(index, workSet, extras, source, destination, kindChanges, linkPolicy);
+        if (byKind != null) {
+            return byKind;
+        }
+        // Only a pair the kinds cannot settle is read, and each side that is read is read as the object it is
+        // at that moment rather than as the one the probe above saw. A source digest this job took before the
+        // transfer needs no reading at all.
+        String knownHash = destinationOnly ? null : knownSourceHashes.get(rel);
+        if (contentIsReadable(destination, linkPolicy, true)) {
+            destination = readSideNow(destPath, rel, linkPolicy, true, readProblems);
+        }
+        if (source != null) {
+            source = knownHash != null ? digested(source, knownHash)
+                    : contentIsReadable(source, linkPolicy, false)
+                    ? readSideNow(sourceEntry.absolutePath(), rel, linkPolicy, false, readProblems)
+                    : source;
+        }
+        Verdict verdict = classify(control, index, workSet, extras, source, destination,
+                kindChanges, comparedByBytes, linkPolicy);
         // A copy verifies against the digest taken before the transfer started. If the source has moved
         // since then, the honest description is a file that changed under the job, not one that was
         // damaged by it - and only a copy has a pre-transfer digest to make that distinction.
@@ -3421,7 +3691,9 @@ public class FileSyncEngine implements AutoCloseable {
         Map<String, String> hashes = new LinkedHashMap<>();
         NoSuchAlgorithmException pending = null;
         boolean stoppedHashing = false;
-        for (Map.Entry<String, Future<String>> future : futures.entrySet()) {
+        Iterator<Map.Entry<String, Future<String>>> undelivered = futures.entrySet().iterator();
+        while (undelivered.hasNext()) {
+            Map.Entry<String, Future<String>> future = undelivered.next();
             if (control.abortRequested()) {
                 // A stopping job does not wait for digests it no longer needs. The pool has been told to stop
                 // as well, so the tasks that had not started are dropped rather than tying up this thread.
@@ -3429,29 +3701,37 @@ public class FileSyncEngine implements AutoCloseable {
                 break;
             }
             try {
-                String hash = future.getValue().get();
-                if (hash != null) {
-                    hashes.put(future.getKey(), hash);
-                }
-            } catch (CancellationException stopped) {
-                stoppedHashing = true;
-            } catch (ExecutionException e) {
-                if (e.getCause() instanceof FileHasher.HashAborted) {
-                    // Not a read problem: this is the job letting go of a hash it no longer wants.
+                try {
+                    String hash = future.getValue().get();
+                    if (hash != null) {
+                        hashes.put(future.getKey(), hash);
+                    }
+                } catch (CancellationException stopped) {
                     stoppedHashing = true;
-                } else if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
-                    pending = algorithmException;
-                } else if (e.getCause() instanceof java.nio.file.NoSuchFileException) {
-                    // Absence is not a read error. The caller classifies a file with no hash and no
-                    // file as MISSING; warning about it too would bury the log in "could not read"
-                    // lines for files that are simply not there.
-                } else {
-                    warnings.add("Could not read " + side + " file: " + future.getKey()
-                            + " (" + e.getCause() + ")");
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof FileHasher.HashAborted) {
+                        // Not a read problem: this is the job letting go of a hash it no longer wants.
+                        stoppedHashing = true;
+                    } else if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                        pending = algorithmException;
+                    } else if (e.getCause() instanceof java.nio.file.NoSuchFileException) {
+                        // Absence is not a read error. The caller classifies a file with no hash and no
+                        // file as MISSING; warning about it too would bury the log in "could not read"
+                        // lines for files that are simply not there.
+                    } else {
+                        warnings.add("Could not read " + side + " file: " + future.getKey()
+                                + " (" + e.getCause() + ")");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+            } finally {
+                // The digest has been taken delivery of, refused, or found to be cancelled: either way the task
+                // is finished, and a pass over 300k files has no business holding 300k finished tasks - or the
+                // digests hanging off them - until the job ends.
+                undelivered.remove();
+                control.retire(future.getValue());
             }
         }
         if (stoppedHashing) {
@@ -3462,6 +3742,7 @@ public class FileSyncEngine implements AutoCloseable {
         if (pending != null) {
             throw pending;
         }
+        peakRetainedHashTasks = Math.max(peakRetainedHashTasks, control.peakRetainedHashTasks());
         return hashes;
     }
 

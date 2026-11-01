@@ -331,8 +331,7 @@ never followed), name fidelity end to end (comment-looking names, whitespace, ne
 name channels, octal escape decoding), what may be reported as copied after an interrupted transfer, write
 safety (a copy may not overlap what it copies, selected names contained in their tree for copies *and* for Verify
 Only, reports that cannot displace a file and are validated before the job starts, collision acceptance bound to
-the job it was given for), scan authority (Run refused before a scan, during a scan, after a typed path is
-edited, or after the scan options change; a stale scan result discarded and said so; a running job keeping the
+the job it was given for), verdicts decided by kind (a regular file opposite a link, a link opposite a file, two links, an extra link, and an object that is neither a link nor a regular file are each decided with nothing opened - measured through a file its own owner cannot read and through a FIFO, whose attempted read would not end; the FOLLOW mirror cases are asserted to read, and a pair whose kind changed mid-job is judged from what it is when its row is written), what a job holds on to (the cancellation registry keeps only the reads it still owes, measured mid-job, at its peak and at the end of the job), scan authority (Run refused before a scan, during a scan, after a typed path is edited, or after the scan options change; a stale scan result discarded and said so; a running job keeping the
 ticks that were on screen when Run was pressed), job ownership (a cancelled, timed-out or closed job says which
 of the three it was; one job's cancel flag cannot be read as another job's; a job whose own thread never returns
 is reported stopped and cannot block, stop, or rewrite the job after it - including when the program closes while
@@ -397,6 +396,15 @@ target** (`--symlinks follow`) the verdict is about the bytes at the end of the 
 in the **destination** is never read through under any policy, because its target may sit outside the destination.
 So two links carrying the same link text whose targets hold different bytes are a **mismatch**, with a warning
 saying why the byte comparison could not run: the same words in a link are not the same bytes behind them.
+
+A verdict that the two objects answer by **what they are** is made without opening either one. A regular file
+opposite a link, two links, a link opposite a file under `link`: each is decided from its kind and, where the
+policy compares links, from the link text - the same verdict, the same empty digest columns, and no content read
+to produce it. The same rule reaches an object that is neither a link nor a regular file: a directory or a FIFO
+standing where a file should be is recognised as what it is, reported `MISSING`, and never opened - which is also
+why a directory there is no longer reported as an unreadable file on the way to that verdict, and a FIFO there no
+longer blocks a job on a read it was never asked to make. Under `follow target` a *source* link is still read on
+both sides, because under that policy the verdict is about the bytes at the end of it (`KindBeforeContentTest`).
 
 When `rsync` exits 24 ("some files vanished before they could be transferred") the job still finishes with a
 warning, as it always has. What it does not do is take that exit code as proof about individual files: a name

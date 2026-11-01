@@ -64,6 +64,49 @@
   [ci-followup-evidence/post-copy-basis](ci-followup-evidence/post-copy-basis/REPORT.md). They are not
   independent-drive, larger-than-RAM or durability results, and no default behaviour changed because of them.
 
+### Changed — an object's kind is settled before its content is read
+
+- The verdict rule is in two stages, in one place: `verdictFromKinds` answers every case that turns on what the
+  two objects **are** - a regular file opposite a symbolic link, two links under `LINK`, an extra object that is
+  a link - and only a pair it cannot settle reaches the digest comparison. A digest is asked for only where a
+  side's own kind has content to give: not for an object that is not there, not through a link this policy does
+  not follow, and not for an object that is neither a link nor a regular file. The verdicts for those pairs are
+  the verdicts the rule has always produced, including which digest columns are empty; what changed is that
+  producing them opens nothing.
+- Two consequences a user can see, both of them an attempt that no longer happens. A directory standing in the
+  destination where the source has a file is reported `MISSING` without also being reported as an unreadable
+  file - it used to be opened, fail, and be named for it, on the way to the same verdict. And a FIFO at that
+  path no longer blocks a job on a read it was never asked to make. A source link under `FOLLOW`, whose verdict
+  *is* about bytes, is still read on both sides: the mirror cases are asserted too, because a comparison that
+  stopped reading there would look like the same fix and would not be one (`KindBeforeContentTest`, 10 tests -
+  a file its own owner cannot read and a FIFO are what make "nothing was opened" a measurement rather than a
+  claim).
+- The post-copy loop reads both kinds when a file enters its window, and a pair the kinds settle queues no read
+  at all. It reads both kinds again before that file's row is written, so a pair whose kind changed while it
+  waited is judged from what it is at the moment the finding is made - which is where the previous code judged
+  it, having read the kind inside the read task itself
+  (`KindBeforeContentTest.aPairSettledByKindIsLookedAtAgainBeforeItsVerdictIsWritten`).
+
+### Fixed — a hash task the job has taken delivery of no longer stays in the cancellation registry
+
+- The registry of hash tasks a job owns only ever grew. A task stayed registered after its result had been read
+  out of it, and a task is the handle on its result - a digest, a pair of side facts, a whole verdict - so a long
+  job carried a finding per file it had already reported, through every later phase, until the job ended. Each
+  of the three passes that register a task now releases it at the point its result is taken delivery of or found
+  to be cancelled: the pre-copy source digests, the pre-copy verification loop, and the post-copy loop. Work a
+  job still owes stays registered, because that registration is the only way a cancel reaches a queued or running
+  read, and a job stopped mid-tree is measured holding exactly that
+  (`RetainedHashTaskTest.aStoppedJobStillHoldsTheHandleOnEveryReadItHadNotTakenDeliveryOf`).
+- Measured per job on the job thread, where the count is exact: a 300-file Copy & Verify under the post-copy
+  basis peaked at 16 registered tasks - its window - and held **0** at the end; the same tree under the default
+  basis peaked at 300 rather than at the 600 its two passes registered together, and held 0. A 400-file Verify
+  Only peaked at 400, because that loop still queues every file it has work for, and held 0. The same probe run
+  against the pre-fix build (`8d73ff53`) is recorded in
+  [ci-followup-evidence/kind-and-retention/RETENTION.md](ci-followup-evidence/kind-and-retention/RETENTION.md):
+  those peaks are identical, and the figures at the end of the job are 300, 600 and 400 where they are now zero.
+  These are counts of tasks this program holds, **not** memory measurements, and they were taken on this
+  container's overlay filesystem.
+
 Earlier release entries are historical descriptions and measurements, not a substitute for the current limits
 and named evidence in [DESIGN.md](DESIGN.md#claim-to-evidence-map).
 
