@@ -346,8 +346,8 @@ public class FileSyncEngine implements AutoCloseable {
          */
         SOURCE_BEFORE_COPY,
         /**
-         * Read nothing before the transfer: hash the source and the destination together, after {@code rsync}
-         * has finished. The transfer starts sooner and the two digest passes overlap. A match says the two
+         * The preliminary Java SHA-256 pass is skipped: hash the source and the destination together, after
+         * {@code rsync} has finished. The transfer starts sooner and the two digest passes overlap. A match says the two
          * sides read alike during verification - nothing more.
          */
         SOURCE_AFTER_COPY,

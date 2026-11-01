@@ -388,7 +388,7 @@ public final class FileVerifierView extends JPanel {
             + "source hashed before the transfer (the default): every source file is hashed before rsync runs,"
             + " so a copy is compared against the source as it was before the transfer, and a source file that"
             + " changed under the job is named as a file that moved.\n"
-            + "source hashed after the transfer: nothing is read before rsync runs; the source and the"
+            + "source hashed after the transfer: the preliminary Java SHA-256 pass is skipped; the source and the"
             + " destination are hashed together afterwards, with a bounded pool, so the transfer starts sooner."
             + " A match then means only that the two sides read alike during verification - a source that"
             + " changed during or after the copy cannot be detected, and no file is reported as having moved."
