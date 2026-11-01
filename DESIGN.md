@@ -23,6 +23,7 @@ or platform guarantees.
 | Stop, observed processes and blocked reads | `CancellationAndProcessTreeTest.aCancelledCopyLeavesNoRsyncReadingTheSource`, `JobOwnershipTest.aCancelledSourceHashStopsTheThreadReadingTheFile`, `aForcedReportNamesTheRowsItLeftOut`. Detached or never-observed descendants and uninterruptible I/O are **not guaranteed stopped**; SIGKILL of the JVM and power loss are outside shutdown-hook guarantees. |
 | Symlink verdicts and UI delivery | `SymlinkVerdictTest.followPolicyDoesNotCallTwoLinksWithTheSameTextAMatch`, `UiJobEventsTest.saturationCoalescesStatusBoundsTheQueueAndNeverLosesCompletion`, `UiCancellationTest.closingTermResistantProcessLeavesEdtAvailableUntilCleanupFinishes`. A display-backed desktop window is **untested here**. |
 | Packaging and rsync versions | `ThinJarIT.headlessViewAndLiveThemeSwitchWorkWithoutFlatLaf`, `thinJarCliHelpRunsWithoutDependencies` run after package; `RsyncVersionMatrixTest.theSameTreeProducesTheSameCountersOnEveryRsyncVersion` exercises configured binaries. GitHub release dispatch and tag concurrency are **not exercised by these local tests**. |
+| Which source digest a verdict was compared against, and what each basis may claim | `PostCopyVerificationTest` (both bases give the same verdicts in work-set order; only the pre-copy basis can report a file as one that moved; a dry run and a Verify Only job record `BOTH_SIDES_AT_VERIFICATION`; an unreadable source is `MISMATCH` and not `MISSING`; links are judged by the same rule whenever the source was hashed; the queue and worker counts stay inside their stated bounds; a cancelled comparison produces `PENDING` rows and never an invented `MISMATCH`/`MISSING`; a basis that only describes a finished job is refused as a choice), `CliTest.aCopyCanChooseWhichDigestItsVerdictsAreComparedAgainstAndTheChoiceTravelsIntoReports`, `FileVerifierViewTest.theHashBasisChoiceIsOnTheCopyJobAndTravelsIntoTheJobThatStarts`. Timing figures are same-overlay measurements on one container (§21), **not** independent-drive or larger-than-RAM results; neither basis is a filesystem snapshot. |
 
 ## 1. One path identity
 
@@ -76,7 +77,22 @@ each unit of work.
 
 - Only the work set is hashed, in both modes.
 - Copy & Verify hashes the source **before** `rsync` runs and reuses those digests for the comparison
-  afterwards: one hash per selected file per side.
+  afterwards: one hash per selected file per side. This is the default, and the only basis the tool has
+  ever had.
+- A copy may instead be told to digest the source **after** the transfer (`VerificationBasis.SOURCE_AFTER_COPY`):
+  this program's **preliminary SHA-256 pass is skipped** - it hashes no file before `rsync` runs - and each side
+  of each file becomes a hashing task of its own afterwards. That is not the same as "the source is not read
+  before the transfer": the `rsync` command line is unchanged and still carries `--checksum`, so rsync reads
+  the source (and the destination) as part of the transfer, and nothing here claims a storage-level ordering of
+  reads. The bytes this program digests are the same under both bases - one digest pass per side per file; what
+  changes is that no digest pass of its own happens in front of the transfer, and that the two passes overlap.
+  That is a different claim, not a faster spelling of the same one - see §21.
+- The post-copy comparison is one pool for both sides with a bounded window of files in flight
+  (`VERIFY_WINDOW_FILES`), so a job of any size queues a bounded number of reads and, when it is stopped, has
+  a bounded amount of reading to abandon. Worker and queue peaks are recorded per job
+  (`peakVerificationWorkers()`, `peakVerificationQueue()`); measured on a 300-file tree on this four-CPU
+  machine they are 4 workers under either basis, and a queue of 300 pending source digests under the pre-copy
+  basis against 16 under the post-copy basis.
 - Symlinks are judged as the objects they are, and one policy applies to both sides of one job.
   `SKIP` leaves them out of the scan entirely. `LINK` carries the link as an object — a link to a directory
   included (listed, never descended through) and a dangling link included (an object with no target) — copies
@@ -316,6 +332,15 @@ filtered view for the filter boxes.
   `FCU_RSYNC_BINARIES`, so a new release can be added without touching the tests. `FCU_RSYNC` pins the one
   binary the process uses; a test run with `FCU_RSYNC` naming an unusable binary refuses to run rather than
   skipping every rsync-dependent test, which is what a version matrix must never do silently.
+- Neither verification basis is a point-in-time view of the source. A pre-copy digest is taken before
+  `rsync` runs, which is what allows a job to call a file one that moved, but the source can still change
+  after that digest. A post-copy comparison reads both sides afterwards and can only say they read alike
+  during verification. A real point-in-time guarantee would need a filesystem snapshot or immutability the
+  filesystem is not providing here (§21).
+- The post-copy basis is opt-in, and its cost is not uniform: measured on one container's overlay
+  filesystem it was 33–42% shorter for a single 256 MiB file and 4–6% **longer** for a tree of 2000
+  four-KiB files (§21). Those figures say nothing about a disk, a network filesystem, or a tree larger
+  than RAM.
 - The per-side selection rule is modelled (`Selection.selected`/`known`) and stated in the window (each
   list reports how many of its rows are ticked, and the work-set line names the rule that produced the
   count). There is deliberately no third "effective files" list: a third thing to keep in sync was the
@@ -847,6 +872,106 @@ reports `copied=0`, `uncertain=1`, `rsync-said-completed=1` where the destinatio
 and still reports `copied=1` where a file really was created and is the size it should be. Anyone reading exports
 should use the new JSON fields (`wouldCopy`, `uncertain`, `notTransferred`, `transfersAnnounced`,
 `transfersCompletedByRsync`, `processed`) instead of assuming `copied` means "files rsync mentioned".
+
+## 21. Which source digest a verdict is compared against
+
+A verdict compares a source digest with a destination digest, and there are two different source digests a
+job could mean: the one it took before `rsync` ran, and the one it takes when it compares. `VerificationBasis`
+records which one a job used, because the two support different claims.
+
+| Value | When a job records it | What a match may say |
+|---|---|---|
+| `SOURCE_BEFORE_COPY` | A copy that verifies, with the default basis: every selected source file was digested before `rsync` ran, and the comparison is against those digests | The copy equals what the source was when the job started, **and** a source file that changed under the job can be named as a file that moved |
+| `SOURCE_AFTER_COPY` | A copy that verifies, asked for with `--hash-source after-copy` or the window's *Source hashes* control. What it skips is this program's preliminary SHA-256 pass, not source reading as such: `rsync` is still run with `--checksum` and reads both sides during the transfer | The source and the destination read alike during verification — nothing more |
+| `BOTH_SIDES_AT_VERIFICATION` | A Verify Only job, and a dry run that was given the post-copy basis | Both sides were read during the comparison; no transfer is being vouched for |
+| `NOTHING_HASHED` | A job whose verification was turned off | Nothing: the report says what `rsync` did |
+| `NOT_RECORDED` | A result the engine published before any job began - a request refused at preflight - or a `JobResult` built by hand | Nothing: no digest schedule was run |
+
+The first two are choices a request can be given; the other three describe what a job ended up doing. Asking
+a request to be given one of the descriptive values is refused at preflight, because a report that said
+"both sides hashed during verification" for a job that had hashed the source first would be a claim the run
+does not support. Likewise a job that never got to read anything claims no schedule at all: the basis a
+request *wanted* is not evidence about what the job *did*.
+
+### Why the default stayed the default
+
+A pre-copy digest is the only thing that makes a *before-and-after* out of a copy. `CollisionAndRaceTest`
+and `PostCopyVerificationTest.onlyTheBasisWithABeforeToCompareAgainstCanCallAFileOneThatMoved` hold both
+halves: with a fixture that rewrites a source file while the copy runs, the default basis reports the file as
+mismatched **and** warns that it "changed in the source while the job ran", while the post-copy basis reports
+the same file as matching — because by the time it looked, the two sides really did read alike. Neither
+answer is wrong; they are answers to different questions, and the default remains the one that can answer the
+sharper one. A real point-in-time view of the source would need a filesystem snapshot or immutability that
+this program is not given, and neither basis claims one.
+
+### The post-copy loop
+
+Under the post-copy basis no digest of the source exists before `rsync` finishes, and each file needs two of
+them. Hashing both sides inside one task would serialise them — one thread would read a 200 GB file once for the
+source and once again for the destination — which is the cost this basis exists to avoid. So:
+
+- each side of each file is a task in **one** pool sized `min(MAX_HASH_THREADS, availableProcessors)`, the
+  same ceiling the pre-existing hashing passes use;
+- at most `VERIFY_WINDOW_FILES` files, so at most twice that many reads, are queued at a time. A 300k-file
+  job does not hold a future for every file it has not read yet, and stopping a job has a small, known amount
+  of queued reading to drop;
+- pairs are consumed in work-set order, so the rows, the counters and any export come out in the same order
+  every other job produces them in, whichever order the pool happened to read in;
+- the pair is decided by `classify`, which is the whole verdict rule and reads nothing itself. `SideFacts`
+  is what a reading task reports about one side; the pre-copy loop fills the source side from a digest it
+  already has, the post-copy loop fills it by reading. One rule, two ways of feeding it, so the two loops
+  cannot drift apart (`SymlinkVerdictTest` and `PostCopyVerificationTest.linksAreJudgedByTheSameRulesWheneverTheSourceWasHashed`);
+- a file that is there but unreadable is a `MISMATCH` with a read problem named, never a `MISSING`, under
+  either basis;
+- the destination reservation is held until the job's lifecycle ends, exactly as before, so a post-copy
+  comparison is still a job that owns its destination while it reads it
+  (`JobOwnershipTest.activeJobKeepsDestinationDuringVerificationAfterProcessExit`,
+  `PostCopyVerificationTest.theDestinationStaysClaimedWhileThePostCopyComparisonRunsAndIsHandedBackAfterwards`).
+
+Unfinished comparisons are not verdicts. A cancelled job drops the queued reads, and a pair whose read was
+cancelled answers nothing: the file is reported as `PENDING` by the caller, with no hash and with its transfer
+disposition intact. Answering `MISSING` or `MISMATCH` for a digest that was never taken would turn a
+cancellation into a finding
+(`PostCopyVerificationTest.aCancelledComparisonReportsPendingRowsInsteadOfInventingVerdicts`).
+
+Queue depth and worker count are recorded per job (`peakVerificationQueue()`, `peakVerificationWorkers()`)
+so "bounded" is a measured ceiling rather than an intention, and the tests assert against them.
+
+One thing deliberately did not change: the identity a collision acceptance is tied to (§16) is still the two
+directories, the kind of job and the files it was asked to handle. The verification basis changes what the job
+*reads*, not what it *writes*, so an acceptance given for a set of colliding names covers the same names under
+either basis - and an acceptance that followed a different selection or a different pair of directories is
+still refused.
+
+### What it costs, measured, and what those measurements are not
+
+Through the packaged CLI against disposable random data on this machine's scratch overlay (source and
+destination on the same device, `st_dev=35`, four CPUs, page-cache warm, medians of three repetitions; the
+same cases repeated after `fsync` + `POSIX_FADV_DONTNEED` on those files, which is a page-cache hint and not
+a device flush):
+
+| Case | Default basis | Post-copy basis | Difference |
+|---|---|---|---|
+| one 256 MiB file, empty destination | 2.859 s | 1.906 s | −33.4% |
+| one 256 MiB file, identical destination | 2.518 s | 1.535 s | −39.0% |
+| four 64 MiB files, empty destination | 1.508 s | 1.447 s | −4.0% |
+| four 64 MiB files, identical destination | 1.184 s | 1.135 s | −4.2% |
+| 2000 four-KiB files, empty destination | 1.524 s | 1.580 s | **+3.7%** |
+| 2000 four-KiB files, identical destination | 1.100 s | 1.242 s | **+12.9%** |
+
+The transfer starts sooner in every case (0.58–1.28 s after process start becoming 0.15–0.44 s), which is the
+design working as intended. The regression for many small files is a cost of the design too: each file costs
+two queued reads and one pair to wait for, and for four-KiB files that bookkeeping is larger than the read.
+The eviction-hint repetitions tell the same story (a 256 MiB file 33.6–37.4% shorter, the four 64 MiB cases
+unchanged within 0.5%). Two window sizes were measured against each other (`VERIFY_WINDOW_FILES` 8 against
+32, eight repetitions each, `runs-window-sweep.jsonl`): 32 was 2–3% quicker on the 2000-file case and no
+quicker on the large-file cases, inside the run-to-run spread, so the tighter bound was kept.
+
+What these numbers are not: they are one container's overlay filesystem, with both sides on one device and
+32 GiB of RAM holding a 1.1 GB payload; they say nothing about a spinning disk, a network filesystem, a tree
+larger than memory, or concurrent writers. `POSIX_FADV_DONTNEED` drops pages from the page cache — it is not
+a cache flush, not a barrier, and not evidence about a physical device. No default behaviour, and no choice a
+user already made, was changed because of these measurements.
 
 ## 18. What rsync's output can and cannot prove about a transfer
 

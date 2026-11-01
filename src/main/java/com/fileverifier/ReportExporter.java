@@ -22,8 +22,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * ledger exists to keep.
  *
  * <p>Compatibility: the four columns JSON's {@code status}/{@code path}/{@code sourceSha256}/
- * {@code destinationSha256} have always carried are unchanged and keep their order; {@code transfer} and
- * {@code verification} are appended. Names are written raw (an export is a record, not a display).
+ * {@code destinationSha256} have always carried are unchanged and keep their order; {@code transfer},
+ * {@code verification} and the {@code verificationBasis} figures are appended - which digests the verdicts
+ * were comparisons against, what that means, and what it cannot claim. Names are written raw (an export is a
+ * record, not a display).
  *
  * <p>A CSV field that a spreadsheet would try to evaluate is disarmed: a field whose first character is
  * {@code =}, {@code +}, {@code -}, {@code @}, a tab or a carriage return gets a leading apostrophe, which is
@@ -365,6 +367,14 @@ public final class ReportExporter {
         csv.append("# vanished,").append(result.vanishedInputs().size()).append('\n');
         csv.append("# errors,").append(result.errors().size()).append('\n');
         csv.append("# warnings,").append(result.warnings().size()).append('\n');
+        // Which digests the verdicts below are comparisons against. A match against a source hashed before the
+        // copy and a match against a source hashed with the destination afterwards are different claims, and a
+        // reader who was not looking at the command line has to be able to tell them apart from the file alone.
+        csv.append("# verificationBasis,").append(result.verificationBasis().name()).append('\n');
+        csv.append("# verificationBasisMeaning,")
+                .append(csvField(result.verificationBasis().describe())).append('\n');
+        csv.append("# verificationBasisLimitation,")
+                .append(csvField(result.verificationBasis().limitation())).append('\n');
         csv.append("status,path,source_sha256,destination_sha256,transfer,verification\n");
         for (FileSyncEngine.FileOutcome outcome : result.outcomes()) {
             csv.append(csvField(outcome.kind())).append(',')
@@ -424,6 +434,13 @@ public final class ReportExporter {
                 .append(", \"processed\": ").append(result.filesProcessed())
                 .append("},\n");
         json.append("  \"rsyncExitCode\": ").append(result.rsyncExitCode()).append(",\n");
+        // The same fact the CSV comment block carries, for a reader that will act on it rather than read it:
+        // which digests the results array was compared against, and what that comparison therefore cannot say.
+        json.append("  \"verificationBasis\": ").append(field(result.verificationBasis().name())).append(",\n");
+        json.append("  \"verificationBasisMeaning\": ")
+                .append(field(result.verificationBasis().describe())).append(",\n");
+        json.append("  \"verificationBasisLimitation\": ")
+                .append(field(result.verificationBasis().limitation())).append(",\n");
         json.append("  \"selectedButAbsent\": ").append(array(result.selectedButAbsent())).append(",\n");
         json.append("  \"vanishedInputs\": ").append(array(result.vanishedInputs())).append(",\n");
         json.append("  \"errors\": ").append(array(result.errors())).append(",\n");

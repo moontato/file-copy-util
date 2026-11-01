@@ -55,6 +55,19 @@ public final class Cli {
           --verify-only             compare hashes instead of copying
           --no-verify               copy without comparing: nothing is hashed, and the report lists each
                                     written file as COPIED instead of as a verdict
+          --hash-source before-copy|after-copy
+                                    which source digest the comparison is made against (copy jobs that
+                                    verify). before-copy is the default and what every earlier version did:
+                                    each source file is hashed before rsync runs, so a copy is compared
+                                    against the source as it was before the transfer, and a source file that
+                                    changed under the job is named as a file that moved. after-copy reads
+                                    nothing before rsync runs: the source and the destination are hashed
+                                    together after the copy, with a bounded pool, so the transfer starts
+                                    sooner - but a match then means only that the two sides read alike during
+                                    verification, no source change during or after the copy can be detected,
+                                    and no file is reported as having moved. Neither basis is an atomic
+                                    snapshot of anything. The basis a job used is recorded in --csv and --json
+                                    so a report cannot be read as a pre-copy comparison when none was taken.
           --files a.txt,sub/b.txt   relative paths to include; repeatable
           --all                     every file the scan finds (see --exclude)
           --exclude a.txt,...       drop these relative paths from --all; repeatable
@@ -131,6 +144,8 @@ public final class Cli {
         Examples:
           --cli --source /data/src --dest /backup/dst --all                       copy everything, verify it
           --cli --source /data/src --dest /backup/dst --all --no-verify            copy everything, compare nothing
+          --cli --source /data/src --dest /backup/dst --all --hash-source after-copy
+                                    copy everything, then compare both sides as they read after the copy
           --cli --source /data/src --dest /backup/dst --all --dry-run             show what would happen first
           --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
           --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
@@ -205,6 +220,10 @@ public final class Cli {
         JobType jobType = JobType.COPY_AND_VERIFY;
         boolean askedVerifyOnly = false;
         boolean askedNoVerify = false;
+        // Which source digest the comparison is made against. The default is what every earlier version of
+        // this front end did, and it stays the default: nothing about a plain copy-and-verify run changes
+        // because this option exists.
+        FileSyncEngine.VerificationBasis verificationBasis = FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY;
         List<String> fileArgs = new ArrayList<>();
         List<String> excludeArgs = new ArrayList<>();
         List<String> excludeDestArgs = new ArrayList<>();
@@ -253,6 +272,17 @@ public final class Cli {
                 case "--no-verify" -> {
                     jobType = JobType.COPY_ONLY;
                     askedNoVerify = true;
+                }
+                case "--hash-source" -> {
+                    String value = value(args, i, arg);
+                    i++;
+                    switch (value) {
+                        case "before-copy" -> verificationBasis = FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY;
+                        case "after-copy" -> verificationBasis = FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY;
+                        default -> throw new UsageException("--hash-source must be before-copy or after-copy,"
+                                + " got '" + value + "'. before-copy hashes the source before rsync runs;"
+                                + " after-copy hashes it with the destination after the copy.");
+                    }
                 }
                 case "--exclude-dest" -> {
                     String value = value(args, i, arg);
@@ -434,7 +464,8 @@ public final class Cli {
             : new Selection(Set.of(), excludedAtDestination);
 
         JobRequest request = new JobRequest(sourceDir, destDir, jobType,
-                new Selection(selected, selected), destination, scanOptions, detectExtra, dryRun);
+                new Selection(selected, selected), destination, scanOptions, detectExtra, dryRun,
+                verificationBasis);
         return new Options(request, timeoutMillis, bandwidthLimitKbps, maxResults,
                 csvPath == null ? null : Path.of(csvPath),
                 jsonPath == null ? null : Path.of(jsonPath), quiet,
@@ -595,6 +626,19 @@ public final class Cli {
             err.println("Note: --exclude-dest does not apply to a copy; a copy follows the source "
                     + "selection. Use --verify-only to leave files out of the comparison.");
         }
+        if (options.request().verificationBasis() == FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY
+                && options.request().recordedBasis() != FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY) {
+            // The same principle: a switch that cannot do anything in this job is named, not ignored.
+            String reason = !options.request().jobType().verifies()
+                ? "this job compares nothing, so nothing is hashed at all"
+                : !options.request().jobType().copies()
+                    ? "a Verify Only job has no copy to be after, and already hashes both sides during"
+                        + " verification"
+                    : "a dry run writes nothing, so there is no copy for the hashing to be after; the two"
+                        + " sides are hashed during verification";
+            err.println("Note: --hash-source after-copy has no effect here ("
+                    + options.request().jobType().describe() + "): " + reason + ".");
+        }
 
         // The report destinations are checkable now, before a byte is copied. Finding out afterwards that
         // --csv and --json named the same file - or that one of them names a file that exists - means the
@@ -641,6 +685,10 @@ public final class Cli {
             out.println("error: " + error);
         }
         out.println(result.message());
+        // The basis is printed for every job, not only for the opt-in one: a reader of the totals has to know
+        // which digests those verdicts are comparisons against, and "the default" is only obvious if it is said.
+        out.printf("verification basis: %s (%s)%n", result.verificationBasis().describe(),
+                result.verificationBasis().limitation());
         if (!options.request().jobType().verifies()) {
             // The usual totals would read "checked=0 matched=0 mismatched=0" for a job that compared
             // nothing on purpose, which looks like a report of a problem rather than an absence of one.

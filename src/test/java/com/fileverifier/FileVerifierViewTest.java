@@ -54,7 +54,7 @@ class FileVerifierViewTest {
         savedPrefs = new java.util.HashMap<>();
         for (String key : List.of("sourceDir", "destDir", "ignorePatterns", "includeHidden",
             "symlinkPolicy", "timeoutSeconds", "dryRun", "detectExtra", "jobType", "verifyAfterCopy",
-            "darkMode")) {
+            "verificationBasis", "darkMode")) {
             savedPrefs.put(key, prefs.get(key, null));
         }
     }
@@ -85,7 +85,7 @@ class FileVerifierViewTest {
         for (String name : List.of(
             "sourcePathField", "destPathField", "sourceBrowseButton", "destBrowseButton",
             "ignoreField", "hiddenCheck", "extraCheck", "symlinkCombo", "scanButton",
-            "copyButton", "verifyOnlyButton", "verifyCheck", "workSetLabel", "sourceList", "destList",
+            "copyButton", "verifyOnlyButton", "verifyCheck", "hashBasisCombo", "workSetLabel", "sourceList", "destList",
             "sourceFilterField", "destFilterField", "progressBar", "statusLabel", "phaseLabel",
             "logArea", "outputTabs", "resultsTable", "onlyProblemsCheck", "exportCsvButton",
             "exportJsonButton", "dryRunCheck", "jobTimeoutField", "darkModeCheck", "runButton",
@@ -160,6 +160,89 @@ class FileVerifierViewTest {
         assertFalse(((JCheckBox) field(restarted, "verifyCheck")).isSelected(),
             "a switch the user turned off should not silently turn itself back on next time");
         assertEquals(FileSyncEngine.JobType.COPY_ONLY, field(restarted, "currentJobType"));
+    }
+
+    /**
+     * Which source digest a verdict is compared against is a choice the window has to expose, because it
+     * changes what a match means. It sits beside the Verify switch, it is live exactly where it can do
+     * something, and what it says travels into the request and into the result that came back.
+     */
+    @Test
+    void theHashBasisChoiceIsOnTheCopyJobAndTravelsIntoTheJobThatStarts(@TempDir Path roots) throws Exception {
+        prefs.remove("jobType");
+        prefs.remove("verifyAfterCopy");
+        prefs.remove("verificationBasis");
+
+        FileVerifierView view = build();
+        JComboBox<?> basis = (JComboBox<?>) field(view, "hashBasisCombo");
+        JToggleButton copy = (JToggleButton) field(view, "copyButton");
+        JToggleButton verifyOnly = (JToggleButton) field(view, "verifyOnlyButton");
+        JCheckBox verify = (JCheckBox) field(view, "verifyCheck");
+
+        assertEquals(2, basis.getItemCount(),
+            "the window offers the two things a job can be told - hash the source before the transfer, or hash"
+                + " it after - and not the labels that describe what a job ended up doing");
+        assertEquals(FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY, basis.getSelectedItem(),
+            "and the default is the behaviour the tool has always had: this control changes nothing by"
+                + " existing");
+        assertTrue(basis.isEnabled(), "a copy that compares can be told which source digest to compare against");
+
+        SwingUtilities.invokeAndWait(verify::doClick);
+        assertFalse(basis.isEnabled(),
+            "a copy that compares nothing hashes nothing whichever way this is set");
+        SwingUtilities.invokeAndWait(verifyOnly::doClick);
+        assertFalse(basis.isEnabled(),
+            "a job that copies nothing has no copy to be before or after: the control would be a lie");
+
+        SwingUtilities.invokeAndWait(copy::doClick);
+        SwingUtilities.invokeAndWait(verify::doClick);
+        assertTrue(basis.isEnabled(), "back to a copy that compares, and the choice is live again");
+
+        Path src = Files.createDirectories(roots.resolve("src"));
+        Path dest = Files.createDirectories(roots.resolve("dest"));
+        TestSupport.write(src.resolve("a.txt"), "one");
+        TestSupport.write(src.resolve("b.txt"), "two");
+        typePaths(view, src, dest);
+        view.scanRequested();
+        awaitScan(view);
+        SwingUtilities.invokeAndWait(
+            () -> basis.setSelectedItem(FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY));
+        assertTrue(logText(view).contains("Verification basis set to source hashed after the transfer"),
+            logText(view));
+        view.runRequested();
+        awaitJob(view);
+
+        FileVerifierView.CompletedJob ran = view.completedJobInUse();
+        assertEquals(FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY, ran.request().verificationBasis(),
+            "the request the engine was given carries the choice");
+        assertEquals(FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY, ran.result().verificationBasis(),
+            "and the result says which digests its verdicts were compared against, so a row cannot be read as"
+                + " a pre-copy comparison when none was taken");
+        assertEquals(2, ran.result().filesMatched(), ran.result().message());
+        view.engineInUse().close();
+
+        FileVerifierView restarted = build();
+        assertEquals(FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY,
+            ((JComboBox<?>) field(restarted, "hashBasisCombo")).getSelectedItem(),
+            "the choice is remembered like every other option on this window");
+
+        // The recorded basis describes the job that ran, not the setting the window happens to hold: a
+        // Verify Only job has no transfer to be before or after.
+        JToggleButton restartedVerifyOnly = (JToggleButton) field(restarted, "verifyOnlyButton");
+        SwingUtilities.invokeAndWait(restartedVerifyOnly::doClick);
+        Path other = Files.createDirectories(roots.resolve("verify-only"));
+        TestSupport.write(other.resolve("c.txt"), "three");
+        typePaths(restarted, src, other);
+        restarted.scanRequested();
+        awaitScan(restarted);
+        restarted.runRequested();
+        awaitJob(restarted);
+        FileSyncEngine.JobResult verifyOnlyRun = restarted.completedJobInUse().result();
+        assertEquals(FileSyncEngine.VerificationBasis.BOTH_SIDES_AT_VERIFICATION,
+            verifyOnlyRun.verificationBasis(),
+            "asking for a post-copy basis in a job with no copy does not invent one: "
+                + verifyOnlyRun.message());
+        restarted.engineInUse().close();
     }
 
     @Test

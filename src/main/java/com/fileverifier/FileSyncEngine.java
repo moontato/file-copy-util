@@ -172,6 +172,35 @@ public class FileSyncEngine implements AutoCloseable {
     /** Hashing is CPU-bound; more threads than this is memory and noise, not speed. */
     private static final int MAX_HASH_THREADS = 4;
 
+    /**
+     * How many files the post-copy verification loop may have queued at once, each contributing one source
+     * read and one destination read (one for a destination-only file). Bounded on purpose: a 300k-file job
+     * must not hold a future for every file it has not read yet, and a job being stopped has this much queued
+     * reading to drop rather than a queue as long as the tree.
+     */
+    static final int VERIFY_WINDOW_FILES = 8;
+
+    /**
+     * What the last verification actually ran with, recorded rather than inferred: the most hash tasks this
+     * engine had queued at once, and the most it ran at the same time. A claim that bounded work is bounded
+     * should be a measurement of this program's own behaviour, and these are that measurement.
+     */
+    private volatile int peakVerificationQueue;
+    private volatile int peakVerificationWorkers;
+
+    /** The worker ceiling a verification pool gets: {@link #MAX_HASH_THREADS}, or fewer cores if there are fewer. */
+    static int verificationWorkerBound() {
+        return Math.min(MAX_HASH_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
+    }
+
+    int peakVerificationQueue() {
+        return peakVerificationQueue;
+    }
+
+    int peakVerificationWorkers() {
+        return peakVerificationWorkers;
+    }
+
     /** rsync progress line, e.g. "  1,500,000,006  99%  975.13MB/s  0:00:01 (xfr#2, to-chk=2/4)". */
     private static final Pattern RSYNC_PERCENT = Pattern.compile("^\\s+[\\d,]+\\s+(\\d{1,3})%");
 
@@ -278,21 +307,124 @@ public class FileSyncEngine implements AutoCloseable {
     }
 
     /**
+     * When this job takes the digest of the <b>source</b>, which is what decides what a match can claim.
+     *
+     * <p>A request asks for {@link #SOURCE_BEFORE_COPY} or {@link #SOURCE_AFTER_COPY}. The other values are
+     * what a job that copies nothing, or compares nothing, actually did: they exist so {@link
+     * JobResult#verificationBasis()} can say which digests the comparison is against, and a report can never
+     * imply a pre-copy source digest that was never taken.
+     *
+     * <p>Neither basis is a point-in-time guarantee. Both read files that other programs may be changing;
+     * a filesystem snapshot, or something else that makes a file immutable, is the only way to get one.
+     */
+    public enum VerificationBasis {
+        /**
+         * Hash every source file before {@code rsync} runs, and compare the destination against that
+         * reference. This is the long-standing behaviour and still the default. It is what lets a job say a
+         * source file "changed in the source while the job ran": without a before, there is no before-and-after.
+         */
+        SOURCE_BEFORE_COPY,
+        /**
+         * Read nothing before the transfer: hash the source and the destination together, after {@code rsync}
+         * has finished. The transfer starts sooner and the two digest passes overlap. A match says the two
+         * sides read alike during verification - nothing more.
+         */
+        SOURCE_AFTER_COPY,
+        /** Verify Only: nothing is copied, and both sides are digested during the comparison. */
+        BOTH_SIDES_AT_VERIFICATION,
+        /** Verification was off: no file was hashed at all. */
+        NOTHING_HASHED,
+        /** A hand-built result that does not say. An engine run never records this. */
+        NOT_RECORDED;
+
+        /** The two values a request may ask for. */
+        public boolean choosable() {
+            return this == SOURCE_BEFORE_COPY || this == SOURCE_AFTER_COPY;
+        }
+
+        /** Whether a match here is a comparison against the source as it was before the transfer. */
+        public boolean hasPreCopyReference() {
+            return this == SOURCE_BEFORE_COPY;
+        }
+
+        /** What a job of this type with this chosen basis actually does about source digests. */
+        public static VerificationBasis recordedFor(JobType jobType, boolean dryRun, VerificationBasis chosen) {
+            if (!jobType.verifies()) {
+                return NOTHING_HASHED;
+            }
+            if (!jobType.copies()) {
+                return BOTH_SIDES_AT_VERIFICATION;
+            }
+            if (dryRun && chosen == SOURCE_AFTER_COPY) {
+                // A dry run writes nothing, so there is no copy for the hashing to be after. What the job
+                // actually did was read both sides during the comparison, and that is what gets recorded.
+                return BOTH_SIDES_AT_VERIFICATION;
+            }
+            return chosen == SOURCE_AFTER_COPY ? SOURCE_AFTER_COPY : SOURCE_BEFORE_COPY;
+        }
+
+        /** The words the window, the CLI and a report use for this basis. */
+        public String describe() {
+            return switch (this) {
+                case SOURCE_BEFORE_COPY -> "source hashed before the transfer";
+                case SOURCE_AFTER_COPY -> "source hashed after the transfer";
+                case BOTH_SIDES_AT_VERIFICATION -> "both sides hashed during verification";
+                case NOTHING_HASHED -> "nothing was hashed";
+                case NOT_RECORDED -> "not recorded";
+            };
+        }
+
+        /** What this basis cannot claim, said beside it so a match is not read as more than it is. */
+        public String limitation() {
+            return switch (this) {
+                case SOURCE_BEFORE_COPY -> "The source digest predates the transfer, so a source that changed"
+                        + " during the job is named as a file that moved rather than one the copy damaged. It"
+                        + " is still not an atomic snapshot: the source can change after that digest.";
+                case SOURCE_AFTER_COPY -> "No digest of the source was taken before rsync ran. A match means"
+                        + " the source and the destination read alike during verification; it cannot show that"
+                        + " a source which changed during or after the copy did so, it reports no file as having"
+                        + " moved, and it is not an atomic or durable guarantee.";
+                case BOTH_SIDES_AT_VERIFICATION -> "Nothing was copied: both sides were read during the"
+                        + " comparison, and no transfer is being vouched for.";
+                case NOTHING_HASHED -> "Nothing was hashed or compared; the report says what rsync did, not"
+                        + " whether the copies are correct.";
+                case NOT_RECORDED -> "This result does not say when the source was hashed.";
+            };
+        }
+    }
+
+    /**
      * Everything one job needs, built by the frame (or a test) and immutable from then on.
      * {@code dryRun} runs rsync with {@code --dry-run}: the work set is computed and the hashes are
-     * compared, but nothing is written.
+     * compared, but nothing is written. {@code verificationBasis} defaults to {@link
+     * VerificationBasis#SOURCE_BEFORE_COPY}, which is what every earlier version of this class did.
      */
     public record JobRequest(Path sourceDir, Path destDir, JobType jobType,
                              Selection sourceSelection, Selection destinationSelection,
-                             ScanOptions scanOptions, boolean detectExtraFiles, boolean dryRun) {
+                             ScanOptions scanOptions, boolean detectExtraFiles, boolean dryRun,
+                             VerificationBasis verificationBasis) {
         public JobRequest {
             scanOptions = scanOptions == null ? ScanOptions.DEFAULTS : scanOptions;
+            verificationBasis = verificationBasis == null
+                    ? VerificationBasis.SOURCE_BEFORE_COPY : verificationBasis;
         }
 
         public JobRequest(Path sourceDir, Path destDir, JobType jobType, Selection sourceSelection,
                           Selection destinationSelection, ScanOptions scanOptions, boolean detectExtraFiles) {
             this(sourceDir, destDir, jobType, sourceSelection, destinationSelection, scanOptions,
-                    detectExtraFiles, false);
+                    detectExtraFiles, false, VerificationBasis.SOURCE_BEFORE_COPY);
+        }
+
+        public JobRequest(Path sourceDir, Path destDir, JobType jobType, Selection sourceSelection,
+                          Selection destinationSelection, ScanOptions scanOptions, boolean detectExtraFiles,
+                          boolean dryRun) {
+            this(sourceDir, destDir, jobType, sourceSelection, destinationSelection, scanOptions,
+                    detectExtraFiles, dryRun, VerificationBasis.SOURCE_BEFORE_COPY);
+        }
+
+        /** What this job's digests are, once its job type is taken into account. */
+        public VerificationBasis recordedBasis() {
+            return VerificationBasis.recordedFor(jobType, dryRun, verificationBasis);
         }
     }
 
@@ -373,6 +505,10 @@ public class FileSyncEngine implements AutoCloseable {
      * @param rowsOmitted          how many per-file rows this job produced but the report does not hold,
      *                             because of the results limit - so an incomplete report cannot read as a
      *                             complete one
+     * @param verificationBasis    when this job hashed the source, and therefore what its verdicts are
+     *                             comparisons against. An engine run always records one; the older hand-built
+     *                             shapes below record {@link VerificationBasis#NOT_RECORDED}, because nothing in
+     *                             them says.
      */
     public record JobResult(JobStatus status, String message,
                             int filesMatched, int filesMismatched, int filesMissing, int filesExtra,
@@ -381,7 +517,8 @@ public class FileSyncEngine implements AutoCloseable {
                             int filesProcessed,
                             int rsyncExitCode, List<FileOutcome> outcomes, List<String> errors,
                             List<String> warnings, int rowsOmitted, AbortCause abortCause,
-                            List<String> selectedButAbsent, List<String> vanishedInputs) {
+                            List<String> selectedButAbsent, List<String> vanishedInputs,
+                            VerificationBasis verificationBasis) {
 
         public JobResult {
             outcomes = List.copyOf(outcomes);
@@ -390,6 +527,8 @@ public class FileSyncEngine implements AutoCloseable {
             selectedButAbsent = List.copyOf(selectedButAbsent);
             vanishedInputs = List.copyOf(vanishedInputs);
             abortCause = abortCause == null ? AbortCause.NONE : abortCause;
+            verificationBasis = verificationBasis == null
+                    ? VerificationBasis.NOT_RECORDED : verificationBasis;
         }
 
         /** The shape from before an input that vanished during the transfer was kept as a figure. */
@@ -403,7 +542,7 @@ public class FileSyncEngine implements AutoCloseable {
             this(status, message, filesMatched, filesMismatched, filesMissing, filesExtra, filesCopied,
                     filesWouldCopy, filesUncertain, filesNotTransferred, transfersAnnounced,
                     transfersCompletedByRsync, filesProcessed, rsyncExitCode, outcomes, errors, warnings,
-                    rowsOmitted, abortCause, selectedButAbsent, List.of());
+                    rowsOmitted, abortCause, selectedButAbsent, List.of(), VerificationBasis.NOT_RECORDED);
         }
 
         /** The shape from before the unanswered requests were kept as a figure: nothing known about them. */
@@ -417,7 +556,7 @@ public class FileSyncEngine implements AutoCloseable {
             this(status, message, filesMatched, filesMismatched, filesMissing, filesExtra, filesCopied,
                     filesWouldCopy, filesUncertain, filesNotTransferred, transfersAnnounced,
                     transfersCompletedByRsync, filesProcessed, rsyncExitCode, outcomes, errors, warnings,
-                    rowsOmitted, abortCause, List.of());
+                    rowsOmitted, abortCause, List.of(), List.of(), VerificationBasis.NOT_RECORDED);
         }
 
         /**
@@ -591,6 +730,21 @@ public class FileSyncEngine implements AutoCloseable {
         private volatile List<String> selectedButAbsent = List.of();
         /** Names this job was handling that disappeared from the source during the transfer. */
         private volatile List<String> vanishedInputs = List.of();
+        /**
+         * Which digests this job actually reached, recorded as it reaches them: nothing hashed until
+         * something is hashed, then whichever source-hash pass ran. Every report this job publishes -
+         * including one written by the watchdog because this job's own thread could not - carries it, so a
+         * report cannot imply a pre-copy source digest when the job hashed the source afterwards.
+         */
+        private volatile VerificationBasis digestBasis = VerificationBasis.NOTHING_HASHED;
+
+        VerificationBasis digestBasis() {
+            return digestBasis;
+        }
+
+        void setDigestBasis(VerificationBasis basis) {
+            this.digestBasis = basis;
+        }
         /**
          * The rsync this job started, and every process it had spawned, snapshotted while the parent was
          * still alive. A local rsync copy is three processes (measured on 3.1.3 and 3.4.0), and killing only
@@ -1276,6 +1430,8 @@ public class FileSyncEngine implements AutoCloseable {
         status.set(JobStatus.RUNNING);
         startedAt.set(System.nanoTime());
         markActivity(control, "starting: " + request.jobType());
+        peakVerificationQueue = 0;
+        peakVerificationWorkers = 0;
         return control;
     }
 
@@ -1514,6 +1670,15 @@ public class FileSyncEngine implements AutoCloseable {
         Path source = request.sourceDir();
         Path dest = request.destDir();
         boolean copies = request.jobType().copies();
+        if (!request.verificationBasis().choosable()) {
+            // Two of the five values of this enum describe what a job ended up doing, not what it can be told
+            // to do. Accepting one here would let a report claim a digest schedule nobody asked for.
+            problems.add("Verification basis " + request.verificationBasis().name()
+                    + " is not a choice a job can be given: a request decides whether the source is hashed"
+                    + " before the copy (SOURCE_BEFORE_COPY) or together with the destination after it"
+                    + " (SOURCE_AFTER_COPY). The other values of that enum say what a job did, not what it was"
+                    + " asked to do.");
+        }
 
         if (source == null || !Files.isDirectory(source)) {
             problems.add("Source is not a directory: " + source);
@@ -1812,7 +1977,8 @@ public class FileSyncEngine implements AutoCloseable {
             // result already published past: that claim would outlive the job that made it.
             return abortedBeforeTransfer("Job " + abortWords(control.cause())
                     + " before rsync started: no file was transferred." + limitPhrase(control),
-                    List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause());
+                    List.of(), List.of(), List.of(), request.jobType().verifies(), control.cause(),
+                    control.digestBasis());
         }
         if (!claimDestination(destinationKey, control)) {
             JobControl holder = destinationHolder(destinationKey);
@@ -1822,17 +1988,23 @@ public class FileSyncEngine implements AutoCloseable {
                             : "")
                     + ". Wait for it to finish, or point this job at a different directory: two jobs writing"
                     + " one directory produce numbers neither of them can vouch for.",
-                    List.of("destination busy: " + destinationKey), List.of(), 0);
+                    List.of("destination busy: " + destinationKey), List.of(), 0, control.digestBasis());
         }
         Selection src = normalize(request.sourceSelection());
         Selection dst = normalize(request.destinationSelection());
         ScanOptions options = request.scanOptions();
         boolean copies = request.jobType().copies();
         boolean verifies = request.jobType().verifies();
+        // When this job reads the source. The default reads it before anything is written, which is what
+        // lets a mismatch name a file that moved rather than one the copy damaged. The opt-in basis reads
+        // both sides together, after the transfer, and gives that up in exchange for starting the transfer
+        // sooner - see VerificationBasis.
+        boolean sourceAfterCopy = verifies && copies
+                && request.verificationBasis() == VerificationBasis.SOURCE_AFTER_COPY;
 
         if (src.selected().isEmpty() && dst.selected().isEmpty()) {
             return failure("No files were selected: an empty selection means no files, not all files.",
-                    List.of(), List.of(), 0);
+                    List.of(), List.of(), 0, control.digestBasis());
         }
 
         markActivity(control, "scanning " + sourceDir);
@@ -1909,14 +2081,14 @@ public class FileSyncEngine implements AutoCloseable {
                     + " or that reaches outside through a linked directory, names a file outside the tree this"
                     + " job is allowed to read or write - and a comparison of it would be reported as a"
                     + " verdict about the destination. Nothing was copied and nothing was compared.";
-            return failure(problem, List.of(problem), List.of(), 0);
+            return failure(problem, List.of(problem), List.of(), 0, control.digestBasis());
         }
 
         if (workTotal == 0) {
             String suffix = notFound.isEmpty() ? "" : " Selected but not found in the source: " + notFoundText + ".";
             return failure("Empty work set: 0 selected source files and 0 destination-only files survived "
                             + "the selection, so there is nothing to do." + suffix,
-                    List.of(), List.of(), 0);
+                    List.of(), List.of(), 0, control.digestBasis());
         }
 
         List<String> errors = new ArrayList<>();
@@ -1979,7 +2151,7 @@ public class FileSyncEngine implements AutoCloseable {
         Map<String, TransferDisposition> transfers = Map.of();
         TransferTally tally = TransferTally.NONE;
 
-        if (copies && verifies) {
+        if (copies && verifies && !sourceAfterCopy) {
             // Its own phase, because it is its own wait: hashing reads the whole source before rsync has
             // written a single byte, and calling that "copying" is exactly how a job looks stalled on the
             // first file for an hour with an empty destination folder.
@@ -1987,6 +2159,9 @@ public class FileSyncEngine implements AutoCloseable {
             control.phase = "hash";
             progress.update(0, "Hashing " + workSet.size()
                     + " source file(s) - nothing is written to the destination during this part...");
+            // Recorded before the pass runs, not after it: a job cancelled halfway through this pass did
+            // read source files before rsync ran, and its report has to say so.
+            control.setDigestBasis(VerificationBasis.SOURCE_BEFORE_COPY);
             // Hashed once, before the copy: these same digests are reused for the comparison below.
             sourceHashes = hashFiles(control, workSet, "source", warnings,
                     options.symlinkPolicy());
@@ -1995,8 +2170,13 @@ public class FileSyncEngine implements AutoCloseable {
         if (copies) {
             listener.onPhase(dryRun ? "dry run" : "copying");
             control.phase = "copy";
-            if (verifies) {
+            if (verifies && !sourceAfterCopy) {
                 progress.update(0, "Transferring " + workSet.size() + " file(s)...");
+            } else if (verifies) {
+                // The other half of the trade this basis makes, said where the person waiting for the copy
+                // can see it: nothing has been read yet, so nothing had to be read before the transfer.
+                progress.update(0, "Transferring " + workSet.size() + " file(s); both sides are hashed "
+                        + (dryRun ? "after the dry run" : "after the copy") + "...");
             } else {
                 // Reading every file to compute a digest that nothing will use is the expensive part of
                 // the job, so a job that will not compare reads nothing until rsync does.
@@ -2017,7 +2197,8 @@ public class FileSyncEngine implements AutoCloseable {
             Path filesFrom = writeFilesFrom(workSet, warnings);
             if (filesFrom == null) {
                 return failure("No selected file name could be handed to rsync (each contains a newline, "
-                        + "carriage return or NUL byte); deselect them and retry.", errors, warnings, 0);
+                        + "carriage return or NUL byte); deselect them and retry.", errors, warnings, 0,
+                        control.digestBasis());
             }
             try {
                 // Asked to stop, and rsync has not started yet: starting it now would put a process on the
@@ -2150,7 +2331,14 @@ public class FileSyncEngine implements AutoCloseable {
         listener.onPhase("verifying");
         control.phase = "verify";
         progress.verifyStart(copies);
-
+        if (sourceAfterCopy) {
+            // A dry run transfers nothing, so this job has no "after the copy" to claim: it read both sides
+            // during the comparison, which is what BOTH_SIDES_AT_VERIFICATION says.
+            control.setDigestBasis(dryRun ? VerificationBasis.BOTH_SIDES_AT_VERIFICATION
+                    : VerificationBasis.SOURCE_AFTER_COPY);
+        } else if (!copies) {
+            control.setDigestBasis(VerificationBasis.BOTH_SIDES_AT_VERIFICATION);
+        }
         if (!copies) {
             sourceHashes = Map.of();
         }
@@ -2159,8 +2347,18 @@ public class FileSyncEngine implements AutoCloseable {
             // file the destination shows a file, and a verdict taken afterwards cannot say what it replaced.
             warnings.addAll(ledger.kindChanges());
         }
-        Set<String> verifiedNames = verifyEntries(control, workSet, extras, destDir, sourceHashes, progress,
-                outcomes, listener, warnings, !copies, transfers, options.symlinkPolicy());
+        Set<String> verifiedNames = sourceAfterCopy
+                ? verifyEntriesAfterCopy(control, workSet, extras, destDir, progress, outcomes, listener,
+                        warnings, transfers, options.symlinkPolicy())
+                : verifyEntries(control, workSet, extras, destDir, sourceHashes, progress, outcomes, listener,
+                        warnings, !copies, transfers, options.symlinkPolicy());
+        if (sourceAfterCopy) {
+            // Said before any early return, because it is the sentence that keeps this job's verdicts from
+            // being read as more than they are. It names the basis that was recorded, which for a dry run is
+            // not the one that was asked for.
+            VerificationBasis recorded = control.digestBasis();
+            warnings.add("Verification basis: " + recorded.describe() + ". " + recorded.limitation());
+        }
         if (copies && (control.timedOut() || control.cancelRequested())) {
             // A clean copy can have unannounced names. Once the overall job is interrupted, do not turn
             // that missing observation into a claim of non-transfer, including on an already recorded row.
@@ -2278,7 +2476,7 @@ public class FileSyncEngine implements AutoCloseable {
                 tally.copied(), tally.wouldCopy(), tally.uncertain(), tally.notTransferred(),
                 progress.copied(), claimedByRsync(progress), progress.processed(), rsyncExitCode, outcomes,
                 errors, warnings, rowsOmitted(progress, outcomes), AbortCause.NONE,
-                control.selectedButAbsent(), control.vanishedInputs());
+                control.selectedButAbsent(), control.vanishedInputs(), control.digestBasis());
     }
 
     private static String completionMessage(ProgressReporter progress, TransferTally tally, boolean dryRun,
@@ -2353,7 +2551,7 @@ public class FileSyncEngine implements AutoCloseable {
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.NONE,
                 control.selectedButAbsent(),
-                control.vanishedInputs());
+                control.vanishedInputs(), control.digestBasis());
     }
 
     /**
@@ -2470,7 +2668,7 @@ public class FileSyncEngine implements AutoCloseable {
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), exitCode,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), control.cause(),
                 control.selectedButAbsent(),
-                control.vanishedInputs());
+                control.vanishedInputs(), control.digestBasis());
     }
 
     /**
@@ -2518,7 +2716,7 @@ public class FileSyncEngine implements AutoCloseable {
                 tally.notTransferred(), progress.copied(), claimedByRsync(progress), progress.processed(), 0,
                 outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause(),
                 control.selectedButAbsent(),
-                control.vanishedInputs());
+                control.vanishedInputs(), control.digestBasis());
     }
 
     private JobResult timeoutResult(JobControl control, ProgressReporter progress, TransferTally tally,
@@ -2545,7 +2743,7 @@ public class FileSyncEngine implements AutoCloseable {
                 tally.notTransferred(), announced, claimedByRsync(progress), progress.processed(), 0,
                 outcomes, errors, extended, rowsOmitted(progress, outcomes), AbortCause.TIMED_OUT,
                 control.selectedButAbsent(),
-                control.vanishedInputs());
+                control.vanishedInputs(), control.digestBasis());
     }
 
     /**
@@ -2674,15 +2872,24 @@ public class FileSyncEngine implements AutoCloseable {
         Set<String> kindChanges = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> comparedByBytes = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> sourceMoved = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peakRunning = new AtomicInteger();
         try {
             for (int index = 0; index < total; index++) {
                 if (control.abortRequested()) {
                     break;
                 }
                 final int i = index;
-                Future<Verdict> task = pool.submit(() -> verdict(control, i, workSet, extras, destDir,
-                        knownSourceHashes, readProblems, kindChanges, comparedByBytes, sourceMoved,
-                        linkPolicy));
+                Future<Verdict> task = pool.submit(() -> {
+                    int live = running.incrementAndGet();
+                    peakRunning.accumulateAndGet(live, Math::max);
+                    try {
+                        return verdict(control, i, workSet, extras, destDir, knownSourceHashes, readProblems,
+                                kindChanges, comparedByBytes, sourceMoved, linkPolicy);
+                    } finally {
+                        running.decrementAndGet();
+                    }
+                });
                 control.adopt(task);
                 futures.add(task);
             }
@@ -2733,6 +2940,184 @@ public class FileSyncEngine implements AutoCloseable {
             progress.verifiedFile(!verifyOnly, verdict.relPath());
         }
 
+        emitVerificationWarnings(warnings, readProblems, sourceMoved, kindChanges, comparedByBytes);
+        // This loop queues everything it has work for, which is what it has always done; the figure is
+        // recorded so the difference against the bounded post-copy loop is a measured one, not an assertion.
+        peakVerificationQueue = Math.max(peakVerificationQueue, futures.size());
+        peakVerificationWorkers = Math.max(peakVerificationWorkers, peakRunning.get());
+        return verifiedNames;
+    }
+
+    /** One file waiting to be decided, with the two reads that decide it. */
+    private record PendingPair(int index, String relPath, Future<SideFacts> source, Future<SideFacts> destination,
+                               int tasks) {
+    }
+
+    /**
+     * Verify a copy by hashing each side of each file as a task of its own, after the transfer finished.
+     *
+     * <p>Why this is a separate loop and not the one above: under this basis neither digest is known before
+     * rsync finishes, and every file has two of them. Hashing both inside one task would serialise them - one
+     * thread would read a 200 GB file once for the source and once again for the destination - which is the
+     * cost this basis exists to avoid. So each side is a task in one bounded pool, the pair is decided by
+     * {@link #classify} on this thread, and pairs are consumed in work-set order: the reads overlap, the
+     * results list stays deterministic, and the counters, the per-file rows and any export come out in the
+     * same order every other job produces them in.
+     *
+     * <p>The queue is bounded: at most {@link #VERIFY_WINDOW_FILES} files - and so at most twice that many
+     * reads - wait at once. A 300k-file job does not hold a future for every file it has not read yet, and
+     * stopping a job has a known, small amount of queued reading to drop rather than a queue as long as the
+     * tree.
+     *
+     * <p>What is deliberately the same as the other loop: the verdict rule, the warnings it raises, the
+     * per-file rows and their transfer dispositions, the results limit, and the rule that a comparison the job
+     * never finished produces no verdict at all - the caller reports those files as pending.
+     */
+    private Set<String> verifyEntriesAfterCopy(JobControl control, List<FileEntry> workSet, List<FileEntry> extras,
+                                               Path destDir, ProgressReporter progress,
+                                               List<FileOutcome> outcomes, ProgressListener listener,
+                                               List<String> warnings,
+                                               Map<String, TransferDisposition> transfers,
+                                               ScanOptions.SymlinkPolicy linkPolicy)
+            throws NoSuchAlgorithmException, InterruptedException {
+        int total = workSet.size() + extras.size();
+        Set<String> verifiedNames = new HashSet<>();
+        if (total == 0) {
+            return verifiedNames;
+        }
+        int threads = Math.min(MAX_HASH_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
+        ExecutorService pool = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "verify-after-copy");
+            thread.setDaemon(true);
+            return thread;
+        });
+        control.adopt(pool);
+        Set<String> readProblems = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> kindChanges = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<String> comparedByBytes = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        // Nothing is ever added to this set in this loop, and that is the point: this basis has no digest of
+        // the source from before the transfer, so it has no before-and-after and cannot call a file one that
+        // moved. The warning it would have produced is a claim this job is not entitled to make.
+        Set<String> sourceMoved = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        java.util.ArrayDeque<PendingPair> pending = new java.util.ArrayDeque<>();
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peakRunning = new AtomicInteger();
+        int next = 0;
+        int queuedTasks = 0;
+        int peakQueuedTasks = 0;
+        try {
+            while (true) {
+                while (next < total && pending.size() < VERIFY_WINDOW_FILES && !control.abortRequested()) {
+                    final int index = next++;
+                    final boolean destinationOnly = index >= workSet.size();
+                    final FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
+                    final String rel = destinationOnly
+                            ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+                    final Path destPath = destDir.resolve(rel);
+                    Future<SideFacts> sourceTask = destinationOnly ? null : pool.submit(() -> {
+                        if (control.abortRequested()) {
+                            return null;
+                        }
+                        int live = running.incrementAndGet();
+                        peakRunning.accumulateAndGet(live, Math::max);
+                        try {
+                            return readSourceSide(sourceEntry, rel, linkPolicy, null, readProblems);
+                        } finally {
+                            running.decrementAndGet();
+                        }
+                    });
+                    Future<SideFacts> destinationTask = pool.submit(() -> {
+                        if (control.abortRequested()) {
+                            return null;
+                        }
+                        int live = running.incrementAndGet();
+                        peakRunning.accumulateAndGet(live, Math::max);
+                        try {
+                            return readDestinationSide(destPath, rel, readProblems);
+                        } finally {
+                            running.decrementAndGet();
+                        }
+                    });
+                    if (sourceTask != null) {
+                        control.adopt(sourceTask);
+                    }
+                    control.adopt(destinationTask);
+                    int tasks = sourceTask == null ? 1 : 2;
+                    pending.addLast(new PendingPair(index, rel, sourceTask, destinationTask, tasks));
+                    queuedTasks += tasks;
+                    peakQueuedTasks = Math.max(peakQueuedTasks, queuedTasks);
+                }
+                PendingPair pair = pending.pollFirst();
+                if (pair == null) {
+                    break;
+                }
+                queuedTasks -= pair.tasks();
+                if (control.abortRequested()) {
+                    // Stopped, not decided. These files get a pending row from the caller; answering MISSING
+                    // or MISMATCH for a digest that was never taken would invent a finding out of a cancellation.
+                    break;
+                }
+                SideFacts source;
+                SideFacts destination;
+                try {
+                    destination = pair.destination().get();
+                    source = pair.source() == null ? null : pair.source().get();
+                } catch (CancellationException stopped) {
+                    // The job stopped this comparison; the file is simply not among the files that were checked.
+                    continue;
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof NoSuchAlgorithmException algorithmException) {
+                        throw algorithmException;
+                    }
+                    // A side that could not be read recorded its problem (if any) in readProblems; a verdict
+                    // is not the place to guess at what it would have been.
+                    continue;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (source == null || destination == null) {
+                    continue;
+                }
+                Verdict verdict = classify(control, pair.index(), workSet, extras, source, destination,
+                        kindChanges, comparedByBytes, linkPolicy);
+                if (verdict == null) {
+                    continue;
+                }
+                markActivity(control, "verified " + verdict.relPath());
+                switch (verdict.kind()) {
+                    case "OK" -> progress.countMatched();
+                    case "MISSING" -> progress.countMissing();
+                    case "MISMATCH" -> progress.countMismatched();
+                    default -> progress.countExtra();
+                }
+                verifiedNames.add(verdict.relPath());
+                recordOutcome(progress, outcomes, listener, verdict.relPath(), verdict.kind(),
+                        verdict.sourceHash(), verdict.destHash(),
+                        transfers.getOrDefault(verdict.relPath(), TransferDisposition.NOT_COPIED));
+                progress.verifiedFile(true, verdict.relPath());
+            }
+        } finally {
+            pool.shutdown();
+            if (control.abortRequested()) {
+                // Queuing reads for a job that is already stopping wastes the read of every remaining file.
+                control.stopHashing();
+            }
+        }
+        emitVerificationWarnings(warnings, readProblems, sourceMoved, kindChanges, comparedByBytes);
+        peakVerificationQueue = Math.max(peakVerificationQueue, peakQueuedTasks);
+        peakVerificationWorkers = Math.max(peakVerificationWorkers, peakRunning.get());
+        return verifiedNames;
+    }
+
+    /**
+     * Say what the reads could not do, in one place, so both verification loops report the same facts the
+     * same way. Set iteration order does not matter: these are warnings about problems, not the per-file
+     * report, which is written in work-set order.
+     */
+    private static void emitVerificationWarnings(List<String> warnings, Set<String> readProblems,
+                                                 Set<String> sourceMoved, Set<String> kindChanges,
+                                                 Set<String> comparedByBytes) {
         for (String problem : readProblems) {
             warnings.add("Could not read file: " + problem);
         }
@@ -2752,7 +3137,6 @@ public class FileSyncEngine implements AutoCloseable {
                     + ". Under FOLLOW the verdict is about the contents at the end of the link, not about the"
                     + " link itself; a link pointing outside the two directories takes that read outside them.");
         }
-        return verifiedNames;
     }
 
     private static String quoted(String value) {
@@ -2763,29 +3147,85 @@ public class FileSyncEngine implements AutoCloseable {
     private record Verdict(String kind, String relPath, String sourceHash, String destHash) {
     }
 
-    private Verdict verdict(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
-                            Path destDir,
-                            Map<String, String> knownSourceHashes, Set<String> readProblems,
-                            Set<String> kindChanges, Set<String> comparedByBytes, Set<String> sourceMoved,
-                            ScanOptions.SymlinkPolicy linkPolicy)
-            throws NoSuchAlgorithmException {
-        if (control.abortRequested()) {
-            return null;
-        }
-        boolean destinationOnly = index >= workSet.size();
-        FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
-        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+    /**
+     * What one side of one file is known to be, gathered by the task that reads it: which object stands
+     * there, what a link says, whether it is a regular file, and its digest.
+     *
+     * <p>Nothing here decides anything: {@link #classify} does that from two of these. Splitting it that way
+     * is what lets one file be read by two tasks - a source hashed together with its destination, after the
+     * copy - or by one - a source whose digest was already taken before the copy - without two copies of the
+     * verdict rule drifting apart.
+     *
+     * <p>{@code hash} is null when the side was absent, could not be read, or was a link this policy does not
+     * read through. That is not the same as "missing", and a verdict must not confuse them: {@code present}
+     * and {@code regularFile} are what tell them apart.
+     */
+    private record SideFacts(boolean present, boolean link, String linkText, boolean regularFile, String hash) {
+    }
 
-        // The object is judged before any content is. A link's own properties are its kind and its text: under
-        // LINK that is the whole comparison, and nothing is read through a link, because its target may sit
-        // outside the two directories this job was given. Under FOLLOW the verdict is about the bytes at the end
-        // of a source link, and the report says so. A link standing in the destination is never followed under
-        // any policy: a copy replaces it (measured), and reading through it would compare an object that belongs
-        // to neither directory.
-        Path destPath = destDir.resolve(rel);
-        Path sourcePath = destinationOnly ? null : sourceEntry.absolutePath();
-        boolean destLink = Files.isSymbolicLink(destPath);
-        boolean sourceLink = sourcePath != null && Files.isSymbolicLink(sourcePath);
+    /**
+     * The source side of one file.
+     *
+     * <p>Under LINK a link is judged by its kind and its text and is never opened. Opening it follows it: a
+     * link to a directory fails the open with "Is a directory", a link to a FIFO blocks the job on a read it
+     * was never asked to make, and a link outside the two trees gets a digest of something the job has no
+     * business reading. Under FOLLOW the verdict is about the bytes at the end of the link, and the
+     * {@code comparedByBytes} warning is what says so out loud.
+     *
+     * @param knownHash the digest this job took before the copy, or null when this side has to be read now
+     */
+    private SideFacts readSourceSide(FileEntry entry, String rel, ScanOptions.SymlinkPolicy linkPolicy,
+                                     String knownHash, Set<String> readProblems)
+            throws NoSuchAlgorithmException {
+        Path path = entry.absolutePath();
+        boolean link = Files.isSymbolicLink(path);
+        boolean present = Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (link && linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
+            return new SideFacts(present, true, readLink(path), false, null);
+        }
+        String hash = knownHash != null ? knownHash : hashFile(path, rel, readProblems);
+        return new SideFacts(present, link, link ? readLink(path) : null, Files.isRegularFile(path), hash);
+    }
+
+    /**
+     * The destination side of one file. A link standing in the destination is never read through, under any
+     * policy: a copy replaces it (measured), and reading through it would compare an object that belongs to
+     * neither directory this job was given.
+     */
+    private SideFacts readDestinationSide(Path destPath, String rel, Set<String> readProblems)
+            throws NoSuchAlgorithmException {
+        boolean link = Files.isSymbolicLink(destPath);
+        boolean present = Files.exists(destPath, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (link) {
+            return new SideFacts(true, true, readLink(destPath), false, null);
+        }
+        return new SideFacts(present, false, null, Files.isRegularFile(destPath),
+                hashFile(destPath, rel, readProblems));
+    }
+
+    /**
+     * One file's verdict, decided from what its two sides are. This is the whole verdict rule, and it reads
+     * nothing itself.
+     *
+     * <p>The object is judged before any content is. A link's own properties are its kind and its text: under
+     * LINK that is the whole comparison, and nothing is read through a link, because its target may sit
+     * outside the two directories this job was given. Under FOLLOW the verdict is about the bytes at the end of
+     * a source link, and the report says so. A link standing in the destination is never followed under any
+     * policy: a copy replaces it (measured), and reading through it would compare an object that belongs to
+     * neither directory.
+     *
+     * <p>Answering null is a verdict of its own: this comparison was interrupted rather than decided, and
+     * answering MISSING or MISMATCH for a file whose digest was never taken would invent a finding out of a
+     * cancellation.
+     */
+    private Verdict classify(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
+                             SideFacts source, SideFacts dest, Set<String> kindChanges,
+                             Set<String> comparedByBytes, ScanOptions.SymlinkPolicy linkPolicy) {
+        boolean destinationOnly = index >= workSet.size();
+        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath()
+                : workSet.get(index).relPath();
+        boolean destLink = dest.link();
+        boolean sourceLink = source != null && source.link();
 
         if (destLink) {
             if (destinationOnly) {
@@ -2797,8 +3237,8 @@ public class FileSyncEngine implements AutoCloseable {
                 if (linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
                     // Under LINK the link is the object, and its text is the comparison. Same text, same object
                     // as far as this job is concerned; different text is a mismatch in what the links say.
-                    String sourceText = readLink(sourcePath);
-                    String destText = readLink(destPath);
+                    String sourceText = source.linkText();
+                    String destText = dest.linkText();
                     if (sourceText != null && sourceText.equals(destText)) {
                         return new Verdict("OK", rel, null, null);
                     }
@@ -2828,7 +3268,7 @@ public class FileSyncEngine implements AutoCloseable {
 
         if (sourceLink && linkPolicy == ScanOptions.SymlinkPolicy.LINK) {
             // A link in the source, and something that is not a link (or nothing) where it should be.
-            if (!Files.exists(destPath, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            if (!dest.present()) {
                 return new Verdict("MISSING", rel, null, null);
             }
             kindChanges.add(rel + ": the source has a symbolic link and the destination holds a regular file."
@@ -2839,42 +3279,66 @@ public class FileSyncEngine implements AutoCloseable {
             comparedByBytes.add(rel);
         }
 
-        String destHash = hashFile(destDir.resolve(rel), rel, readProblems);
+        String destHash = dest.hash();
         if (destinationOnly) {
             return new Verdict("EXTRA", rel, null, destHash);
         }
-
-        String sourceHash = knownSourceHashes.get(rel);
-        if (sourceHash == null) {
-            sourceHash = hashFile(sourceEntry.absolutePath(), rel, readProblems);
-        }
+        String sourceHash = source == null ? null : source.hash();
         if (destHash != null && sourceHash != null && sourceHash.equals(destHash)) {
             return new Verdict("OK", rel, sourceHash, destHash);
         }
         if (control.abortRequested()) {
-            // This comparison was interrupted, not decided. A file whose digest was never taken has no
-            // verdict, and answering MISSING or MISMATCH for it would invent a finding out of a cancellation.
+            // Interrupted, not decided: one of the two digests this verdict needs was never taken, and the
+            // file is reported as pending by the caller rather than answered here.
             return null;
         }
-        if (sourceHash == null && !Files.isRegularFile(sourceEntry.absolutePath())) {
+        if (sourceHash == null && !(source != null && source.regularFile())) {
             return new Verdict("MISSING", rel, null, destHash);
         }
         if (destHash == null) {
             return new Verdict("MISSING", rel, sourceHash, null);
         }
-        // A copy verifies against the digest taken before the transfer started. If the source has moved
-        // since then, the honest description is a file that changed under the job, not one that was
-        // damaged by it - and only a copy has a pre-transfer digest to make that distinction.
-        String beforeCopy = knownSourceHashes.get(rel);
-        if (beforeCopy != null) {
-            String now = hashFile(sourceEntry.absolutePath(), rel, readProblems);
-            if (now != null && !now.equals(beforeCopy)) {
-                sourceMoved.add(rel);
-            }
-        }
         // A source file that exists but could not be hashed is not "missing": reporting it as such
         // would hide an unreadable file behind a word that means "not there".
         return new Verdict("MISMATCH", rel, sourceHash, destHash);
+    }
+
+    /**
+     * One file's verdict where the source digest was already taken before the copy, or where both sides are
+     * read in this file's own task (Verify Only). The destination is the only side this task has left to read
+     * for a copy; the source side is still inspected, because a link is judged before any content is.
+     */
+    private Verdict verdict(JobControl control, int index, List<FileEntry> workSet, List<FileEntry> extras,
+                            Path destDir,
+                            Map<String, String> knownSourceHashes, Set<String> readProblems,
+                            Set<String> kindChanges, Set<String> comparedByBytes, Set<String> sourceMoved,
+                            ScanOptions.SymlinkPolicy linkPolicy)
+            throws NoSuchAlgorithmException {
+        if (control.abortRequested()) {
+            return null;
+        }
+        boolean destinationOnly = index >= workSet.size();
+        FileEntry sourceEntry = destinationOnly ? null : workSet.get(index);
+        String rel = destinationOnly ? extras.get(index - workSet.size()).relPath() : sourceEntry.relPath();
+        SideFacts dest = readDestinationSide(destDir.resolve(rel), rel, readProblems);
+        SideFacts source = destinationOnly ? null
+                : readSourceSide(sourceEntry, rel, linkPolicy, knownSourceHashes.get(rel), readProblems);
+        Verdict verdict = classify(control, index, workSet, extras, source, dest, kindChanges,
+                comparedByBytes, linkPolicy);
+        // A copy verifies against the digest taken before the transfer started. If the source has moved
+        // since then, the honest description is a file that changed under the job, not one that was
+        // damaged by it - and only a copy has a pre-transfer digest to make that distinction.
+        if (verdict != null && "MISMATCH".equals(verdict.kind())
+                && verdict.sourceHash() != null && verdict.destHash() != null) {
+            String beforeCopy = knownSourceHashes.get(rel);
+            if (beforeCopy != null) {
+                String now = hashFile(sourceEntry.absolutePath(), rel, readProblems);
+                if (now != null && !now.equals(beforeCopy)) {
+                    sourceMoved.add(rel);
+                }
+            }
+        }
+        return verdict;
     }
 
     /** Where a link points, or null when it cannot be read. The target is never opened. */
@@ -3638,7 +4102,8 @@ public class FileSyncEngine implements AutoCloseable {
                 counters.mismatched(), counters.missing(), counters.extra(), 0, 0, 0, 0, counters.copied(),
                 Math.max(0, counters.rsyncTransfers()), counters.processed(), 0, List.of(), List.of(),
                 List.copyOf(warnings),
-                counters.rowCount(), why, control.selectedButAbsent(), control.vanishedInputs());
+                counters.rowCount(), why, control.selectedButAbsent(), control.vanishedInputs(),
+                control.digestBasis());
         finishJob(forced, control, control.listener(), delivery);
     }
 
@@ -3767,17 +4232,29 @@ public class FileSyncEngine implements AutoCloseable {
         String full = verifies ? message : message + " Verification was off, so nothing was compared.";
         return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, transfers.size(), 0, 0, 0, 0,
                 outcomes, errors, warnings, rowsOmitted(progress, outcomes), control.cause(),
-                control.selectedButAbsent(), control.vanishedInputs());
+                control.selectedButAbsent(), control.vanishedInputs(), control.digestBasis());
     }
 
     /** A job stopped before its work set was built: no selected-file dispositions can be asserted yet. */
     private JobResult abortedBeforeTransfer(String message, List<FileOutcome> outcomes, List<String> errors,
-                                            List<String> warnings, boolean verifies, AbortCause cause) {
+                                            List<String> warnings, boolean verifies, AbortCause cause,
+                                            VerificationBasis digestBasis) {
         String full = verifies ? message : message + " Verification was off, so nothing was compared.";
         return new JobResult(JobStatus.FAILED, full, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, outcomes, errors,
-                warnings, 0, cause);
+                warnings, 0, cause, List.of(), List.of(), digestBasis);
     }
 
+    /** A refusal or failure the job body itself reports; it knows whether anything was hashed. */
+    private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode,
+                              VerificationBasis digestBasis) {
+        return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, exitCode, List.of(),
+                errors, warnings, 0, AbortCause.NONE, List.of(), List.of(), digestBasis);
+    }
+
+    /**
+     * The same failure from outside the job body - a guard around it, or a job that never got a body to
+     * run. Nothing there knows which digests were reached, so the result says it does not.
+     */
     private JobResult failure(String message, List<String> errors, List<String> warnings, int exitCode) {
         return new JobResult(JobStatus.FAILED, message, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, exitCode, List.of(),
                 errors, warnings, 0, AbortCause.NONE);

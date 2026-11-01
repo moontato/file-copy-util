@@ -13,6 +13,17 @@ counters) and [CHANGELOG.md](CHANGELOG.md) for what changed between 1.1.0 and 1.
 
 - **Copy** — Uses `rsync` to copy the selected files, with a *Verify after copying* switch (on by default)
   that compares SHA-256 hashes of what was written afterwards
+- **Which Source Digest a Verdict Compares Against** — A copy that verifies can be told *which* source digest
+  its verdicts are compared against: **source hashed before the transfer** (the default, and what every
+  earlier version did — it is what lets a job name a source file that changed under the job as a file that
+  *moved*), or **source hashed after the transfer** (`--hash-source after-copy`, and *Source hashes* in the
+  window): this program skips its preliminary SHA-256 pass over the source, the transfer starts sooner, and
+  each side of each file is hashed afterwards as its own task in one bounded pool. It does not mean the source
+  is unread before the transfer — `rsync` still runs with `--checksum` and reads both sides as it transfers.
+  A match under that basis says only that the two
+  sides read alike during verification — a source that changed during or after the copy cannot be detected,
+  and no file is reported as having moved. Neither basis is an atomic snapshot of anything, and the basis a
+  job used is recorded in the CSV and JSON exports
 - **Verify only** — Compares SHA-256 hashes of the selected files between source and destination without
   running `rsync` at all: the only job that looks at a destination without touching it
 - **File Selection** — Recursively scans directories and displays all files with checkboxes to include/exclude
@@ -30,7 +41,8 @@ counters) and [CHANGELOG.md](CHANGELOG.md) for what changed between 1.1.0 and 1.
 - **Dry Run** — *Dry run (write nothing)* runs `rsync --dry-run` and still compares hashes: you see what the job would copy and what already mismatches, and nothing is written
 - **Partial-Transfer Reporting** — after a cancelled or timed-out copy, the engine looks for matching hidden partial-file names and reports what it finds; it never deletes them. This is not proof of every partial file or its ownership
 - **Bandwidth Cap** — `--bwlimit KB/s` caps the transfer rate
-- **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode and extra-file detection are restored in the next window
+- **Saved Preferences** — Directories, ignore patterns, hidden/symlink policy, timeout, job mode, extra-file
+  detection and the source-hash choice are restored in the next window
 - **Smart Directory Selection** — The chooser starts in the directory already in that field (falling back to the other field, then home) and takes the directory you actually clicked
 - **Headless CLI** — `--cli` runs the same engine without a display, with CSV/JSON export and exit codes for scripting
 - **Modern interface** — FlatLaf theme with light or dark mode (remembered between runs), cards instead of group boxes, labels above fields, a segmented *Copy / Verify only* control with a *Verify after copying* switch beside it, one filled action button whose label names the job it will run, and a results table whose status column carries a colour dot beside the word
@@ -86,6 +98,7 @@ java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backu
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --no-verify
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --files-from0 names.lst
 java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --dry-run
+java -jar target/file-copy-util-1.4.0.jar --cli --source /data/src --dest /backup/dst --all --hash-source after-copy
 java -jar target/file-copy-util-1.4.0.jar --cli --help
 ```
 
@@ -108,7 +121,9 @@ files are used exactly as written; a file that is not valid UTF-8 is refused rat
 | 5 | only with `--strict`: the job completed and found nothing wrong, but a name this run was given had no file behind it |
 
 Other CLI options: `--verify-only`, `--no-verify` (copy without comparing; the two flags contradict each
-other and using both is a usage error), `--dry-run`, `--exclude a.txt,...` (with `--all`),
+other and using both is a usage error), `--hash-source before-copy|after-copy` (which source digest the
+comparison is made against — see [Which source digest a verdict is compared against](#which-source-digest-a-verdict-is-compared-against)),
+`--dry-run`, `--exclude a.txt,...` (with `--all`),
 `--exclude-dest a.txt,...` (with `--verify-only`), `--ignore "GLOB,GLOB"`
 (adds to the default ignore list), `--no-default-ignore`, `--no-hidden`, `--symlinks skip|link|follow`,
 `--no-report-extra`, `--timeout SECONDS`, `--bwlimit KB/s`, `--max-results N`, `--quiet`,
@@ -167,7 +182,9 @@ the old one. The version of the program is printed in muted text at the bottom r
 4. **Scan Files** — Click "Scan Files" to recursively scan both directories and populate the file lists. Changing an option afterwards says the scan is stale; press **Scan Files** again to apply it
 5. **Select Files** — Use checkboxes to include/exclude files. "Select All" / "Deselect All" for convenience; a filter box narrows what you see without changing what is ticked
 6. **Choose what the job does** — *Copy* or *Verify only*, and for a copy whether *Verify after copying* is
-   ticked (it is by default; untick it for a plain copy that hashes nothing)
+   ticked (it is by default; untick it for a plain copy that hashes nothing). When a copy verifies, the
+   *Source hashes* choice beside it says which source digest the comparison is made against — *source hashed
+   before the transfer* (default) or *source hashed after the transfer*
 7. **Run** — Start the operation. While it runs the status line says what is happening in the phase it names:
    `hashing source` (reading the source to hash it - nothing written yet), then `copying` with the file being
    written now and how far along it is (`now writing: big.bin (9.9 MB of 114.4 MB, 9%)`), then `verifying`
@@ -186,10 +203,42 @@ A file that has no row in the destination list was not unticked there — it is 
 
 An empty selection is refused rather than treated as "all files": use **Select All** to include everything.
 
+### Which source digest a verdict is compared against
+
+A verdict is a comparison between two digests, and there are two different things the source digest can be.
+The choice is on the copy job, in the window (*Source hashes*) and on the command line
+(`--hash-source before-copy|after-copy`):
+
+| Basis | What the job does | What a match means | What it cannot say |
+|---|---|---|---|
+| **source hashed before the transfer** (default) | Hashes every selected source file first, then runs `rsync`, then compares each destination file against that digest | The copy equals what the source was when the job started | Not an atomic snapshot: the source can change after that digest. It is also not proof the transfer wrote the bytes — see the transfer figures |
+| **source hashed after the transfer** | Skips this program's preliminary SHA-256 pass, so it hashes nothing before `rsync` runs (`rsync` is unchanged and still carries `--checksum`, so its own reading of both sides during the transfer remains); after the transfer, each side of each file is hashed as its own task in one bounded pool, and each pair is decided in work-set order | The source and the destination **read alike during verification** | Nothing about the source as it was before the copy: a source file that changed during or after the copy is not detectable, no file is reported as having moved, and no copy is vouched for beyond what the transfer figures say |
+
+The default is the behaviour every earlier version had: nothing about a copy-and-verify run changes because
+this control exists. Choosing *after the transfer* trades the source-movement report for a transfer that
+starts sooner (there is no reading pass in front of it) and for the two digest passes overlapping instead of
+running one after the other.
+
+```
+verification basis: source hashed after the transfer (No digest of the source was taken before rsync ran. A
+match means the source and the destination read alike during verification; it cannot show that a source which
+changed during or after the copy did so, it reports no file as having moved, and it is not an atomic or
+durable guarantee.)
+```
+
+The same fact is written into both exports (`verificationBasis`, its meaning and its limitation), so a report
+says which of the two claims its rows carry. A job that hashes nothing records `NOTHING_HASHED`; a Verify
+only job, and a dry run asked for the after-transfer basis, record `BOTH_SIDES_AT_VERIFICATION` — a dry run
+writes nothing, so it has no copy for the hashing to be after. A job that is stopped before it compared a
+file reports that file as `PENDING`: an unfinished comparison is not turned into a mismatch or a missing file.
+
 ### Reading the results
 
 ```
 Copy & Verify Complete: 509 file(s) checked, 3 copied, 509 matched, 0 mismatched, 0 missing
+verification basis: source hashed before the transfer (The source digest predates the transfer, so a source
+that changed during the job is named as a file that moved rather than one the copy damaged. It is still not an
+atomic snapshot: the source can change after that digest.)
 Totals: checked=509 copied=3 matched=509 mismatched=0 missing=0 extra=0
   transfers: copied=3 would-copy=0 uncertain=0 not-transferred=0, rsync announced=3, rsync said it completed=3; rows reported=509
 ```
@@ -388,6 +437,9 @@ limit, and four rows on a screen then read as a complete record. Both exports an
 # rsyncExitCode,20
 # errors,1
 # warnings,1
+# verificationBasis,SOURCE_BEFORE_COPY
+# verificationBasisMeaning,source hashed before the transfer
+# verificationBasisLimitation,"The source digest predates the transfer, so a source that changed during the job is named as a file that moved rather than one the copy damaged. It is still not an atomic snapshot: the source can change after that digest."
 status,path,source_sha256,destination_sha256,transfer,verification
 "PENDING","half.txt","","","UNCERTAIN","pending"
 ```
@@ -397,8 +449,9 @@ columns row. For an ordinarily completed or reconciled job, the counts describe 
 rows retained. A forced terminal result can contain only counters published so far; unread facts and rows
 cannot be named or counted.
 
-**JSON** carries the same facts as fields: `status`, `abortCause`, `truncated`, `rowsListed`, `rowsOmitted`, a
-`totals` object with every figure, plus the `errors` and `warnings` arrays in full.
+**JSON** carries the same facts as fields: `status`, `abortCause`, `truncated`, `rowsListed`, `rowsOmitted`,
+a `totals` object with every figure, `verificationBasis`, `verificationBasisMeaning` and
+`verificationBasisLimitation`, plus the `errors` and `warnings` arrays in full.
 
 **The window** titles the Results tab `Results (3 of 12)` when the list is short and logs "9 row(s) are not
 listed here … the totals above count the whole job". **The command line** prints the same as a `note:` line

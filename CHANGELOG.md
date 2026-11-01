@@ -22,6 +22,48 @@
   this is not a display-backed window test. Dependency update configuration is not evidence that GitHub alerts
   are enabled. Release concurrency has static checks, not a dispatched release test.
 
+### Added — an opt-in choice of which source digest a verdict is compared against
+
+- `FileSyncEngine.VerificationBasis` names which source digests a job's verdicts are comparisons against:
+  `SOURCE_BEFORE_COPY` (the default, and what every earlier version did), `SOURCE_AFTER_COPY` (opt-in),
+  `BOTH_SIDES_AT_VERIFICATION` (a job with no transfer to be before or after), `NOTHING_HASHED` (a job that
+  compares nothing) and `NOT_RECORDED` (a result that was not produced by a run). Only the first two are
+  choices a request can be given; asking for one of the descriptive values is refused at preflight
+  (`PostCopyVerificationTest.aRequestCannotAskForABasisThatIsNotAChoice`).
+- `--hash-source before-copy|after-copy` and a *Source hashes* control beside the *Verify after copying*
+  switch in the window carry that choice into the captured request. Both are live only where the choice can
+  do something: a job that copies nothing has no copy to be before or after, and a copy that compares nothing
+  hashes nothing either way. The window disables the control in those cases and logs what the choice means
+  (`FileVerifierViewTest.theHashBasisChoiceIsOnTheCopyJobAndTravelsIntoTheJobThatStarts`); the CLI says so on
+  stderr rather than letting a flag silently do nothing, including for `--dry-run`, which writes nothing and so
+  records `BOTH_SIDES_AT_VERIFICATION`.
+- Under `after-copy` the program's preliminary SHA-256 pass over the source is skipped: no file is hashed by
+  this program before `rsync` runs. (The `rsync` invocation is unchanged and still carries `--checksum`, so
+  rsync's own reading of both sides during the transfer remains.) Afterwards each side of each file is hashed as a
+  task of its own in one bounded pool (`min(MAX_HASH_THREADS, availableProcessors)`), with at most
+  `VERIFY_WINDOW_FILES` files — so twice that many reads — queued at once, and pairs are consumed in work-set
+  order: concurrent reads, one row per selected name, in the same order every other job produces
+  (`PostCopyVerificationTest.postCopyHashingStaysInsideTheWorkerBoundAndTheQueueWindowAndOrderingSurvivesIt`,
+  `bothBasesGiveTheSameVerdictsInWorkSetOrderForTheSameTree`).
+- The verdict rule is one rule: `classify` decides from what the two sides are, and both verification loops
+  call it, so the two bases cannot drift apart. The rsync invocation, the transfer ledger, selection
+  authority, destination reservation, symlink and containment rules, cancellation, counters and result limits
+  are untouched (`RsyncVersionMatrixTest` against the four pinned rsync builds).
+- What the new basis cannot claim is stated where it is used: the warning that names files which
+  "changed in the source while the job ran" is produced only by a job with a pre-copy digest, and a
+  post-copy report carries "Verification basis: … " with its limitation. Only the default basis can report a
+  file as having moved (`PostCopyVerificationTest.onlyTheBasisWithABeforeToCompareAgainstCanCallAFileOneThatMoved`).
+- A comparison a stopped job never finished produces no verdict: no invented `MISMATCH`, no invented `MISSING`,
+  and the file appears as `PENDING` (`aCancelledComparisonReportsPendingRowsInsteadOfInventingVerdicts`).
+- CSV exports carry `# verificationBasis`, `# verificationBasisMeaning` and `# verificationBasisLimitation`
+  above the rows; JSON carries the same three fields. The per-row columns and their order are unchanged.
+- Measured on one container's overlay filesystem, with the source and destination on the same device:
+  34–40% shorter total job time for a 256 MiB file, about 2–5% shorter for four 64 MiB files, and 4–13% **longer**
+  for a tree of 2000 four-KiB files, with the transfer starting sooner in every case. Full figures, the cache
+  conditions and the limits of those measurements are in
+  [ci-followup-evidence/post-copy-basis](ci-followup-evidence/post-copy-basis/REPORT.md). They are not
+  independent-drive, larger-than-RAM or durability results, and no default behaviour changed because of them.
+
 Earlier release entries are historical descriptions and measurements, not a substitute for the current limits
 and named evidence in [DESIGN.md](DESIGN.md#claim-to-evidence-map).
 

@@ -47,6 +47,7 @@ public final class FileVerifierView extends JPanel {
     private static final String PREF_EXTRA = "detectExtra";
     private static final String PREF_JOB_TYPE = "jobType";
     private static final String PREF_VERIFY_AFTER_COPY = "verifyAfterCopy";
+    private static final String PREF_HASH_BASIS = "verificationBasis";
     private static final String PREF_THEME = "darkMode";
 
     private final Preferences prefs = Preferences.userRoot().node("com/fileverifier");
@@ -84,6 +85,8 @@ public final class FileVerifierView extends JPanel {
     private JToggleButton copyButton;
     private JToggleButton verifyOnlyButton;
     private JCheckBox verifyCheck;
+    /** Which source digest the verdicts are compared against; see {@link FileSyncEngine.VerificationBasis}. */
+    private JComboBox<FileSyncEngine.VerificationBasis> hashBasisCombo;
     private JButton runButton;
     private JButton cancelButton;
     private JButton exportCsvButton;
@@ -358,9 +361,47 @@ public final class FileVerifierView extends JPanel {
             currentJobType = resolvedJobType();
             updateRunButtonLabel();
             updateWorkSetSummary();
+            updateHashBasisAvailability();
             savePreferences();
         });
         segments.add(verifyCheck);
+        // The other half of the same question: not whether this job compares, but which source digest the
+        // comparison is made against. It sits beside the Verify switch and is live exactly when that switch is,
+        // because a job that copies nothing has no "before the copy" to hash in, and a job that compares
+        // nothing hashes nothing whichever way it is set.
+        segments.add(UiTheme.fieldLabel("Source hashes"));
+        hashBasisCombo = UiTheme.comboBox(new FileSyncEngine.VerificationBasis[]{
+            FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY,
+            FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY
+        });
+        hashBasisCombo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                setText(hashBasisLabel(value instanceof FileSyncEngine.VerificationBasis basis
+                    ? basis : null));
+                return this;
+            }
+        });
+        hashBasisCombo.setToolTipText("Which source digest the verdicts are compared against.\n"
+            + "source hashed before the transfer (the default): every source file is hashed before rsync runs,"
+            + " so a copy is compared against the source as it was before the transfer, and a source file that"
+            + " changed under the job is named as a file that moved.\n"
+            + "source hashed after the transfer: nothing is read before rsync runs; the source and the"
+            + " destination are hashed together afterwards, with a bounded pool, so the transfer starts sooner."
+            + " A match then means only that the two sides read alike during verification - a source that"
+            + " changed during or after the copy cannot be detected, and no file is reported as having moved."
+            + "\nNeither is an atomic snapshot of anything. Either way the basis is written into the CSV and"
+            + " JSON reports, so a record cannot be read as a pre-copy comparison when none was taken.");
+        hashBasisCombo.addActionListener(e -> {
+            if (hashBasisCombo != null) {
+                log("Verification basis set to " + selectedHashBasis().describe() + ": "
+                        + selectedHashBasis().limitation());
+            }
+            savePreferences();
+        });
+        segments.add(hashBasisCombo);
         modeRow.add(segments, BorderLayout.WEST);
 
         // 5.6: what the two checkbox lists add up to, in the engine's own rule, shown before Run is
@@ -623,6 +664,8 @@ public final class FileVerifierView extends JPanel {
         boolean storedVerify = prefs.getBoolean(PREF_VERIFY_AFTER_COPY,
             !FileSyncEngine.JobType.COPY_ONLY.name().equals(storedType));
         verifyCheck.setSelected(storedVerify);
+        hashBasisCombo.setSelectedItem(basisFromName(prefs.get(PREF_HASH_BASIS,
+            FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY.name())));
         selectCopyMode(!wasVerifyOnly);
         darkModeCheck.setSelected(prefs.getBoolean(PREF_THEME, false));
     }
@@ -639,6 +682,7 @@ public final class FileVerifierView extends JPanel {
         currentJobType = resolvedJobType();
         prefs.put(PREF_JOB_TYPE, currentJobType.name());
         prefs.putBoolean(PREF_VERIFY_AFTER_COPY, verifyCheck.isSelected());
+        prefs.put(PREF_HASH_BASIS, selectedHashBasis().name());
         prefs.putBoolean(PREF_THEME, darkModeCheck.isSelected());
     }
 
@@ -648,6 +692,36 @@ public final class FileVerifierView extends JPanel {
         } catch (IllegalArgumentException e) {
             return ScanOptions.SymlinkPolicy.SKIP;
         }
+    }
+
+    /** A stored basis that no longer exists, or never did, means the default: nothing is silently upgraded. */
+    private static FileSyncEngine.VerificationBasis basisFromName(String name) {
+        try {
+            FileSyncEngine.VerificationBasis basis = FileSyncEngine.VerificationBasis.valueOf(name);
+            return basis.choosable() ? basis : FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY;
+        } catch (IllegalArgumentException e) {
+            return FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY;
+        }
+    }
+
+    private FileSyncEngine.VerificationBasis selectedHashBasis() {
+        Object selected = hashBasisCombo.getSelectedItem();
+        return selected instanceof FileSyncEngine.VerificationBasis basis
+            ? basis : FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY;
+    }
+
+    /** In the window's own words, because "SOURCE_AFTER_COPY" is not a sentence a person can check. */
+    private static String hashBasisLabel(FileSyncEngine.VerificationBasis basis) {
+        if (basis == null) {
+            return "";
+        }
+        return switch (basis) {
+            case SOURCE_BEFORE_COPY -> "source before copying (default)";
+            case SOURCE_AFTER_COPY -> "source after copying";
+            case BOTH_SIDES_AT_VERIFICATION -> "both sides at verification";
+            case NOTHING_HASHED -> "nothing hashed";
+            case NOT_RECORDED -> "not recorded";
+        };
     }
 
     private static String symlinkLabel(ScanOptions.SymlinkPolicy policy) {
@@ -936,7 +1010,20 @@ public final class FileVerifierView extends JPanel {
         currentJobType = resolvedJobType();
         updateRunButtonLabel();
         verifyCheck.setEnabled(copy);
+        updateHashBasisAvailability();
         updateWorkSetSummary();
+    }
+
+    /**
+     * The basis switch means something only for a job that copies <i>and</i> compares: a Verify only job has
+     * no copy to be before or after, and a copy that compares nothing hashes nothing either way. Leaving it
+     * live in those cases would look like a choice that did something.
+     */
+    private void updateHashBasisAvailability() {
+        if (hashBasisCombo == null) {
+            return;
+        }
+        hashBasisCombo.setEnabled(!engine.isRunning() && copyButton.isSelected() && verifyCheck.isSelected());
     }
 
     /**
@@ -1028,6 +1115,7 @@ public final class FileVerifierView extends JPanel {
         copyButton.setEnabled(idle);
         verifyOnlyButton.setEnabled(idle);
         verifyCheck.setEnabled(idle && copyButton.isSelected());
+        updateHashBasisAvailability();
         jobTimeoutField.setEnabled(idle);
         dryRunCheck.setEnabled(idle);
         ignoreField.setEnabled(idle);
@@ -1097,7 +1185,7 @@ public final class FileVerifierView extends JPanel {
         FileSyncEngine.JobRequest request = new FileSyncEngine.JobRequest(
             loadedScan.sourceRoot(), loadedScan.destRoot(), resolvedJobType(),
             sourceSelection, destSelection, loadedScan.options(), extraCheck.isSelected(),
-            dryRunCheck.isSelected());
+            dryRunCheck.isSelected(), selectedHashBasis());
         pendingRequest = request;
 
         startRequest(request);
