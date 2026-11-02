@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — Unreleased
+
+- Move copying and checksum guidance into a keyboard-accessible help dialog; the log remains for job events,
+  warnings and errors. Make the file lists and output vertically resizable, stack crowded controls, and allow
+  the window to scroll on small or scaled displays. Transfer and verification behavior is unchanged.
+
 ## 1.4.0 — 2026-11-01
 
 ### Consolidated claims and limits

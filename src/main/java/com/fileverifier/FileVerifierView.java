@@ -54,7 +54,6 @@ public final class FileVerifierView extends JPanel {
 
     private JLabel versionLabel;
     private boolean pathEditSuppressed;
-    private boolean explanationShown;
 
     private JTextField sourcePathField;
     private JTextField destPathField;
@@ -225,8 +224,12 @@ public final class FileVerifierView extends JPanel {
         UiTheme.surface(this);
         setBorder(new EmptyBorder(UiTheme.SPACING));
         add(createTopPanel(), BorderLayout.NORTH);
-        add(createCenterPanel(), BorderLayout.CENTER);
-        add(createBottomPanel(), BorderLayout.SOUTH);
+        JSplitPane vertical = new JSplitPane(JSplitPane.VERTICAL_SPLIT, createCenterPanel(), createBottomPanel());
+        vertical.setName("listsAndOutputSplit");
+        vertical.setResizeWeight(0.6);
+        vertical.setDividerSize(10);
+        vertical.setBorder(null);
+        add(vertical, BorderLayout.CENTER);
     }
 
     /**
@@ -299,12 +302,14 @@ public final class FileVerifierView extends JPanel {
         optionsRow.add(ignoreLabel);
         optionsRow.add(ignoreField);
 
+        JPanel policyRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        policyRow.setOpaque(false);
         hiddenCheck = UiTheme.check("Hidden files");
         hiddenCheck.setSelected(true);
         // A ChangeListener, not an ActionListener: JCheckBox fires ActionEvent only for a click, so a
         // programmatically changed box (or a restored preference) would otherwise go unnoticed.
         hiddenCheck.addChangeListener(e -> noteScanOptionsChanged());
-        optionsRow.add(hiddenCheck);
+        policyRow.add(hiddenCheck);
 
         symlinkCombo = UiTheme.comboBox(new ScanOptions.SymlinkPolicy[]{
             ScanOptions.SymlinkPolicy.SKIP, ScanOptions.SymlinkPolicy.LINK, ScanOptions.SymlinkPolicy.FOLLOW
@@ -319,21 +324,26 @@ public final class FileVerifierView extends JPanel {
             }
         });
         symlinkCombo.addActionListener(e -> noteScanOptionsChanged());
-        optionsRow.add(UiTheme.fieldLabel("Symbolic links"));
-        optionsRow.add(symlinkCombo);
+        policyRow.add(UiTheme.fieldLabel("Symbolic links"));
+        policyRow.add(symlinkCombo);
 
         extraCheck = UiTheme.check("Destination-only files");
         extraCheck.setSelected(true);
         extraCheck.setToolTipText("Verify Only lists files that exist at the destination but not in the "
             + "selected source as EXTRA.");
-        optionsRow.add(extraCheck);
-        options.add(optionsRow, BorderLayout.CENTER);
+        policyRow.add(extraCheck);
+        JPanel optionLines = new JPanel();
+        optionLines.setOpaque(false);
+        optionLines.setLayout(new BoxLayout(optionLines, BoxLayout.Y_AXIS));
+        optionLines.add(optionsRow);
+        optionLines.add(policyRow);
+        options.add(optionLines, BorderLayout.CENTER);
 
         scanButton = UiTheme.button("Scan files");
         scanButton.addActionListener(e -> scanDirectories());
         options.add(scanButton, BorderLayout.EAST);
 
-        JPanel modeRow = new JPanel(new BorderLayout(12, 4));
+        JPanel modeRow = new JPanel(new BorderLayout(0, 4));
         modeRow.setOpaque(false);
 
         JPanel segments = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -369,7 +379,9 @@ public final class FileVerifierView extends JPanel {
         // comparison is made against. It sits beside the Verify switch and is live exactly when that switch is,
         // because a job that copies nothing has no "before the copy" to hash in, and a job that compares
         // nothing hashes nothing whichever way it is set.
-        segments.add(UiTheme.fieldLabel("Source hashes"));
+        JPanel basisRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        basisRow.setOpaque(false);
+        basisRow.add(UiTheme.fieldLabel("Source hashes"));
         hashBasisCombo = UiTheme.comboBox(new FileSyncEngine.VerificationBasis[]{
             FileSyncEngine.VerificationBasis.SOURCE_BEFORE_COPY,
             FileSyncEngine.VerificationBasis.SOURCE_AFTER_COPY
@@ -401,8 +413,13 @@ public final class FileVerifierView extends JPanel {
             }
             savePreferences();
         });
-        segments.add(hashBasisCombo);
-        modeRow.add(segments, BorderLayout.WEST);
+        basisRow.add(hashBasisCombo);
+        JPanel modeLines = new JPanel();
+        modeLines.setOpaque(false);
+        modeLines.setLayout(new BoxLayout(modeLines, BoxLayout.Y_AXIS));
+        modeLines.add(segments);
+        modeLines.add(basisRow);
+        modeRow.add(modeLines, BorderLayout.NORTH);
 
         // 5.6: what the two checkbox lists add up to, in the engine's own rule, shown before Run is
         // pressed. A second list of "effective" files would have been another thing to keep in sync
@@ -411,7 +428,7 @@ public final class FileVerifierView extends JPanel {
         workSetLabel.setToolTipText("How many files the selected operation would process, using the same "
             + "rule the job uses: a copy follows the source ticks; Verify only follows the source ticks minus "
             + "destination rows that were shown and left unticked.");
-        modeRow.add(workSetLabel, BorderLayout.CENTER);
+        modeRow.add(workSetLabel, BorderLayout.SOUTH);
 
         panel.add(paths, BorderLayout.NORTH);
         panel.add(options, BorderLayout.CENTER);
@@ -448,14 +465,14 @@ public final class FileVerifierView extends JPanel {
         JLabel countLabel = UiTheme.caption("0 files, 0 selected");
         JPanel head = new JPanel(new BorderLayout(8, 0));
         head.setOpaque(false);
-        head.add(heading, BorderLayout.WEST);
-        head.add(countLabel, BorderLayout.EAST);
+        head.add(heading, BorderLayout.NORTH);
+        head.add(countLabel, BorderLayout.SOUTH);
         panel.add(head, BorderLayout.NORTH);
 
         model.setCountLabel(countLabel);
         model.setOnChange(this::updateWorkSetSummary);
 
-        list.setVisibleRowCount(15);
+        list.setVisibleRowCount(6);
         list.setCellRenderer(new DirectoryCellRenderer());
 
         JPanel filterRow = new JPanel(new BorderLayout(6, 0));
@@ -494,13 +511,17 @@ public final class FileVerifierView extends JPanel {
         });
         buttons.add(selectAllBtn);
         buttons.add(deselectAllBtn);
-        actions.add(buttons, BorderLayout.WEST);
+        actions.add(buttons, BorderLayout.NORTH);
         JLabel hint = UiTheme.caption(isSource ? "unticked is never copied or verified"
             : "unticked is excluded from Verify only");
         hint.setHorizontalAlignment(SwingConstants.LEFT);
         hint.setBorder(new EmptyBorder(0, 8, 0, 8));
-        actions.add(hint, BorderLayout.CENTER);
+        actions.add(hint, BorderLayout.SOUTH);
         panel.add(actions, BorderLayout.SOUTH);
+        Dimension listPreferred = panel.getPreferredSize();
+        panel.setMinimumSize(new Dimension(
+            Math.max(headAndFilter.getPreferredSize().width, actions.getPreferredSize().width) + 32,
+            Math.max(150, listPreferred.height - scroll.getPreferredSize().height + 72)));
 
         list.addMouseListener(new MouseAdapter() {
             @Override
@@ -533,7 +554,15 @@ public final class FileVerifierView extends JPanel {
         statusLabel = UiTheme.bodyLabel("Ready. Pick both directories, then Scan files.");
         statusRow.add(statusLabel, BorderLayout.CENTER);
         phaseLabel = UiTheme.caption("");
-        statusRow.add(phaseLabel, BorderLayout.EAST);
+        JButton copyingHelp = UiTheme.button("How copying works");
+        copyingHelp.setName("copyingHelp");
+        copyingHelp.setMnemonic(KeyEvent.VK_H);
+        copyingHelp.addActionListener(e -> showCopyingHelp());
+        JPanel phaseControls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        phaseControls.setOpaque(false);
+        phaseControls.add(phaseLabel);
+        phaseControls.add(copyingHelp);
+        statusRow.add(phaseControls, BorderLayout.EAST);
         panel.add(statusRow, BorderLayout.NORTH);
 
         logArea = tailLog.component();
@@ -569,9 +598,9 @@ public final class FileVerifierView extends JPanel {
         exportJsonButton = UiTheme.button("Export JSON");
         exportJsonButton.addActionListener(e -> exportReport("json"));
         toolbarLeft.add(exportJsonButton);
-        resultsToolbar.add(toolbarLeft, BorderLayout.WEST);
+        resultsToolbar.add(toolbarLeft, BorderLayout.NORTH);
         resultsToolbar.add(UiTheme.caption("click a column header to sort - hashes are truncated here, full in exports"),
-            BorderLayout.EAST);
+            BorderLayout.SOUTH);
 
         JPanel resultsPanel = new JPanel(new BorderLayout());
         resultsPanel.setOpaque(false);
@@ -586,7 +615,7 @@ public final class FileVerifierView extends JPanel {
         outputTabs.addTab("Log", logScrollPane);
         resultsTabTitle = new JLabel();
         outputTabs.addTab("Results", resultsPanel);
-        outputTabs.setPreferredSize(new Dimension(0, 220));
+        outputTabs.setPreferredSize(new Dimension(0, 150));
         panel.add(outputTabs, BorderLayout.CENTER);
 
         JPanel controls = new JPanel(new BorderLayout(10, 0));
@@ -607,7 +636,7 @@ public final class FileVerifierView extends JPanel {
         jobTimeoutField.setToolTipText("Kill rsync if the whole job takes longer than this.");
         controlsLeft.add(timeoutLabel);
         controlsLeft.add(jobTimeoutField);
-        controls.add(controlsLeft, BorderLayout.WEST);
+        controls.add(controlsLeft, BorderLayout.NORTH);
 
         JPanel controlsRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         controlsRight.setOpaque(false);
@@ -628,10 +657,32 @@ public final class FileVerifierView extends JPanel {
         runButton = UiTheme.primaryButton("Run job");
         runButton.addActionListener(e -> runJob());
         controlsRight.add(runButton);
-        controls.add(controlsRight, BorderLayout.EAST);
+        controls.add(controlsRight, BorderLayout.SOUTH);
 
         panel.add(controls, BorderLayout.SOUTH);
+        Dimension outputPreferred = panel.getPreferredSize();
+        panel.setMinimumSize(new Dimension(outputPreferred.width,
+            Math.max(180, outputPreferred.height - outputTabs.getPreferredSize().height + 80)));
         return panel;
+    }
+
+    static final String COPYING_HELP = "When verification is enabled, the default basis computes Java SHA-256 "
+        + "digests of source files before rsync transfers them. With the opt-in after-copy basis, that preliminary "
+        + "Java SHA-256 pass is skipped and both sides are hashed during verification. rsync uses its own "
+        + "checksums and may read files during transfer preparation.\n\n"
+        + "During a transfer, rsync normally writes to a temporary file in the destination directory and renames "
+        + "it when the transfer of that file completes. Temporary names may be hidden, and a final name may not "
+        + "appear until then. This describes rsync's usual behavior; it does not mean a temporary file was observed "
+        + "for this job. Errors and operational warnings are reported in the log.";
+
+    private void showCopyingHelp() {
+        JTextArea text = new JTextArea(COPYING_HELP, 12, 48);
+        text.setEditable(false);
+        UiTheme.asLog(text);
+        text.setCaretPosition(0);
+        JScrollPane scroll = new JScrollPane(text);
+        UiTheme.edge(scroll);
+        JOptionPane.showMessageDialog(this, scroll, "How copying works", JOptionPane.INFORMATION_MESSAGE);
     }
 
     /** Re-installs the look-and-feel and re-themes the window that is already on screen. */
@@ -1304,14 +1355,6 @@ public final class FileVerifierView extends JPanel {
                 if (!current()) return;
                 phaseLabel.setText("Phase: " + phase);
                 log(phase + "...");
-                if ("copying".equals(phase) && !explanationShown) {
-                    explanationShown = true;
-                    log("  rsync writes each file as a hidden temporary file in its destination folder"
-                        + " (for example .big.iso.qjX7kX) and renames it to its real name only when that"
-                        + " file's transfer is complete. A large file therefore appears in the"
-                        + " destination at the end of its copy, not the start - show hidden files in"
-                        + " your file manager to watch it grow.");
-                }
             }
             @Override public void progress(int percent, String text) {
                 if (!current()) return;

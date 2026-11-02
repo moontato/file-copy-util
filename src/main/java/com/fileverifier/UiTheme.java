@@ -278,19 +278,19 @@ public final class UiTheme {
     public static Font baseFont() {
         Font ui = UIManager.getFont("Label.font");
         Font foundation = ui != null ? ui : Font.getFont("Dialog");
-        return foundation.deriveFont(Font.PLAIN, 13.0f);
+        return foundation.deriveFont(Font.PLAIN, Math.max(13.0f, foundation.getSize2D()));
     }
 
     public static Font headingFont() {
-        return baseFont().deriveFont(Font.BOLD, 15.0f);
+        return baseFont().deriveFont(Font.BOLD, baseFont().getSize2D() * 15.0f / 13.0f);
     }
 
     public static Font captionFont() {
-        return baseFont().deriveFont(Font.PLAIN, 12.0f);
+        return baseFont().deriveFont(Font.PLAIN, baseFont().getSize2D() * 12.0f / 13.0f);
     }
 
     public static Font monoFont() {
-        return new Font(Font.MONOSPACED, Font.PLAIN, 12);
+        return new Font(Font.MONOSPACED, Font.PLAIN, 12).deriveFont(baseFont().getSize2D() * 12.0f / 13.0f);
     }
 
     // ------------------------------------------------------------- components

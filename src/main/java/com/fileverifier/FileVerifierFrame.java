@@ -1,6 +1,10 @@
 package com.fileverifier;
 
 import javax.swing.JFrame;
+import javax.swing.JScrollPane;
+import java.awt.Dimension;
+import java.awt.GraphicsEnvironment;
+import java.awt.Rectangle;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.util.prefs.Preferences;
@@ -24,14 +28,22 @@ public final class FileVerifierFrame extends JFrame {
         // The long name stays here: it is the window's title, not the project's coordinate.
         setTitle("File Verifier & Copier");
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
-        setSize(1150, 820);
-        setMinimumSize(new java.awt.Dimension(820, 600));
-        setLocationRelativeTo(null);
         // Read the theme before the view builds a single widget: a light window that repaints dark a
         // second after opening looks broken.
         UiTheme.install(darkPreferred());
         view = new FileVerifierView();
-        setContentPane(view);
+        JScrollPane viewport = new JScrollPane(view);
+        viewport.setBorder(null);
+        viewport.getVerticalScrollBar().setUnitIncrement(24);
+        viewport.getHorizontalScrollBar().setUnitIncrement(24);
+        setContentPane(viewport);
+        // Swing coordinates reflect the active display scale. On a small screen the viewport scrolls
+        // rather than squeezing fixed controls into each other; never require a window larger than the
+        // usable screen (which excludes taskbars and other desktop insets).
+        Rectangle usable = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+        setMinimumSize(new Dimension(Math.min(480, usable.width), Math.min(360, usable.height)));
+        setSize(Math.min(1150, usable.width), Math.min(820, usable.height));
+        setLocationRelativeTo(null);
         addWindowListener(new WindowAdapter() {
             private boolean closing;
             @Override

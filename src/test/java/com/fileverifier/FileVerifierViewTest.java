@@ -74,8 +74,40 @@ class FileVerifierViewTest {
     void theWholeWindowBuildsWithoutADisplay() throws Exception {
         FileVerifierView view = build();
         assertNotNull(view.getLayout());
-        assertTrue(view.getComponents().length == 3,
-            "the window is three regions: paths and options, the two lists, status plus output");
+        assertEquals(2, view.getComponents().length,
+            "the window has the paths/options and a resizable lists/output split");
+    }
+
+    @Test
+    void copyingGuidanceIsAccessibleAndNotInsertedIntoTheJobLog() throws Exception {
+        FileVerifierView view = build();
+        JButton help = findNamedButton(view, "copyingHelp");
+        assertNotNull(help);
+        assertTrue(help.isFocusable());
+        assertEquals(java.awt.event.KeyEvent.VK_H, help.getMnemonic());
+        assertTrue(FileVerifierView.COPYING_HELP.contains("preliminary Java SHA-256 pass is skipped"));
+        assertTrue(FileVerifierView.COPYING_HELP.contains("does not mean a temporary file was observed"));
+        UiJobEvents[] events = new UiJobEvents[1];
+        SwingUtilities.invokeAndWait(() -> {
+            events[0] = view.beginJobDisplay(null);
+            events[0].onPhase("copying");
+        });
+        SwingUtilities.invokeAndWait(() -> { });
+        String log = ((JTextArea) field(view, "logArea")).getText();
+        assertTrue(log.contains("copying..."), log);
+        assertFalse(log.contains("temporary file"), log);
+        view.shutdown();
+    }
+
+    private static JButton findNamedButton(Container parent, String name) {
+        for (java.awt.Component component : parent.getComponents()) {
+            if (component instanceof JButton button && name.equals(button.getName())) return button;
+            if (component instanceof Container child) {
+                JButton found = findNamedButton(child, name);
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     @Test
