@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.1 — Unreleased
+## 1.4.1 — 2026-11-03
 
 - Move copying and checksum guidance into a keyboard-accessible help dialog; the log remains for job events,
   warnings and errors. Make the file lists and output vertically resizable, wrap crowded control rows onto
@@ -9,6 +9,14 @@
   its middle (the full text stays in its tooltip and accessible description). List cells and results rows are
   measured from the components that paint them, so a larger interface font - including the thin-jar platform
   look and feel - gets taller rows instead of clipped text. Transfer and verification behavior is unchanged.
+- Labels read on the text line of the control beside them instead of floating above it: a wrapped control row
+  shares the deepest text baseline its components ask for, a control with no text to align is centred on that
+  line, a row keeps the vertical gap it is configured with, and the two directory rows express the same
+  alignment as a GridBag top inset (GridBag has no baseline constraint). Row heights, budgets and scrolling are
+  unchanged by this.
+- The window opens from the packed frame plus the insets the window actually reports, raised to the intended
+  default and clamped to the usable screen, so the title bar and borders are no longer paid for out of the
+  content area; a screen too small still gets its scrollbars.
 
 ## 1.4.0 — 2026-11-01
 
