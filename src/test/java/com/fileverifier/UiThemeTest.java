@@ -13,6 +13,8 @@ import javax.swing.UIManager;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.LineBorder;
 import java.awt.Color;
+import java.awt.Component;
+import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -297,5 +299,104 @@ class UiThemeTest {
         assertTrue(label.getY() > base.top, "the label should be dropped by the baseline correction");
         assertEquals(fieldLine, labelLine, "directory label sits off the field's text line");
         GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(grid, "grid directory row");
+    }
+
+    /**
+     * The vertical gap between wrapped lines is part of the height this layout reports, so it has to be part
+     * of where the next line starts as well. Two identical rows - one configured with no gap, one with 8 -
+     * are laid out at the same width: every line below the first has to move down by one gap for each break
+     * above it, the space between consecutive lines has to be at least that gap, and the preferred height has
+     * to grow by gaps x the gap. The zero-gap row is the behaviour the window itself uses, since
+     * every control row in the view is built with vgap 0, so it is pinned here rather than assumed.
+     */
+    @Test
+    void wrappedLinesKeepTheConfiguredVerticalGap() throws Exception {
+        UiTheme.install(false);
+        JPanel[] rows = new JPanel[2];
+        int[] gaps = new int[]{0, 8};
+        for (int index = 0; index < rows.length; index++) {
+            JPanel row = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, gaps[index]));
+            row.add(new JCheckBox("Hidden files"));
+            row.add(new JLabel("Symbolic links"));
+            row.add(new JComboBox<>(new String[]{"Skip symbolic links"}));
+            row.add(new JButton("Scan files"));
+            rows[index] = row;
+        }
+        int natural = rows[0].getPreferredSize().width;
+        int width = natural / 2;
+        for (JPanel row : rows) {
+            row.setSize(new Dimension(width, 600));
+        }
+        Dimension zeroGap = rows[0].getPreferredSize();
+        Dimension eightGap = rows[1].getPreferredSize();
+        for (JPanel row : rows) {
+            row.doLayout();
+        }
+        int[] zeroTops = lineTops(rows[0]);
+        int[] gappedTops = lineTops(rows[1]);
+        System.out.println("vertical gap check at " + width + "px: vgap 0 preferred=" + zeroGap
+            + " line tops=" + java.util.Arrays.toString(zeroTops)
+            + " | vgap 8 preferred=" + eightGap + " line tops=" + java.util.Arrays.toString(gappedTops)
+            + " | space between line 1 box and line 2 = "
+            + (gappedTops[1] - lineBottom(rows[1], 0)) + "px");
+
+        assertTrue(zeroTops.length >= 2, "the row should wrap at " + width + "px, got tops "
+            + java.util.Arrays.toString(zeroTops));
+        assertEquals(zeroTops.length, gappedTops.length,
+            "the same row at the same width broke into a different number of lines: "
+                + java.util.Arrays.toString(zeroTops) + " vs " + java.util.Arrays.toString(gappedTops));
+        int breaks = zeroTops.length - 1;
+        for (int line = 0; line < zeroTops.length; line++) {
+            assertEquals(zeroTops[line] + 8 * line, gappedTops[line],
+                "line " + (line + 1) + " did not move down by one 8px gap per break above it: "
+                    + zeroTops[line] + " -> " + gappedTops[line]);
+        }
+        for (int line = 0; line + 1 < gappedTops.length; line++) {
+            int space = gappedTops[line + 1] - lineBottom(rows[1], line);
+            assertTrue(space >= 8, "lines " + (line + 1) + " and " + (line + 2)
+                + " are not separated by the configured gap: " + space + "px of space");
+        }
+        assertEquals(zeroGap.height + 8 * breaks, eightGap.height,
+            "the preferred height does not carry " + breaks + " gaps of 8px: " + zeroGap.height + " -> "
+                + eightGap.height);
+        assertEquals(zeroGap.width, eightGap.width, "a vertical gap must not change the row's natural width");
+
+        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(rows[0], "wrapped lines, vgap 0");
+        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(rows[1], "wrapped lines, vgap 8");
+    }
+
+    /** Top edge of each line a row was laid out on, in order, using the same line grouping as the harness. */
+    private static int[] lineTops(Container row) {
+        java.util.List<Component> children = new java.util.ArrayList<>();
+        for (Component child : row.getComponents()) {
+            if (child.isVisible() && child.getWidth() > 0 && child.getHeight() > 0) {
+                children.add(child);
+            }
+        }
+        children.sort((left, right) -> Integer.compare(left.getY(), right.getY()));
+        java.util.List<Integer> tops = new java.util.ArrayList<>();
+        int bandBottom = Integer.MIN_VALUE;
+        for (Component child : children) {
+            if (tops.isEmpty() || child.getY() >= bandBottom) {
+                tops.add(child.getY());
+                bandBottom = child.getY() + child.getHeight();
+            } else {
+                bandBottom = Math.max(bandBottom, child.getY() + child.getHeight());
+            }
+        }
+        return tops.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    private static int lineBottom(Container row, int lineIndex) {
+        int[] tops = lineTops(row);
+        int top = tops[lineIndex];
+        int bottom = top;
+        for (Component child : row.getComponents()) {
+            if (child.isVisible() && child.getWidth() > 0 && child.getHeight() > 0
+                && child.getY() >= top && (lineIndex + 1 == tops.length || child.getY() < tops[lineIndex + 1])) {
+                bottom = Math.max(bottom, child.getY() + child.getHeight());
+            }
+        }
+        return bottom;
     }
 }

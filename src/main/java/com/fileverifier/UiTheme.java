@@ -685,7 +685,9 @@ public final class UiTheme {
             for (Component child : visible(parent)) {
                 Dimension size = child.getPreferredSize();
                 if (!row.isEmpty() && size.width > 0 && x + size.width > insets.left + available) {
-                    rowTop += placeRow(row, sizes, line, rowTop, available, insets);
+                    // The gap between lines is part of the height this layout reports, so it has to be part of
+                    // where the next line starts too: a row configured with a vertical gap has to leave one.
+                    rowTop += placeRow(row, sizes, line, rowTop, available, insets) + vgap;
                     row.clear();
                     sizes.clear();
                     line = new LineMetrics();
