@@ -188,6 +188,125 @@ final class GuiLayoutHarness {
         }
     }
 
+    /**
+     * Every component in a baseline-aligned row - the wrapping control rows and the directory grid - has to
+     * read on one text line. Each component's own baseline is compared with the deepest baseline in its row,
+     * and a component that reports no baseline has to sit centred against the row instead. Returns the worst
+     * offset found, in pixels; more than one pixel is a label floating above the control beside it.
+     */
+    static int assertRowComponentsShareTheirTextBaseline(FileVerifierView view, String label) {
+        return assertRowComponentsShareTheirTextBaseline((Container) view, label);
+    }
+
+    /**
+     * Every component on one line of a baseline-aligned row - the wrapping control rows and the directory
+     * grid - has to read on one text line. Children of such a row are grouped into the lines they were laid
+     * out on, because a row that had to wrap holds several. Within each line, a component that reports a text
+     * baseline is compared with the deepest baseline in that line, and a component that reports none has to
+     * sit centred against the line. Returns the worst offset in pixels; more than one pixel means a label
+     * floating above the control beside it.
+     */
+    static int assertRowComponentsShareTheirTextBaseline(Container root, String label) {
+        int worst = 0;
+        String offender = "";
+        int linesChecked = 0;
+        List<Container> containers = new ArrayList<>();
+        collectContainers(root, containers);
+        for (Container container : containers) {
+            java.awt.LayoutManager layout = container.getLayout();
+            if (!(layout instanceof UiTheme.WrapLayout) && !(layout instanceof java.awt.GridBagLayout)) {
+                continue;
+            }
+            List<Component> children = new ArrayList<>();
+            for (Component child : container.getComponents()) {
+                // A component with no box - a caption whose text has not been set yet - has no text line of
+                // its own to compare, and must not decide where the line's middle is.
+                if (child.isVisible() && child.getWidth() > 0 && child.getHeight() > 0) {
+                    children.add(child);
+                }
+            }
+            if (children.size() < 2) {
+                continue;
+            }
+            children.sort((left, right) -> Integer.compare(left.getY(), right.getY()));
+            List<List<Component>> lines = new ArrayList<>();
+            List<Component> line = new ArrayList<>();
+            int bandBottom = Integer.MIN_VALUE;
+            for (Component child : children) {
+                // A line never overlaps the next one, and the first component of the next line sits exactly
+                // where this line's box ends, so the boundary belongs to the new line.
+                if (!line.isEmpty() && child.getY() >= bandBottom) {
+                    lines.add(line);
+                    line = new ArrayList<>();
+                }
+                line.add(child);
+                bandBottom = Math.max(bandBottom, child.getY() + child.getHeight());
+            }
+            lines.add(line);
+            for (List<Component> one : lines) {
+                if (one.size() < 2) {
+                    continue;
+                }
+                linesChecked++;
+                int top = Integer.MAX_VALUE;
+                int bottom = Integer.MIN_VALUE;
+                int lineBaseline = 0;
+                List<Integer> baselines = new ArrayList<>();
+                for (Component child : one) {
+                    top = Math.min(top, child.getY());
+                    bottom = Math.max(bottom, child.getY() + child.getHeight());
+                    int baseline = UiTheme.baselineOf(child);
+                    baselines.add(baseline);
+                    if (baseline >= 0) {
+                        lineBaseline = Math.max(lineBaseline, child.getY() + baseline);
+                    }
+                }
+                int middle = top + (bottom - top) / 2;
+                for (int i = 0; i < one.size(); i++) {
+                    Component child = one.get(i);
+                    int baseline = baselines.get(i);
+                    int offset;
+                    String what;
+                    if (baseline >= 0) {
+                        offset = Math.abs(child.getY() + baseline - lineBaseline);
+                        what = "baseline";
+                    } else {
+                        offset = Math.abs(child.getY() + child.getHeight() / 2 - middle);
+                        what = "centre of a component with no baseline";
+                    }
+                    if (offset > worst) {
+                        worst = offset;
+                        offender = describe(child) + " (" + what + " in " + layout.getClass().getSimpleName() + ")";
+                    }
+                }
+            }
+        }
+        System.out.println(label + ": baseline-aligned lines=" + linesChecked + " worst offset=" + worst + "px"
+            + (offender.isEmpty() ? "" : " (" + offender + ")"));
+        require(worst <= 1,
+            label + ": controls on one line are " + worst + "px apart on the text line (" + offender + ")");
+        return worst;
+    }
+
+    private static void collectContainers(Container container, List<Container> found) {
+        found.add(container);
+        for (Component child : container.getComponents()) {
+            if (child instanceof Container nested) {
+                collectContainers(nested, found);
+            }
+        }
+    }
+
+    private static String describe(Component component) {
+        if (component instanceof javax.swing.JLabel text) {
+            return "label \"" + text.getText() + "\"";
+        }
+        if (component instanceof javax.swing.AbstractButton button) {
+            return button.getClass().getSimpleName() + " \"" + button.getText() + "\"";
+        }
+        return component.getClass().getSimpleName();
+    }
+
     static void layoutToPreferred(Container container) {
         container.setSize(container.getPreferredSize());
         layoutAll(container);

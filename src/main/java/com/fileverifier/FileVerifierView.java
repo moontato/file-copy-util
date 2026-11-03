@@ -269,48 +269,68 @@ public final class FileVerifierView extends JPanel {
         JPanel paths = UiTheme.card();
         paths.setLayout(new GridBagLayout());
         GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(2, 0, 2, 8);
-        gbc.anchor = GridBagConstraints.WEST;
+        Insets pathInsets = new Insets(2, 0, 2, 8);
+        gbc.insets = pathInsets;
+        // NORTHWEST, not WEST: the vertical anchor is where the baseline correction lands, and every cell in
+        // a GridBag row shares the top of that row's band.
+        gbc.anchor = GridBagConstraints.NORTHWEST;
+
+        JLabel sourceLabel = UiTheme.fieldLabel("Source directory");
+        sourcePathField = UiTheme.field(28);
+        installPathField(sourcePathField);
+        sourceBrowseButton = UiTheme.button("Browse");
+        sourceBrowseButton.addActionListener(e -> browseDirectory(true));
+        // GridBag has no baseline constraint, so the label is dropped by however much shallower its text is
+        // than the field's or the button's: one text line across the row instead of a label floating above it.
+        int sourceRowAscent = UiTheme.rowAscent(sourceLabel, sourcePathField, sourceBrowseButton);
 
         gbc.gridx = 0;
         gbc.gridy = 0;
-        paths.add(UiTheme.fieldLabel("Source directory"), gbc);
+        gbc.weightx = 0;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, sourceRowAscent, sourceLabel);
+        paths.add(sourceLabel, gbc);
 
         gbc.gridx = 1;
         gbc.gridy = 0;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        sourcePathField = UiTheme.field(28);
-        installPathField(sourcePathField);
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, sourceRowAscent, sourcePathField);
         paths.add(sourcePathField, gbc);
 
         gbc.gridx = 2;
         gbc.gridy = 0;
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
-        sourceBrowseButton = UiTheme.button("Browse");
-        sourceBrowseButton.addActionListener(e -> browseDirectory(true));
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, sourceRowAscent, sourceBrowseButton);
         paths.add(sourceBrowseButton, gbc);
+
+        JLabel destinationLabel = UiTheme.fieldLabel("Destination directory");
+        destPathField = UiTheme.field(28);
+        installPathField(destPathField);
+        destBrowseButton = UiTheme.button("Browse");
+        destBrowseButton.addActionListener(e -> browseDirectory(false));
+        int destinationRowAscent = UiTheme.rowAscent(destinationLabel, destPathField, destBrowseButton);
 
         gbc.gridx = 0;
         gbc.gridy = 1;
         gbc.weightx = 0;
-        paths.add(UiTheme.fieldLabel("Destination directory"), gbc);
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, destinationRowAscent, destinationLabel);
+        paths.add(destinationLabel, gbc);
 
         gbc.gridx = 1;
         gbc.gridy = 1;
         gbc.weightx = 1.0;
         gbc.fill = GridBagConstraints.HORIZONTAL;
-        destPathField = UiTheme.field(28);
-        installPathField(destPathField);
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, destinationRowAscent, destPathField);
         paths.add(destPathField, gbc);
 
         gbc.gridx = 2;
         gbc.gridy = 1;
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
-        destBrowseButton = UiTheme.button("Browse");
-        destBrowseButton.addActionListener(e -> browseDirectory(false));
+        gbc.insets = UiTheme.baselineRowInsets(pathInsets, destinationRowAscent, destBrowseButton);
         paths.add(destBrowseButton, gbc);
 
         JPanel options = UiTheme.card();

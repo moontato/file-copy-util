@@ -3,11 +3,19 @@ package com.fileverifier;
 import org.junit.jupiter.api.Test;
 
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JTextField;
+import javax.swing.UIManager;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.LineBorder;
 import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -173,5 +181,121 @@ class UiThemeTest {
         assertTrue(UiTheme.baseFont().getSize() > UiTheme.captionFont().getSize());
         assertEquals("Monospaced", UiTheme.monoFont().getName());
         assertNotNull(UiTheme.baseFont().getFamily());
+    }
+
+    /**
+     * The thin jar has no FlatLaf, so the wrapping rows are laid out by the platform look and feel's metrics.
+     * A caption label is shallower than a field or a button, and a row that pins every control to its own top
+     * puts the label above the text inside the control next to it. Baseline alignment has to hold there too,
+     * at normal and enlarged font sizes, and on both lines of a row that had to break.
+     */
+    @Test
+    void wrappedRowsLineUpOnTheTextLineUnderThePlatformLookAndFeelAtBothFontSizes() throws Exception {
+        javax.swing.LookAndFeel previous = UIManager.getLookAndFeel();
+        try {
+            UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
+            for (int points : new int[]{13, 24}) {
+                JCheckBox check = new JCheckBox("Hidden files");
+                JLabel caption = new JLabel("Symbolic links");
+                JComboBox<String> combo = new JComboBox<>(new String[]{"Skip symbolic links"});
+                JButton button = new JButton("Scan files");
+                for (JComponent control : new JComponent[]{check, combo, button}) {
+                    control.setFont(control.getFont().deriveFont((float) points));
+                }
+                caption.setFont(caption.getFont().deriveFont(Font.PLAIN, points * 12.0f / 13.0f));
+                JComponent noText = new JComponent() { };
+                noText.setPreferredSize(new Dimension(40, points * 2 + 6));
+
+                JPanel row = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, 0));
+                row.add(check);
+                row.add(caption);
+                row.add(combo);
+                row.add(button);
+                row.add(noText);
+                int natural = row.getPreferredSize().width;
+                int oneLineHeight = row.getPreferredSize().height;
+                assertTrue(natural > 260, "this row should be wide enough to have to break");
+
+                row.setSize(row.getPreferredSize());
+                row.doLayout();
+                int captionLine = caption.getY() + UiTheme.baselineOf(caption);
+                int comboLine = combo.getY() + UiTheme.baselineOf(combo);
+                System.out.println("platform L&F " + points + "pt: label baseline " + captionLine
+                    + " combo baseline " + comboLine + " label top " + caption.getY()
+                    + " combo top " + combo.getY() + " row preferred height " + oneLineHeight
+                    + " (label ascent " + UiTheme.baselineOf(caption)
+                    + ", combo ascent " + UiTheme.baselineOf(combo) + ")");
+                assertEquals(comboLine, captionLine, "caption dropped off the combo's text line at " + points + "pt");
+                assertTrue(UiTheme.baselineOf(caption) < UiTheme.baselineOf(combo),
+                    "the test is only meaningful if the caption's text starts higher than the combo's");
+                assertTrue(caption.getY() > combo.getY(), "the shallower label should have been dropped, not pinned high");
+                assertTrue(noText.getY() >= 0, "a component with no baseline should stay inside the row");
+                int bandTop = Integer.MAX_VALUE;
+                int bandBottom = Integer.MIN_VALUE;
+                for (JComponent control : new JComponent[]{check, caption, combo, button, noText}) {
+                    bandTop = Math.min(bandTop, control.getY());
+                    bandBottom = Math.max(bandBottom, control.getY() + control.getHeight());
+                }
+                int middle = bandTop + (bandBottom - bandTop) / 2;
+                assertTrue(Math.abs(noText.getY() + noText.getHeight() / 2 - middle) <= 1,
+                    "a component with no baseline should be centred on the line: its middle "
+                        + (noText.getY() + noText.getHeight() / 2) + " vs line middle " + middle);
+                GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(row,
+                    "platform L&F " + points + "pt, one line");
+
+                row.setSize(new Dimension(natural / 2, oneLineHeight * 3));
+                row.doLayout();
+                assertTrue(combo.getY() > check.getY(),
+                    "the row did not actually break into more than one line at " + (natural / 2) + "px: combo y "
+                        + combo.getY() + " vs checkbox y " + check.getY());
+                GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(row,
+                    "platform L&F " + points + "pt, wrapped at " + (natural / 2) + "px");
+            }
+        } finally {
+            UIManager.setLookAndFeel(previous);
+            UiTheme.install(false);
+        }
+    }
+
+    /**
+     * GridBagLayout has no baseline constraint, so the directory rows express it as a top inset. Without the
+     * correction the label is pinned to the top of the row band and reads above the path in the field.
+     */
+    @Test
+    void gridBagDirectoryRowsPutTheirLabelOnTheFieldTextLine() throws Exception {
+        UiTheme.install(false);
+        JLabel label = UiTheme.fieldLabel("Source directory");
+        JTextField field = UiTheme.field(24);
+        JButton browse = UiTheme.button("Browse");
+        java.awt.Insets base = new java.awt.Insets(2, 0, 2, 8);
+        int ascent = UiTheme.rowAscent(label, field, browse);
+        JPanel grid = new JPanel(new java.awt.GridBagLayout());
+        java.awt.GridBagConstraints constraints = new java.awt.GridBagConstraints();
+        constraints.anchor = java.awt.GridBagConstraints.NORTHWEST;
+        constraints.gridx = 0;
+        constraints.gridy = 0;
+        constraints.insets = UiTheme.baselineRowInsets(base, ascent, label);
+        grid.add(label, constraints);
+        constraints.gridx = 1;
+        constraints.weightx = 1.0;
+        constraints.fill = java.awt.GridBagConstraints.HORIZONTAL;
+        constraints.insets = UiTheme.baselineRowInsets(base, ascent, field);
+        grid.add(field, constraints);
+        constraints.gridx = 2;
+        constraints.weightx = 0;
+        constraints.fill = java.awt.GridBagConstraints.NONE;
+        constraints.insets = UiTheme.baselineRowInsets(base, ascent, browse);
+        grid.add(browse, constraints);
+
+        grid.setSize(grid.getPreferredSize());
+        grid.doLayout();
+        int labelLine = label.getY() + UiTheme.baselineOf(label);
+        int fieldLine = field.getY() + UiTheme.baselineOf(field);
+        System.out.println("grid row: row ascent " + ascent + " label baseline " + labelLine
+            + " field baseline " + fieldLine + " label top " + label.getY() + " field top " + field.getY());
+        assertTrue(UiTheme.baselineOf(label) < UiTheme.baselineOf(field));
+        assertTrue(label.getY() > base.top, "the label should be dropped by the baseline correction");
+        assertEquals(fieldLine, labelLine, "directory label sits off the field's text line");
+        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(grid, "grid directory row");
     }
 }

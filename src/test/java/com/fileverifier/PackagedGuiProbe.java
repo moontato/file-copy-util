@@ -52,6 +52,7 @@ public final class PackagedGuiProbe {
             GuiLayoutHarness.assertContentScrollsInsideItsOwnRegions(view, label);
             GuiLayoutHarness.assertStatusLineStaysOneLine(view, label);
             GuiLayoutHarness.assertActionsReachable(view, label);
+            GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view, label);
             JList<?> list = (JList<?>) field(view, "sourceList");
             System.out.println(label + " baseFont=" + UiTheme.baseFont().getSize2D()
                 + " listCell=" + list.getUI().getCellBounds(list, 0, 0).height

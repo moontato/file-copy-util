@@ -496,6 +496,43 @@ public final class UiTheme {
     }
 
     /**
+     * Where this component's text sits inside its own preferred height, measured the way Swing measures it
+     * for painting: {@code JComponent.getBaseline} asked at the component's preferred size. -1 when the
+     * component has no text baseline to align to - a scroll pane, a panel, a progress bar.
+     */
+    public static int baselineOf(Component component) {
+        if (!(component instanceof javax.swing.JComponent cell)) {
+            return -1;
+        }
+        Dimension size = cell.getPreferredSize();
+        int baseline = cell.getBaseline(size.width, size.height);
+        return baseline >= 0 && baseline <= size.height ? baseline : -1;
+    }
+
+    /**
+     * The deepest ascent in one row of components: the text line its row-mates have to be dropped to. A
+     * field and a button reach lower than a small caption label does, so the label is the one that moves.
+     */
+    public static int rowAscent(javax.swing.JComponent... components) {
+        int ascent = 0;
+        for (javax.swing.JComponent component : components) {
+            ascent = Math.max(ascent, Math.max(0, baselineOf(component)));
+        }
+        return ascent;
+    }
+
+    /**
+     * GridBagLayout has no baseline constraint, so the alignment is expressed as a top inset: drop each
+     * component by the difference between the row's deepest ascent and its own and their text lines up.
+     * A component with no baseline keeps the insets it was given and is aligned by the row's own centring.
+     */
+    public static Insets baselineRowInsets(Insets base, int rowAscent, javax.swing.JComponent component) {
+        int baseline = baselineOf(component);
+        int extra = baseline >= 0 ? Math.max(0, rowAscent - baseline) : 0;
+        return new Insets(base.top + extra, base.left, base.bottom, base.right);
+    }
+
+    /**
      * A row of controls that wraps instead of widening the window. {@code FlowLayout} reports a minimum
      * width equal to its preferred width - it never breaks a line - so a row holding two path fields and
      * two buttons pins the whole form to 700 pixels and a narrow screen has to scroll to reach Run.
@@ -532,18 +569,19 @@ public final class UiTheme {
         public Dimension preferredLayoutSize(Container parent) {
             Insets insets = parent.getInsets();
             int naturalWidth = 0;
-            int tallest = 0;
+            LineMetrics oneLine = new LineMetrics();
             for (Component child : visible(parent)) {
                 Dimension size = child.getPreferredSize();
                 naturalWidth += size.width + (naturalWidth == 0 ? 0 : hgap);
-                tallest = Math.max(tallest, size.height);
+                oneLine.add(child, size);
             }
             int inner = parent.getWidth() - insets.left - insets.right;
             // Height is reported for the width this row actually has. A row that has had to break gets
             // the height its lines need, so a wrapped control is never cut in half by its own panel.
-            int height = inner > 0 && inner < naturalWidth ? stackedHeight(parent, inner, false) : tallest;
+            int height = inner > 0 && inner < naturalWidth
+                ? stackedHeight(parent, inner, false) : oneLine.height();
             return new Dimension(naturalWidth + insets.left + insets.right,
-                Math.max(tallest, height) + insets.top + insets.bottom);
+                Math.max(oneLine.height(), height) + insets.top + insets.bottom);
         }
 
         @Override
@@ -563,22 +601,56 @@ public final class UiTheme {
                 tallest + insets.top + insets.bottom);
         }
 
-        /** How tall the row becomes when it is laid out at this width. */
+        /** How tall the row becomes when it is laid out at this width, line by line. */
         private int stackedHeight(Container parent, int width, boolean minimum) {
             int height = 0;
             int x = 0;
-            int rowHeight = 0;
+            LineMetrics line = new LineMetrics();
             for (Component child : visible(parent)) {
                 Dimension size = minimum ? child.getMinimumSize() : child.getPreferredSize();
-                if (rowHeight > 0 && x + size.width > width) {
-                    height += rowHeight + vgap;
-                    rowHeight = 0;
+                if (line.count > 0 && size.width > 0 && x + size.width > width) {
+                    height += line.height() + vgap;
+                    line = new LineMetrics();
                     x = 0;
                 }
-                rowHeight = Math.max(rowHeight, size.height);
+                line.add(child, size);
                 x += size.width + hgap;
             }
-            return height + rowHeight;
+            return height + line.height();
+        }
+
+        /**
+         * What one line of this row needs once its components share a text line: the deepest ascent and the
+         * deepest descent among the components that have a baseline, never less than the tallest component.
+         */
+        private static final class LineMetrics {
+            private int ascent;
+            private int descent;
+            private int tallest;
+            private int count;
+
+            void add(Component component, Dimension size) {
+                count++;
+                if (size.width <= 0 || size.height <= 0) {
+                    // A caption with nothing to say yet occupies no box: it must not force a line break and
+                    // must not raise the line's height. It gets its size and revalidates when text arrives.
+                    return;
+                }
+                tallest = Math.max(tallest, size.height);
+                int baseline = baselineOf(component);
+                if (baseline >= 0) {
+                    ascent = Math.max(ascent, baseline);
+                    descent = Math.max(descent, size.height - baseline);
+                }
+            }
+
+            int height() {
+                return Math.max(tallest, ascent + descent);
+            }
+
+            int ascent() {
+                return ascent;
+            }
         }
 
         @Override
@@ -606,45 +678,57 @@ public final class UiTheme {
             Insets insets = parent.getInsets();
             int available = parent.getWidth() - insets.left - insets.right;
             int rowTop = insets.top;
-            int rowHeight = 0;
             int x = insets.left;
             java.util.List<Component> row = new java.util.ArrayList<>();
+            java.util.List<Dimension> sizes = new java.util.ArrayList<>();
+            LineMetrics line = new LineMetrics();
             for (Component child : visible(parent)) {
                 Dimension size = child.getPreferredSize();
-                if (!row.isEmpty() && x + size.width > insets.left + available) {
-                    align(row, rowHeight, rowTop, available, insets);
+                if (!row.isEmpty() && size.width > 0 && x + size.width > insets.left + available) {
+                    rowTop += placeRow(row, sizes, line, rowTop, available, insets);
                     row.clear();
-                    rowTop += rowHeight + vgap;
-                    rowHeight = 0;
+                    sizes.clear();
+                    line = new LineMetrics();
                     x = insets.left;
                 }
-                child.setBounds(x, rowTop, size.width, size.height);
                 row.add(child);
-                rowHeight = Math.max(rowHeight, size.height);
+                sizes.add(size);
+                line.add(child, size);
                 x += size.width + hgap;
             }
             if (!row.isEmpty()) {
-                align(row, rowHeight, rowTop, available, insets);
+                placeRow(row, sizes, line, rowTop, available, insets);
             }
         }
 
-        /** Shifts one finished line sideways for the row's alignment. */
-        private void align(java.util.List<Component> row, int rowHeight, int top, int available, Insets insets) {
-            if (alignment == FlowLayout.LEFT) {
-                return;
-            }
+        /**
+         * Lays one finished line. Components that report a text baseline are dropped so their baselines
+         * coincide - a caption label beside a combo or a field then reads on the same line as the text
+         * inside it instead of floating above it. Components with no baseline are centred against the line.
+         * The whole line is then shifted sideways for the row's alignment. Returns the height it used.
+         */
+        private int placeRow(java.util.List<Component> row, java.util.List<Dimension> sizes, LineMetrics line,
+                             int top, int available, Insets insets) {
             int used = 0;
             for (int i = 0; i < row.size(); i++) {
-                used += row.get(i).getWidth() + (i == 0 ? 0 : hgap);
+                used += sizes.get(i).width + (i == 0 ? 0 : hgap);
             }
-            int shift = alignment == FlowLayout.RIGHT ? Math.max(0, available - used)
+            int shift = alignment == FlowLayout.LEFT ? 0
+                : alignment == FlowLayout.RIGHT ? Math.max(0, available - used)
                 : Math.max(0, (available - used) / 2);
-            if (shift == 0) {
-                return;
+            int height = line.height();
+            int ascent = line.ascent();
+            int x = insets.left + shift;
+            for (int i = 0; i < row.size(); i++) {
+                Component child = row.get(i);
+                Dimension size = sizes.get(i);
+                int baseline = baselineOf(child);
+                int y = baseline >= 0 && ascent > 0 ? top + (ascent - baseline)
+                    : top + (height - size.height) / 2;
+                child.setBounds(x, y, size.width, size.height);
+                x += size.width + hgap;
             }
-            for (Component child : row) {
-                child.setBounds(child.getX() + shift, top, child.getWidth(), child.getHeight());
-            }
+            return height;
         }
 
         private static java.util.List<Component> visible(Container parent) {

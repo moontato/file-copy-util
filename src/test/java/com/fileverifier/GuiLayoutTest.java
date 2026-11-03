@@ -229,4 +229,116 @@ class GuiLayoutTest {
         }
     }
 
+    @Test
+    void labelsAndControlsOnOneLineReadOnTheSameTextLineInBothThemes() throws Exception {
+        Preferences prefs = Preferences.userRoot().node("com/fileverifier");
+        boolean previous = prefs.getBoolean("darkMode", false);
+        try {
+            for (boolean dark : new boolean[]{false, true}) {
+                prefs.putBoolean("darkMode", dark);
+                Throwable[] failure = new Throwable[1];
+                SwingUtilities.invokeAndWait(() -> {
+                    FileVerifierView view = new FileVerifierView();
+                    try {
+                        GuiLayoutHarness.populate(view);
+                        GuiLayoutHarness.layoutToPreferred(view);
+                        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view,
+                            "flatlaf, dark=" + dark);
+                        assertSharedTextLine(view, "symlinkCombo", "Symbolic links");
+                        assertSharedTextLine(view, "sourcePathField", "Source directory");
+                        assertSharedTextLine(view, "destPathField", "Destination directory");
+                        assertSharedTextLine(view, "ignoreField", "Ignore");
+                    } catch (Throwable problem) {
+                        failure[0] = problem;
+                    } finally {
+                        view.shutdown();
+                    }
+                });
+                if (failure[0] != null) {
+                    rethrow(failure[0]);
+                }
+            }
+        } finally {
+            prefs.putBoolean("darkMode", previous);
+        }
+    }
+
+    @Test
+    void labelsStayOnTheControlTextLineWhenTheRowWrapsAndWhenTheFontGrows() throws Exception {
+        java.util.List<String> keys = java.util.List.of("Label.font", "List.font", "Table.font",
+            "TextField.font", "Button.font", "CheckBox.font");
+        java.util.Map<String, Object> saved = new java.util.HashMap<>();
+        for (String key : keys) {
+            saved.put(key, UIManager.get(key));
+        }
+        Font enlarged = new Font(Font.SANS_SERIF, Font.PLAIN, 24);
+        try {
+            for (boolean dark : new boolean[]{false, true}) {
+                Throwable[] failure = new Throwable[1];
+                SwingUtilities.invokeAndWait(() -> {
+                    FileVerifierView view = new FileVerifierView();
+                    try {
+                        GuiLayoutHarness.populate(view);
+                        for (String key : keys) {
+                            UIManager.put(key, enlarged);
+                        }
+                        UiTheme.refresh(view);
+                        UiTheme.restyle(view);
+                        view.applyContentBounds();
+                        GuiLayoutHarness.layoutToPreferred(view);
+                        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view,
+                            "enlarged 24 point, dark=" + dark + ", unwrapped");
+                        assertSharedTextLine(view, "symlinkCombo", "Symbolic links");
+                        assertSharedTextLine(view, "sourcePathField", "Source directory");
+                        // Narrow enough that the control rows have to break into two lines.
+                        JScrollPane constrained = new JScrollPane(view);
+                        constrained.setSize(480, 360);
+                        GuiLayoutHarness.layoutAll(constrained);
+                        GuiLayoutHarness.layoutAll(view);
+                        GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view,
+                            "enlarged 24 point, dark=" + dark + ", wrapped at 480px");
+                        constrained.getViewport().setView(null);
+                    } catch (Throwable problem) {
+                        failure[0] = problem;
+                    } finally {
+                        view.shutdown();
+                    }
+                });
+                if (failure[0] != null) {
+                    rethrow(failure[0]);
+                }
+            }
+        } finally {
+            for (String key : keys) {
+                if (saved.get(key) instanceof Font original) {
+                    UIManager.put(key, original);
+                }
+            }
+        }
+    }
+
+    /** The label in front of this control must sit on the control's own text line, not above it. */
+    private static void assertSharedTextLine(FileVerifierView view, String controlField, String labelText)
+            throws Exception {
+        JComponent control = (JComponent) field(view, controlField);
+        JLabel label = null;
+        for (Component child : control.getParent().getComponents()) {
+            if (child instanceof JLabel candidate && labelText.equals(candidate.getText())) {
+                label = candidate;
+                break;
+            }
+        }
+        assertNotNull(label, "no \"" + labelText + "\" label beside " + controlField);
+        int controlLine = control.getY() + UiTheme.baselineOf(control);
+        int labelLine = label.getY() + UiTheme.baselineOf(label);
+        System.out.println("text line check: \"" + labelText + "\" baseline " + labelLine
+            + " vs " + controlField + " baseline " + controlLine);
+        assertTrue(UiTheme.baselineOf(control) >= 0, controlField + " reports no text baseline");
+        // Font metrics are integer pixels and GridBag distributes row space with rounding, so one pixel is
+        // the floor of what "on the same text line" can mean here. More than that is a label above its control.
+        assertTrue(Math.abs(controlLine - labelLine) <= 1,
+            "\"" + labelText + "\" sits " + Math.abs(controlLine - labelLine) + "px off the text inside "
+                + controlField);
+    }
+
 }

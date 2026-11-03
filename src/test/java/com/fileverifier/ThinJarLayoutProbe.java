@@ -52,6 +52,7 @@ public final class ThinJarLayoutProbe {
                 view.applyContentBounds();
                 GuiLayoutHarness.layoutAll(view);
                 System.out.println("platform fallback at 13 point: " + describe(view));
+                GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view, "thin fallback at 13 point");
 
                 for (String key : keys) {
                     UIManager.put(key, new Font(Font.SANS_SERIF, Font.PLAIN, 24));
@@ -63,6 +64,7 @@ public final class ThinJarLayoutProbe {
                 GuiLayoutHarness.assertRowsFitTheRenderer(view, "thin fallback at 24 point");
                 GuiLayoutHarness.assertContentScrollsInsideItsOwnRegions(view, "thin fallback at 24 point");
                 GuiLayoutHarness.assertActionsReachable(view, "thin fallback at 24 point");
+                GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view, "thin fallback at 24 point");
                 System.out.println("platform fallback at 24 point: " + describe(view));
 
                 JCheckBox theme = (JCheckBox) GuiLayoutHarness.field(view, "darkModeCheck");
@@ -73,6 +75,8 @@ public final class ThinJarLayoutProbe {
                 view.applyContentBounds();
                 GuiLayoutHarness.layoutAll(view);
                 GuiLayoutHarness.assertRowsFitTheRenderer(view, "thin fallback, dark palette, 24 point");
+                GuiLayoutHarness.assertRowComponentsShareTheirTextBaseline(view,
+                    "thin fallback, dark palette, 24 point");
                 System.out.println("after theme switch: " + describe(view));
             } catch (Exception failure) {
                 throw new IllegalStateException(failure);
