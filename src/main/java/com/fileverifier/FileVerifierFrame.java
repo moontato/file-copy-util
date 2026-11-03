@@ -4,6 +4,7 @@ import javax.swing.JFrame;
 import javax.swing.JScrollPane;
 import java.awt.Dimension;
 import java.awt.GraphicsEnvironment;
+import java.awt.Insets;
 import java.awt.Rectangle;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -22,6 +23,13 @@ public final class FileVerifierFrame extends JFrame {
 
     private static final long serialVersionUID = 1L;
 
+    /** What this window would like to open at, when both the layout and the screen allow it. */
+    static final int INTENDED_WIDTH = 1150;
+    static final int INTENDED_HEIGHT = 820;
+    /** Never insist on more than this, and never more than the screen has. */
+    static final int FLOOR_WIDTH = 480;
+    static final int FLOOR_HEIGHT = 360;
+
     private final FileVerifierView view;
 
     public FileVerifierFrame() {
@@ -37,18 +45,16 @@ public final class FileVerifierFrame extends JFrame {
         viewport.getVerticalScrollBar().setUnitIncrement(24);
         viewport.getHorizontalScrollBar().setUnitIncrement(24);
         setContentPane(viewport);
-        // Swing coordinates reflect the active display scale. On a small screen the viewport scrolls
-        // rather than squeezing fixed controls into each other; never require a window larger than the
-        // usable screen (which excludes taskbars and other desktop insets).
+        // Swing coordinates reflect the active display scale. Never require a window larger than the usable
+        // screen (which excludes taskbars and other desktop insets).
         Rectangle usable = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
-        setMinimumSize(new Dimension(Math.min(480, usable.width), Math.min(360, usable.height)));
-        // The opening size follows the layout the interface actually asks for, clamped to the screen:
-        // at a 12 point font the window opens around 1150x854 because that is what the rows need, and a
-        // larger font opens a taller window instead of scrolling one row at a time.
-        Dimension preferred = view.getPreferredSize();
-        int width = Math.min(usable.width, Math.max(1150, preferred.width));
-        int height = Math.min(usable.height, Math.max(820, preferred.height));
-        setSize(width, height);
+        Dimension floor = new Dimension(Math.min(FLOOR_WIDTH, usable.width), Math.min(FLOOR_HEIGHT, usable.height));
+        setMinimumSize(floor);
+        // Pack first. The frame's own preferred size is the only measurement that includes what the content
+        // pane reserves for itself - the viewport's border and its scrollbars - and after the pack the window
+        // is realized, so getInsets() reports the title bar and borders instead of nothing.
+        pack();
+        setSize(openingSize(getPreferredSize(), viewport.getPreferredSize(), getInsets(), usable, floor));
         setLocationRelativeTo(null);
         addWindowListener(new WindowAdapter() {
             private boolean closing;
@@ -64,6 +70,25 @@ public final class FileVerifierFrame extends JFrame {
     /** The view, so a test or a harness can drive the interface without a display. */
     FileVerifierView view() {
         return view;
+    }
+
+    /**
+     * The outer window size to open at. The client area the content asks for is added to the insets the
+     * window really has - title bar, borders - the result is raised to the intended default, and only then
+     * clamped to the usable screen and the window's own floor. Clamping the outer bounds is what keeps
+     * scrolling alive on a screen too small for the content: the layout is not squeezed to fit.
+     *
+     * <p>Package-private, with the insets passed in, because a headless JVM has no window manager. The
+     * arithmetic below is testable; the decoration sizes a real desktop reports are not.</p>
+     */
+    static Dimension openingSize(Dimension packed, Dimension clientContent, Insets decorations,
+                                 Rectangle usable, Dimension floor) {
+        int width = Math.max(packed.width, clientContent.width + decorations.left + decorations.right);
+        int height = Math.max(packed.height, clientContent.height + decorations.top + decorations.bottom);
+        // floor is already clamped to the screen at the call site, so this can never exceed the usable area.
+        width = Math.max(floor.width, Math.min(usable.width, Math.max(INTENDED_WIDTH, width)));
+        height = Math.max(floor.height, Math.min(usable.height, Math.max(INTENDED_HEIGHT, height)));
+        return new Dimension(width, height);
     }
 
     private static boolean darkPreferred() {
