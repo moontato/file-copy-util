@@ -42,7 +42,13 @@ public final class FileVerifierFrame extends JFrame {
         // usable screen (which excludes taskbars and other desktop insets).
         Rectangle usable = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
         setMinimumSize(new Dimension(Math.min(480, usable.width), Math.min(360, usable.height)));
-        setSize(Math.min(1150, usable.width), Math.min(820, usable.height));
+        // The opening size follows the layout the interface actually asks for, clamped to the screen:
+        // at a 12 point font the window opens around 1150x854 because that is what the rows need, and a
+        // larger font opens a taller window instead of scrolling one row at a time.
+        Dimension preferred = view.getPreferredSize();
+        int width = Math.min(usable.width, Math.max(1150, preferred.width));
+        int height = Math.min(usable.height, Math.max(820, preferred.height));
+        setSize(width, height);
         setLocationRelativeTo(null);
         addWindowListener(new WindowAdapter() {
             private boolean closing;

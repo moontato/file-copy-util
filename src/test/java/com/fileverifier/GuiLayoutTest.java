@@ -112,4 +112,121 @@ class GuiLayoutTest {
             if (previous == null) prefs.remove("darkMode"); else prefs.put("darkMode", previous);
         }
     }
+
+    private static void rethrow(Throwable problem) throws Exception {
+        if (problem instanceof Exception exception) {
+            throw exception;
+        }
+        throw new RuntimeException(problem);
+    }
+
+    @Test
+    void longNestedPathsScrollInsideTheirListsAndKeepRunAndCancelReachable() throws Exception {
+        Preferences prefs = Preferences.userRoot().node("com/fileverifier");
+        boolean previous = prefs.getBoolean("darkMode", false);
+        try {
+            for (boolean dark : new boolean[]{false, true}) {
+                prefs.putBoolean("darkMode", dark);
+                Throwable[] failure = new Throwable[1];
+                SwingUtilities.invokeAndWait(() -> {
+                    FileVerifierView view = new FileVerifierView();
+                    try {
+                        String names = GuiLayoutHarness.assertPathLengthDoesNotWidenTheForm(view, "dark=" + dark);
+                        String label = "populated dark=" + dark;
+                        GuiLayoutHarness.assertContentScrollsInsideItsOwnRegions(view, label);
+                        GuiLayoutHarness.assertStatusLineStaysOneLine(view, label);
+                        GuiLayoutHarness.assertActionsReachable(view, label);
+
+                        JList<?> sourceList = (JList<?>) field(view, "sourceList");
+                        JScrollPane listScroll = (JScrollPane) sourceList.getParent().getParent();
+                        JScrollPane constrained = new JScrollPane(view);
+                        constrained.setSize(480, 360);
+                        GuiLayoutHarness.layoutAll(constrained);
+                        assertTrue(constrained.getViewport().getViewRect().width < view.getPreferredSize().width,
+                            "a 480x360 screen no longer needs outer scrolling, so the small-screen escape hatch is gone");
+                        System.out.println(label + " " + names
+                            + " filled=" + view.getPreferredSize().width + "x" + view.getPreferredSize().height
+                            + " listPreferredWidth=" + sourceList.getPreferredSize().width
+                            + " listBudget=" + listScroll.getPreferredSize().width
+                            + " listCellHeight=" + sourceList.getUI().getCellBounds(sourceList, 0, 0).height
+                            + " constrainedViewportWidth=" + constrained.getViewport().getViewRect().width);
+                        constrained.getViewport().setView(null);
+                    } catch (Throwable problem) {
+                        failure[0] = problem;
+                    } finally {
+                        view.shutdown();
+                    }
+                });
+                if (failure[0] != null) {
+                    rethrow(failure[0]);
+                }
+            }
+        } finally {
+            prefs.putBoolean("darkMode", previous);
+        }
+    }
+
+    @Test
+    void rowsFitAGenuinelyEnlargedInterfaceFontAndAreMeasuredAgainAfterAThemeSwitch() throws Exception {
+        java.util.List<String> keys = java.util.List.of("Label.font", "List.font", "Table.font",
+            "TextField.font", "Button.font", "CheckBox.font");
+        java.util.Map<String, Object> saved = new java.util.HashMap<>();
+        for (String key : keys) {
+            saved.put(key, UIManager.get(key));
+        }
+        Font enlarged = new Font(Font.SANS_SERIF, Font.PLAIN, 24);
+        try {
+            Throwable[] failure = new Throwable[1];
+            SwingUtilities.invokeAndWait(() -> {
+                FileVerifierView view = new FileVerifierView();
+                try {
+                    GuiLayoutHarness.populate(view);
+                    for (String key : keys) {
+                        UIManager.put(key, enlarged);
+                    }
+                    UiTheme.refresh(view);
+                    UiTheme.restyle(view);
+                    view.applyContentBounds();
+                    GuiLayoutHarness.assertRowsFitTheRenderer(view, "enlarged 24 point");
+                    GuiLayoutHarness.assertContentScrollsInsideItsOwnRegions(view, "enlarged 24 point");
+                    GuiLayoutHarness.assertActionsReachable(view, "enlarged 24 point");
+                    JList<?> sourceList = (JList<?>) field(view, "sourceList");
+                    JTable results = (JTable) field(view, "resultsTable");
+                    System.out.println("enlarged baseFont=" + UiTheme.baseFont().getSize2D()
+                        + " line=" + GuiLayoutHarness.lineHeight(UiTheme.baseFont())
+                        + " listCell=" + sourceList.getUI().getCellBounds(sourceList, 0, 0).height
+                        + " tableRow=" + results.getRowHeight(0)
+                        + " header=" + results.getTableHeader().getPreferredSize().height
+                        + " filled=" + view.getPreferredSize().width + "x" + view.getPreferredSize().height);
+
+                    JCheckBox theme = (JCheckBox) field(view, "darkModeCheck");
+                    theme.doClick();
+                    for (String key : keys) {
+                        UIManager.put(key, enlarged);
+                    }
+                    view.applyContentBounds();
+                    GuiLayoutHarness.layoutAll(view);
+                    GuiLayoutHarness.assertRowsFitTheRenderer(view, "dark palette at 24 point");
+                    theme.doClick();
+                    System.out.println("after theme switch listCell="
+                        + sourceList.getUI().getCellBounds(sourceList, 0, 0).height
+                        + " tableRow=" + results.getRowHeight(0));
+                } catch (Throwable problem) {
+                    failure[0] = problem;
+                } finally {
+                    view.shutdown();
+                }
+            });
+            if (failure[0] != null) {
+                rethrow(failure[0]);
+            }
+        } finally {
+            for (String key : keys) {
+                if (saved.get(key) instanceof Font original) {
+                    UIManager.put(key, original);
+                }
+            }
+        }
+    }
+
 }

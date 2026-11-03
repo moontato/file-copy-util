@@ -7,8 +7,8 @@ import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
-import javax.swing.JTable;
 import javax.swing.JProgressBar;
+import javax.swing.JTable;
 import javax.swing.plaf.ColorUIResource;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
@@ -22,7 +22,11 @@ import javax.swing.border.LineBorder;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Container;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.LayoutManager2;
 import java.awt.Font;
+import java.awt.Insets;
 import java.awt.Window;
 
 /**
@@ -411,7 +415,8 @@ public final class UiTheme {
         list.setForeground(asThemeColor(active.text()));
         list.putClientProperty(SURFACE, Boolean.TRUE);
         list.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
-        list.setFixedCellHeight(20);
+        // No row height is pinned here: the view measures the cell renderer that paints these rows and
+        // sizes rows from that, at whatever font is current.
         return list;
     }
 
@@ -421,7 +426,6 @@ public final class UiTheme {
         table.setBackground(asThemeColor(active.window()));
         table.setForeground(asThemeColor(active.text()));
         table.putClientProperty(SURFACE, Boolean.TRUE);
-        table.setRowHeight(20);
         table.setShowGrid(false);
         table.setIntercellSpacing(new java.awt.Dimension(0, 0));
         table.setFillsViewportHeight(true);
@@ -492,6 +496,195 @@ public final class UiTheme {
     }
 
     /**
+     * A row of controls that wraps instead of widening the window. {@code FlowLayout} reports a minimum
+     * width equal to its preferred width - it never breaks a line - so a row holding two path fields and
+     * two buttons pins the whole form to 700 pixels and a narrow screen has to scroll to reach Run.
+     * Here the preferred size is still one line, but the minimum is the widest single control: the row
+     * breaks at the width it is given, and Run and Cancel stay on screen.
+     */
+    public static final class WrapLayout implements java.awt.LayoutManager2 {
+        private final int alignment;
+        private final int hgap;
+        private final int vgap;
+
+        public WrapLayout(int alignment, int hgap, int vgap) {
+            this.alignment = alignment;
+            this.hgap = hgap;
+            this.vgap = vgap;
+        }
+
+        @Override
+        public void addLayoutComponent(Component component, Object constraints) {
+            // Order comes from the container itself: JComponent reports children in the order they were added.
+        }
+
+        @Override
+        public void addLayoutComponent(String name, Component component) {
+            addLayoutComponent(component, null);
+        }
+
+        @Override
+        public void removeLayoutComponent(Component component) {
+            // Nothing is cached, so there is nothing to drop.
+        }
+
+        @Override
+        public Dimension preferredLayoutSize(Container parent) {
+            Insets insets = parent.getInsets();
+            int naturalWidth = 0;
+            int tallest = 0;
+            for (Component child : visible(parent)) {
+                Dimension size = child.getPreferredSize();
+                naturalWidth += size.width + (naturalWidth == 0 ? 0 : hgap);
+                tallest = Math.max(tallest, size.height);
+            }
+            int inner = parent.getWidth() - insets.left - insets.right;
+            // Height is reported for the width this row actually has. A row that has had to break gets
+            // the height its lines need, so a wrapped control is never cut in half by its own panel.
+            int height = inner > 0 && inner < naturalWidth ? stackedHeight(parent, inner, false) : tallest;
+            return new Dimension(naturalWidth + insets.left + insets.right,
+                Math.max(tallest, height) + insets.top + insets.bottom);
+        }
+
+        @Override
+        public Dimension minimumLayoutSize(Container parent) {
+            Insets insets = parent.getInsets();
+            int widest = 0;
+            int tallest = 0;
+            for (Component child : visible(parent)) {
+                Dimension size = child.getMinimumSize();
+                widest = Math.max(widest, size.width);
+                tallest = Math.max(tallest, size.height);
+            }
+            // One control wide and one line tall. Below the row's natural width the window scrolls - the
+            // frame's viewport gives a view at least its preferred width - rather than the window claiming
+            // it can show a whole row of controls at half their width.
+            return new Dimension(widest + insets.left + insets.right,
+                tallest + insets.top + insets.bottom);
+        }
+
+        /** How tall the row becomes when it is laid out at this width. */
+        private int stackedHeight(Container parent, int width, boolean minimum) {
+            int height = 0;
+            int x = 0;
+            int rowHeight = 0;
+            for (Component child : visible(parent)) {
+                Dimension size = minimum ? child.getMinimumSize() : child.getPreferredSize();
+                if (rowHeight > 0 && x + size.width > width) {
+                    height += rowHeight + vgap;
+                    rowHeight = 0;
+                    x = 0;
+                }
+                rowHeight = Math.max(rowHeight, size.height);
+                x += size.width + hgap;
+            }
+            return height + rowHeight;
+        }
+
+        @Override
+        public Dimension maximumLayoutSize(Container parent) {
+            return new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE);
+        }
+
+        @Override
+        public float getLayoutAlignmentX(Container parent) {
+            return alignment == FlowLayout.LEFT ? 0f : alignment == FlowLayout.RIGHT ? 1f : 0.5f;
+        }
+
+        @Override
+        public float getLayoutAlignmentY(Container parent) {
+            return 0.5f;
+        }
+
+        @Override
+        public void invalidateLayout(Container parent) {
+            // Stateless: sizes are read from the children every time.
+        }
+
+        @Override
+        public void layoutContainer(Container parent) {
+            Insets insets = parent.getInsets();
+            int available = parent.getWidth() - insets.left - insets.right;
+            int rowTop = insets.top;
+            int rowHeight = 0;
+            int x = insets.left;
+            java.util.List<Component> row = new java.util.ArrayList<>();
+            for (Component child : visible(parent)) {
+                Dimension size = child.getPreferredSize();
+                if (!row.isEmpty() && x + size.width > insets.left + available) {
+                    align(row, rowHeight, rowTop, available, insets);
+                    row.clear();
+                    rowTop += rowHeight + vgap;
+                    rowHeight = 0;
+                    x = insets.left;
+                }
+                child.setBounds(x, rowTop, size.width, size.height);
+                row.add(child);
+                rowHeight = Math.max(rowHeight, size.height);
+                x += size.width + hgap;
+            }
+            if (!row.isEmpty()) {
+                align(row, rowHeight, rowTop, available, insets);
+            }
+        }
+
+        /** Shifts one finished line sideways for the row's alignment. */
+        private void align(java.util.List<Component> row, int rowHeight, int top, int available, Insets insets) {
+            if (alignment == FlowLayout.LEFT) {
+                return;
+            }
+            int used = 0;
+            for (int i = 0; i < row.size(); i++) {
+                used += row.get(i).getWidth() + (i == 0 ? 0 : hgap);
+            }
+            int shift = alignment == FlowLayout.RIGHT ? Math.max(0, available - used)
+                : Math.max(0, (available - used) / 2);
+            if (shift == 0) {
+                return;
+            }
+            for (Component child : row) {
+                child.setBounds(child.getX() + shift, top, child.getWidth(), child.getHeight());
+            }
+        }
+
+        private static java.util.List<Component> visible(Container parent) {
+            java.util.List<Component> shown = new java.util.ArrayList<>();
+            for (Component child : parent.getComponents()) {
+                if (child.isVisible()) {
+                    shown.add(child);
+                }
+            }
+            return shown;
+        }
+    }
+    /** The narrowest row this window will use for a list or table row: a pointer target, not a font. */
+    public static final int MIN_ROW_HEIGHT = 20;
+
+    /**
+     * How tall a row must be for the component that actually paints it. Rows used to be pinned to 20
+     * pixels, which clips a 24 point interface; asking the renderer its own preferred height keeps the
+     * row honest when the font, the palette or the look and feel changes.
+     */
+    public static int rowHeightFor(javax.swing.JComponent cell) {
+        return Math.max(MIN_ROW_HEIGHT, cell.getPreferredSize().height + 2);
+    }
+
+    /**
+     * A width expressed as a number of character columns in one font. Regions that must not grow with
+     * their content - a file list, the results table, the status line - are sized this way, so a bigger
+     * font widens them proportionally instead of leaving them unusably narrow.
+     */
+    public static int widthInColumns(int columns, Font font) {
+        return columns * Math.max(1, textWidth("0", font));
+    }
+
+    /** How wide this text is in this font, measured the same way every bounded region is sized. */
+    public static int textWidth(String text, Font font) {
+        java.awt.font.FontRenderContext context = new java.awt.font.FontRenderContext(null, true, true);
+        return (int) Math.ceil(font.getStringBounds(text, context).getWidth());
+    }
+
+    /**
      * Re-apply the current palette to components already on screen. Colours chosen at construction
      * time would otherwise survive a theme switch, which is the usual way "dark mode support" ends up
      * half working. Everything {@code UiTheme} created is tagged, so this walks and re-paints.
@@ -532,13 +725,36 @@ public final class UiTheme {
             component.setBackground(asThemeColor(active.window()));
             component.setForeground(asThemeColor(active.text()));
             if (component instanceof JTable table) {
+                table.setFont(monoFont());
+                table.getTableHeader().setFont(captionFont());
                 table.getTableHeader().setBackground(asThemeColor(active.surface()));
                 table.getTableHeader().setForeground(asThemeColor(active.text()));
             }
         }
         if (root instanceof javax.swing.JTextArea area && Boolean.TRUE.equals(area.getClientProperty(LOG))) {
+            area.setFont(monoFont());
             area.setBackground(asThemeColor(active.logBackground()));
             area.setForeground(asThemeColor(active.logText()));
+        }
+        // Fonts follow the interface font too. A control built at 13 point stays at 13 point through a
+        // look-and-feel switch unless somebody says so, which is how a scaled display ends up with
+        // 24 point headings above 13 point fields and rows.
+        if (root instanceof javax.swing.text.JTextComponent text
+            && Boolean.TRUE.equals(((javax.swing.JComponent) root).getClientProperty(SURFACE))) {
+            text.setFont(baseFont());
+        }
+        if (root instanceof JComboBox<?> box) {
+            box.setFont(baseFont());
+        }
+        if (root instanceof JList<?> list) {
+            list.setFont(baseFont());
+        }
+        if (root instanceof javax.swing.AbstractButton button
+            && (Boolean.TRUE.equals(button.getClientProperty(TEXT))
+                || "primary".equals(button.getClientProperty(FILL))
+                || "danger".equals(button.getClientProperty(FILL))
+                || "segment".equals(button.getClientProperty(FILL)))) {
+            button.setFont(baseFont());
         }
         if (root instanceof JLabel label) {
             Object kind = label.getClientProperty(LABEL);

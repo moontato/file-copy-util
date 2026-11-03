@@ -35,6 +35,20 @@ class ThinJarIT {
         assertTrue(output.contains("--source"), output);
     }
 
+    @Test
+    void populatedLayoutAndEnlargedFontsWorkInThePlatformFallbackWithoutFlatLaf() throws Exception {
+        Path jar = Path.of(System.getProperty("thinJar")).toRealPath();
+        Path testClasses = Path.of(System.getProperty("testClasses")).toRealPath();
+        String classpath = jar + File.pathSeparator + testClasses;
+        String output = run(List.of(java(), "-Djava.awt.headless=true",
+            "-Djava.util.prefs.userRoot=" + temp, "-cp", classpath,
+            "com.fileverifier.ThinJarLayoutProbe", jar.toString()));
+        assertTrue(output.contains("FlatLaf absent from thin classpath"), output);
+        assertTrue(output.contains("platform fallback at 13 point"), output);
+        assertTrue(output.contains("platform fallback at 24 point"), output);
+        assertTrue(output.contains("after theme switch"), output);
+    }
+
     private String run(List<String> command) throws Exception {
         Path output = Files.createTempFile(temp, "child-", ".log");
         Process process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(output.toFile()).start();

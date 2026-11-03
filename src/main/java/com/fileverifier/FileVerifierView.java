@@ -4,6 +4,9 @@ import javax.swing.*;
 import javax.swing.border.*;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.JTableHeader;
+import javax.swing.table.TableCellRenderer;
+
 import java.awt.*;
 import java.awt.event.*;
 import java.io.File;
@@ -49,6 +52,20 @@ public final class FileVerifierView extends JPanel {
     private static final String PREF_VERIFY_AFTER_COPY = "verifyAfterCopy";
     private static final String PREF_HASH_BASIS = "verificationBasis";
     private static final String PREF_THEME = "darkMode";
+    private static final String ELLIPSIS = "\u2026";
+
+    /** Rows a list or table asks for before any content is counted. */
+    private static final int VISIBLE_LIST_ROWS = 6;
+    private static final int VISIBLE_RESULT_ROWS = 6;
+    /**
+     * Widths in characters of one '0' in the working font. Content wider than this scrolls inside its own
+     * list or table; the numbers are what stop a long path from deciding how wide the window must be.
+     */
+    private static final int LIST_COLUMNS = 32;
+    private static final int RESULTS_COLUMNS = 44;
+    private static final int STATUS_COLUMNS = 40;
+    /** How narrow a bounded region may be squeezed before the window starts scrolling instead. */
+    private static final int MINIMUM_CONTENT_COLUMNS = 10;
 
     private final Preferences prefs = Preferences.userRoot().node("com/fileverifier");
 
@@ -68,6 +85,13 @@ public final class FileVerifierView extends JPanel {
 
     private JTabbedPane outputTabs;
     private JTable resultsTable;
+    private JScrollPane resultsScroll;
+    private JScrollPane sourceListScroll;
+    private JScrollPane destListScroll;
+    /** The renderers that paint rows are also what the row heights are measured from. */
+    private final DirectoryCellRenderer sourceCellRenderer = new DirectoryCellRenderer();
+    private final DirectoryCellRenderer destCellRenderer = new DirectoryCellRenderer();
+    private final OutcomeCellRenderer outcomeCellRenderer = new OutcomeCellRenderer();
     private JLabel resultsTabTitle;
     private JCheckBox onlyProblemsCheck;
 
@@ -158,6 +182,8 @@ public final class FileVerifierView extends JPanel {
         // so the palette is applied last rather than hoped for. It also makes a widget built before a
         // theme switch legible after it.
         UiTheme.restyle(this);
+        applyContentBounds();
+        setStatusText(statusLabel.getText());
     }
 
     /**
@@ -290,7 +316,7 @@ public final class FileVerifierView extends JPanel {
         JPanel options = UiTheme.card();
         options.setLayout(new BorderLayout(10, 0));
 
-        JPanel optionsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        JPanel optionsRow = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, 0));
         optionsRow.setOpaque(false);
         JLabel ignoreLabel = UiTheme.fieldLabel("Ignore");
         ignoreField = UiTheme.field(22);
@@ -302,7 +328,7 @@ public final class FileVerifierView extends JPanel {
         optionsRow.add(ignoreLabel);
         optionsRow.add(ignoreField);
 
-        JPanel policyRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        JPanel policyRow = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, 0));
         policyRow.setOpaque(false);
         hiddenCheck = UiTheme.check("Hidden files");
         hiddenCheck.setSelected(true);
@@ -346,7 +372,7 @@ public final class FileVerifierView extends JPanel {
         JPanel modeRow = new JPanel(new BorderLayout(0, 4));
         modeRow.setOpaque(false);
 
-        JPanel segments = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        JPanel segments = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 0, 0));
         segments.setOpaque(false);
         segments.add(UiTheme.fieldLabel("Mode"));
         // Two segments, not three modes: whether the job copies, and separately whether it compares
@@ -379,7 +405,7 @@ public final class FileVerifierView extends JPanel {
         // comparison is made against. It sits beside the Verify switch and is live exactly when that switch is,
         // because a job that copies nothing has no "before the copy" to hash in, and a job that compares
         // nothing hashes nothing whichever way it is set.
-        JPanel basisRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        JPanel basisRow = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 0, 0));
         basisRow.setOpaque(false);
         basisRow.add(UiTheme.fieldLabel("Source hashes"));
         hashBasisCombo = UiTheme.comboBox(new FileSyncEngine.VerificationBasis[]{
@@ -442,9 +468,9 @@ public final class FileVerifierView extends JPanel {
         UiTheme.surface(panel);
 
         JPanel sourcePanel = createListPanel("Source files", sourceList = UiTheme.list(sourceModel.view()),
-            sourceModel, sourceFilterField = UiTheme.field(12), true);
+            sourceModel, sourceFilterField = UiTheme.field(12), true, sourceCellRenderer);
         JPanel destPanel = createListPanel("Destination files", destList = UiTheme.list(destModel.view()),
-            destModel, destFilterField = UiTheme.field(12), false);
+            destModel, destFilterField = UiTheme.field(12), false, destCellRenderer);
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, sourcePanel, destPanel);
         splitPane.setResizeWeight(0.5);
@@ -457,7 +483,7 @@ public final class FileVerifierView extends JPanel {
 
     /** A card holding a filter box, a live count, and click-to-toggle rows (3.8). */
     private JPanel createListPanel(String title, JList<DirectoryEntry> list, FileListModel model,
-                                   JTextField filterField, boolean isSource) {
+                                   JTextField filterField, boolean isSource, DirectoryCellRenderer renderer) {
         JPanel panel = UiTheme.card();
         panel.setLayout(new BorderLayout(8, 6));
 
@@ -472,8 +498,10 @@ public final class FileVerifierView extends JPanel {
         model.setCountLabel(countLabel);
         model.setOnChange(this::updateWorkSetSummary);
 
-        list.setVisibleRowCount(6);
-        list.setCellRenderer(new DirectoryCellRenderer());
+        list.setVisibleRowCount(VISIBLE_LIST_ROWS);
+        list.setCellRenderer(renderer);
+        int listRow = measuredRowHeight(list, renderer);
+        list.setFixedCellHeight(listRow);
 
         JPanel filterRow = new JPanel(new BorderLayout(6, 0));
         filterRow.setOpaque(false);
@@ -493,11 +521,20 @@ public final class FileVerifierView extends JPanel {
 
         JScrollPane scroll = new JScrollPane(list);
         UiTheme.edge(scroll);
+        // A long relative path must widen this list, not the whole window. Without the bound a 110
+        // character path makes the form ask for 1600 pixels and pushes Run and Cancel out of the window;
+        // with it the path scrolls inside the list, where it belongs.
+        scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        if (isSource) {
+            sourceListScroll = scroll;
+        } else {
+            destListScroll = scroll;
+        }
         panel.add(scroll, BorderLayout.CENTER);
 
         JPanel actions = new JPanel(new BorderLayout(8, 0));
         actions.setOpaque(false);
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        JPanel buttons = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 6, 0));
         buttons.setOpaque(false);
         JButton selectAllBtn = UiTheme.button("Select all");
         selectAllBtn.addActionListener(e -> {
@@ -518,10 +555,13 @@ public final class FileVerifierView extends JPanel {
         hint.setBorder(new EmptyBorder(0, 8, 0, 8));
         actions.add(hint, BorderLayout.SOUTH);
         panel.add(actions, BorderLayout.SOUTH);
-        Dimension listPreferred = panel.getPreferredSize();
+        // The floor is the card's own chrome plus one readable row. Anything smaller and the window
+        // scrolls instead of pretending it can show a file list in no space at all.
         panel.setMinimumSize(new Dimension(
-            Math.max(headAndFilter.getPreferredSize().width, actions.getPreferredSize().width) + 32,
-            Math.max(150, listPreferred.height - scroll.getPreferredSize().height + 72)));
+            Math.max(headAndFilter.getMinimumSize().width, actions.getMinimumSize().width)
+                + 2 * UiTheme.SPACING.left,
+            headAndFilter.getMinimumSize().height + actions.getMinimumSize().height
+                + listRow + UiTheme.SPACING.top + UiTheme.SPACING.bottom));
 
         list.addMouseListener(new MouseAdapter() {
             @Override
@@ -558,7 +598,7 @@ public final class FileVerifierView extends JPanel {
         copyingHelp.setName("copyingHelp");
         copyingHelp.setMnemonic(KeyEvent.VK_H);
         copyingHelp.addActionListener(e -> showCopyingHelp());
-        JPanel phaseControls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        JPanel phaseControls = new JPanel(new UiTheme.WrapLayout(FlowLayout.RIGHT, 8, 0));
         phaseControls.setOpaque(false);
         phaseControls.add(phaseLabel);
         phaseControls.add(copyingHelp);
@@ -584,7 +624,7 @@ public final class FileVerifierView extends JPanel {
 
         JPanel resultsToolbar = new JPanel(new BorderLayout(8, 0));
         resultsToolbar.setOpaque(false);
-        JPanel toolbarLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        JPanel toolbarLeft = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, 0));
         toolbarLeft.setOpaque(false);
         onlyProblemsCheck = UiTheme.check("Only problems");
         // ChangeListener rather than ActionListener: a JCheckBox fires ActionEvent only on a click, so a
@@ -608,6 +648,8 @@ public final class FileVerifierView extends JPanel {
         // JScrollPane(JTable) does not attach the header. Without this the column titles - and the
         // click-to-sort affordance the toolbar advertises - are simply missing from the window.
         JScrollPane resultsScroll = new JScrollPane(resultsTable);
+        resultsScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        this.resultsScroll = resultsScroll;
         resultsScroll.setRowHeaderView(resultsTable.getTableHeader());
         resultsPanel.add(resultsScroll, BorderLayout.CENTER);
 
@@ -620,7 +662,7 @@ public final class FileVerifierView extends JPanel {
 
         JPanel controls = new JPanel(new BorderLayout(10, 0));
         controls.setOpaque(false);
-        JPanel controlsLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        JPanel controlsLeft = new JPanel(new UiTheme.WrapLayout(FlowLayout.LEFT, 10, 0));
         controlsLeft.setOpaque(false);
         darkModeCheck = UiTheme.check("Dark mode");
         darkModeCheck.addActionListener(e -> applyTheme(darkModeCheck.isSelected()));
@@ -638,7 +680,7 @@ public final class FileVerifierView extends JPanel {
         controlsLeft.add(jobTimeoutField);
         controls.add(controlsLeft, BorderLayout.NORTH);
 
-        JPanel controlsRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        JPanel controlsRight = new JPanel(new UiTheme.WrapLayout(FlowLayout.RIGHT, 8, 0));
         controlsRight.setOpaque(false);
         // The version the build stamped into this artifact, in the quiet corner: which build is this
         // window, without putting a number in the way of anything you have to press.
@@ -660,9 +702,8 @@ public final class FileVerifierView extends JPanel {
         controls.add(controlsRight, BorderLayout.SOUTH);
 
         panel.add(controls, BorderLayout.SOUTH);
-        Dimension outputPreferred = panel.getPreferredSize();
-        panel.setMinimumSize(new Dimension(outputPreferred.width,
-            Math.max(180, outputPreferred.height - outputTabs.getPreferredSize().height + 80)));
+        // No hand-picked floor here: the status row, the output tabs and the control rows carry minimums
+        // measured from their own fonts and controls, and BorderLayout adds them up.
         return panel;
     }
 
@@ -685,15 +726,124 @@ public final class FileVerifierView extends JPanel {
         JOptionPane.showMessageDialog(this, scroll, "How copying works", JOptionPane.INFORMATION_MESSAGE);
     }
 
+    /**
+     * The status line stays one line long, whatever the job is doing. A 110 character path inside a
+     * progress sentence would otherwise decide how wide the window has to be - and Run and Cancel live at
+     * the far side of that width. The middle is elided instead; the unshortened text is the tooltip.
+     */
+    void setStatusText(String fullText) {
+        Font font = statusLabel.getFont();
+        String shown = elideMiddle(fullText, font, UiTheme.widthInColumns(STATUS_COLUMNS, font));
+        statusLabel.setText(shown);
+        statusLabel.setToolTipText(shown.equals(fullText) ? null : fullText);
+        // A screen reader should read the job, not the abbreviation.
+        statusLabel.getAccessibleContext().setAccessibleDescription(fullText);
+    }
+
+    /**
+     * Cut a line down to a pixel budget by removing its middle, so the opening words ("Now writing:") and
+     * the trailing counters both survive. The tail gets the larger share: the numbers are what a person
+     * glances at, and the head is usually a fixed phrase.
+     */
+    static String elideMiddle(String text, Font font, int maxPixels) {
+        if (UiTheme.textWidth(text, font) <= maxPixels) {
+            return text;
+        }
+        int budget = Math.max(0, maxPixels - UiTheme.textWidth(ELLIPSIS, font));
+        int tailStart = text.length();
+        int tailUsed = 0;
+        int tailBudget = budget * 3 / 5;
+        while (tailStart > 1) {
+            int width = UiTheme.textWidth(text.substring(tailStart - 1, tailStart), font);
+            if (tailUsed + width > tailBudget) {
+                break;
+            }
+            tailUsed += width;
+            tailStart--;
+        }
+        int headEnd = 0;
+        int headUsed = 0;
+        int headBudget = budget - tailUsed;
+        while (headEnd < tailStart) {
+            int width = UiTheme.textWidth(text.substring(headEnd, headEnd + 1), font);
+            if (headUsed + width > headBudget) {
+                break;
+            }
+            headUsed += width;
+            headEnd++;
+        }
+        if (headEnd >= tailStart) {
+            return text;
+        }
+        return text.substring(0, headEnd) + ELLIPSIS + text.substring(tailStart);
+    }
+
     /** Re-installs the look-and-feel and re-themes the window that is already on screen. */
     private void applyTheme(boolean dark) {
         UiTheme.install(dark);
         UiTheme.refresh(this);
         UiTheme.restyle(this);
+        // A look-and-feel swap brings its own fonts and its own idea of what a row looks like, so row
+        // heights and the bounded content regions are measured again instead of kept from construction.
+        applyContentBounds();
         sourceList.repaint();
         destList.repaint();
         resultsTable.repaint();
         prefs.putBoolean(PREF_THEME, dark);
+    }
+
+    /**
+     * One sample row, rendered by the renderer that will paint the real rows, measured at the current
+     * font. This is the only honest way to size a row: the list renderer is a checkbox, the results
+     * renderer is a monospaced cell with an icon, and neither is 20 pixels tall at 24 point.
+     */
+    private int measuredRowHeight(JList<DirectoryEntry> list, DirectoryCellRenderer renderer) {
+        DirectoryEntry sample = new DirectoryEntry(new FileEntry("sample", Path.of("/sample", "sample")), true);
+        Component cell = renderer.getListCellRendererComponent(list, sample, 0, false, false);
+        return cell instanceof JComponent component ? UiTheme.rowHeightFor(component) : UiTheme.MIN_ROW_HEIGHT;
+    }
+
+    /**
+     * Row heights and the sizes the scrolling regions ask for, derived from the current fonts.
+     * Runs at construction and after every theme change.
+     */
+    void applyContentBounds() {
+        Font body = UiTheme.baseFont();
+        int listRow = Math.max(measuredRowHeight(sourceList, sourceCellRenderer),
+            measuredRowHeight(destList, destCellRenderer));
+        for (JList<DirectoryEntry> list : List.of(sourceList, destList)) {
+            list.setFixedCellHeight(listRow);
+        }
+        int listColumns = UiTheme.widthInColumns(LIST_COLUMNS, body);
+        int listMinimumColumns = UiTheme.widthInColumns(MINIMUM_CONTENT_COLUMNS, body);
+        for (JScrollPane scroll : List.of(sourceListScroll, destListScroll)) {
+            scroll.setPreferredSize(new Dimension(listColumns, VISIBLE_LIST_ROWS * listRow));
+            scroll.setMinimumSize(new Dimension(listMinimumColumns, 2 * listRow));
+        }
+
+        int resultRow = listRow;
+        for (int column = 0; column < resultsTable.getColumnCount(); column++) {
+            Component cell = outcomeCellRenderer.getTableCellRendererComponent(resultsTable,
+                column == 0 ? "MISMATCH" : "0123456789abcdef0123456789abcdef", false, false, 0, column);
+            if (cell instanceof JComponent component) {
+                resultRow = Math.max(resultRow, UiTheme.rowHeightFor(component));
+            }
+        }
+        // The header sizes itself from its own renderer, so it is measured rather than set: a row should
+        // not be shorter than the caption above it, and at 24 point neither is 20 pixels.
+        TableCellRenderer headerRenderer = resultsTable.getTableHeader().getDefaultRenderer();
+        Component headerCell = headerRenderer.getTableCellRendererComponent(resultsTable,
+            "Path", false, false, 0, 0);
+        if (headerCell instanceof JComponent component) {
+            resultRow = Math.max(resultRow, UiTheme.rowHeightFor(component));
+        }
+        resultsTable.setRowHeight(resultRow);
+        resultsScroll.setPreferredSize(new Dimension(
+            UiTheme.widthInColumns(RESULTS_COLUMNS, UiTheme.monoFont()), VISIBLE_RESULT_ROWS * resultRow));
+        resultsScroll.setMinimumSize(new Dimension(
+            UiTheme.widthInColumns(MINIMUM_CONTENT_COLUMNS, UiTheme.monoFont()), 3 * resultRow));
+
+        revalidate();
     }
 
     // ------------------------------------------------------------------ preferences
@@ -922,7 +1072,7 @@ public final class FileVerifierView extends JPanel {
         final long generation = ++scanGeneration;
         inFlightScans.incrementAndGet();
         scanning = true;
-        statusLabel.setText("Scanning files...");
+        setStatusText("Scanning files...");
         savePreferences();
 
         SwingWorker<ScanPair, Void> worker = new SwingWorker<>() {
@@ -947,7 +1097,7 @@ public final class FileVerifierView extends JPanel {
                     finishScan(generation, source, dest, options, result, untickedSource, untickedDest);
                 } catch (Exception e) {
                     String message = rootCauseMessage(e);
-                    statusLabel.setText("Scan failed: " + message);
+                    setStatusText("Scan failed: " + message);
                     log("Scan failed: " + message);
                     loadedScan = null;
                 } finally {
@@ -991,7 +1141,7 @@ public final class FileVerifierView extends JPanel {
         applyScanResult(destModel, result.dest(), untickedDest);
         loadedScan = new LoadedScan(generation, source, dest, options,
             result.source().files().size(), result.dest().files().size());
-        statusLabel.setText(String.format("Scanned: %d source files, %d destination files",
+        setStatusText(String.format("Scanned: %d source files, %d destination files",
             result.source().files().size(), result.dest().files().size()));
         log(String.format("Scanned %d source files and %d destination files.",
             result.source().files().size(), result.dest().files().size()));
@@ -1182,7 +1332,7 @@ public final class FileVerifierView extends JPanel {
         }
         cancelButton.setEnabled(false);
         log("Cancellation requested - terminating rsync...");
-        statusLabel.setText("Cancelling...");
+        setStatusText("Cancelling...");
         engine.cancelInBackground();
     }
 
@@ -1193,7 +1343,7 @@ public final class FileVerifierView extends JPanel {
         }
         long seconds = engine.millisSinceLastActivity() / 1000;
         if (seconds >= 3) {
-            statusLabel.setText(String.format("Still running - last activity %ds ago (%s)",
+            setStatusText(String.format("Still running - last activity %ds ago (%s)",
                 seconds, engine.lastActivityDescription()));
         }
     }
@@ -1269,7 +1419,7 @@ public final class FileVerifierView extends JPanel {
 
     private void reportRefusal(String refusal) {
         log("Refused to start: " + refusal);
-        statusLabel.setText("Run refused - nothing scanned, or the scan no longer matches the window");
+        setStatusText("Run refused - nothing scanned, or the scan no longer matches the window");
         try {
             JOptionPane.showMessageDialog(this, refusal, "Nothing Scanned", JOptionPane.WARNING_MESSAGE);
         } catch (java.awt.HeadlessException noDisplay) {
@@ -1358,7 +1508,7 @@ public final class FileVerifierView extends JPanel {
             }
             @Override public void progress(int percent, String text) {
                 if (!current()) return;
-                statusLabel.setText(text);
+                setStatusText(text);
                 progressBar.setValue(Math.max(0, Math.min(100, percent)));
             }
             @Override public void line(String line) { if (current()) log(line); }
@@ -1485,7 +1635,7 @@ public final class FileVerifierView extends JPanel {
             progressBar.setString("Complete");
             progressBar.setValue(100);
             // A copy that compared nothing has to read as that on the status line too, not only in the log.
-            statusLabel.setText(launchedJobType != null && !launchedJobType.verifies()
+            setStatusText(launchedJobType != null && !launchedJobType.verifies()
                 ? "Copy complete - nothing was compared." : "Job completed.");
             log("");
             log("=== JOB COMPLETED ===");
@@ -1496,7 +1646,7 @@ public final class FileVerifierView extends JPanel {
             // window hours later; "Job failed." on its own invites the wrong conclusion about the files.
             boolean stopped = result.wasAborted();
             progressBar.setString(stopped ? "Stopped" : "Failed");
-            statusLabel.setText(switch (result.abortCause()) {
+            setStatusText(switch (result.abortCause()) {
                 case TIMED_OUT -> "Job stopped: it passed the time limit.";
                 case USER_CANCELLED -> "Job cancelled.";
                 case ENGINE_CLOSED -> "Job stopped: the program was closing.";
@@ -1650,7 +1800,7 @@ public final class FileVerifierView extends JPanel {
         } catch (java.awt.HeadlessException noDisplay) {
             log("No display is available, so the file chooser could not be opened - use the command line"
                 + " front end (--csv/--json) to export here.");
-            statusLabel.setText("Export needs a display here - use --csv or --json on the command line.");
+            setStatusText("Export needs a display here - use --csv or --json on the command line.");
             return;
         }
         if (choice != JFileChooser.APPROVE_OPTION) {
@@ -1677,7 +1827,7 @@ public final class FileVerifierView extends JPanel {
             try {
                 Path written = writeCompletedReport(target, format, allowInsideDataTrees);
                 log("Report written: " + written);
-                statusLabel.setText("Report written: " + written);
+                setStatusText("Report written: " + written);
                 return;
             } catch (ReportExporter.ReportRefusal refusal) {
                 String why = refusal.getMessage();
@@ -2065,6 +2215,9 @@ public final class FileVerifierView extends JPanel {
                                                       DirectoryEntry value, int index,
                                                       boolean isSelected, boolean cellHasFocus) {
             UiTheme.Palette palette = UiTheme.palette();
+            // The font is picked up on every paint: a renderer sized once at construction keeps the old
+            // look-and-feel's metrics, and the row heights are measured from this same renderer.
+            setFont(UiTheme.baseFont());
             setSelected(value.selected());
             setText(value.relPath());
             if (isSelected) {

@@ -3,8 +3,12 @@
 ## 1.4.1 — Unreleased
 
 - Move copying and checksum guidance into a keyboard-accessible help dialog; the log remains for job events,
-  warnings and errors. Make the file lists and output vertically resizable, stack crowded controls, and allow
-  the window to scroll on small or scaled displays. Transfer and verification behavior is unchanged.
+  warnings and errors. Make the file lists and output vertically resizable, wrap crowded control rows onto
+  another line, and allow the window to scroll on small or scaled displays. A long relative path now widens
+  its own list, where it scrolls, instead of widening the window; the status line keeps one line and elides
+  its middle (the full text stays in its tooltip and accessible description). List cells and results rows are
+  measured from the components that paint them, so a larger interface font - including the thin-jar platform
+  look and feel - gets taller rows instead of clipped text. Transfer and verification behavior is unchanged.
 
 ## 1.4.0 — 2026-11-01
 
