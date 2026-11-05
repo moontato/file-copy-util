@@ -10,6 +10,17 @@ final class UiJobEvents implements FileSyncEngine.ProgressListener {
     static final int MAX_LINES = 256;
     static final int MAX_LINE_CHARS = 2048;
     static final int MAX_PER_DRAIN = 64;
+    /**
+     * How many queued per-file lines a completion pass still shows ahead of its job summary.
+     *
+     * <p>A short job used to lose most of its own log: nine verdicts arrived, four lines were displayed, and the
+     * completion counted the remaining five as suppressed even though the report said nine matched. Completion now
+     * shows the oldest lines that fit in its pass, so a job of a few dozen files reads back whole. A job whose
+     * queue is genuinely saturated still has the rest reported as suppressed, and one pass still does no more
+     * work than {@link #RETAINED_LINES_AT_COMPLETION} lines plus the summary, so how long completion waits does
+     * not grow with the backlog. It stays below {@link #MAX_PER_DRAIN} for that reason.
+     */
+    static final int RETAINED_LINES_AT_COMPLETION = 32;
 
     interface Sink {
         void phase(String phase);
@@ -120,7 +131,10 @@ final class UiJobEvents implements FileSyncEngine.ProgressListener {
             completed = result;
             result = null;
             if (completed != null) {
-                // Do not let a saturated live log hold completion behind thousands of display lines.
+                // Completion must not eat the per-file lines that arrived before it. The oldest queued lines are
+                // delivered in order ahead of the summary, and only what is left over counts as suppressed: the
+                // pass is bounded, so a saturated job does not push the completion further behind.
+                while (batch.size() < RETAINED_LINES_AT_COMPLETION && !lines.isEmpty()) batch.add(lines.removeFirst());
                 dropped += lines.size();
                 lines.clear();
             } else {

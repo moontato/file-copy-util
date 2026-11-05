@@ -99,6 +99,61 @@ class FileVerifierViewTest {
         view.shutdown();
     }
 
+    @Test
+    void aNineFileJobShowsEveryVerdictLineAndKeepsEveryRowInResults() throws Exception {
+        // The log used to swallow the tail of a short job: nine verdicts, four [OK] lines, five counted as
+        // suppressed, and a report that still said nine matched. Checked here through the real window: what the
+        // log shows and what Results keeps must both hold all nine.
+        FileVerifierView view = build();
+        List<String> queued = List.of(
+            "notes/a.txt", "notes/b.txt", "notes/c.txt",
+            "albums/xperia/xperia-2024-0001.jpg", "albums/xperia/xperia-2024-0002.jpg",
+            "albums/xperia/xperia-2024-0003.jpg", "albums/xperia/xperia-2024-0004.jpg",
+            "albums/xperia/xperia-2024-0005.jpg", "albums/xperia/xperia-2024-0006.jpg");
+        FileSyncEngine.JobRequest request = new FileSyncEngine.JobRequest(Path.of("."), Path.of("."),
+            FileSyncEngine.JobType.VERIFY_ONLY, FileSyncEngine.Selection.of(queued),
+            FileSyncEngine.Selection.none(), ScanOptions.DEFAULTS, false, false);
+        FileSyncEngine.JobResult result = new FileSyncEngine.JobResult(FileSyncEngine.JobStatus.COMPLETED,
+            "finished", 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0,
+            queued.stream().map(rel -> new FileSyncEngine.FileOutcome(rel, "OK", null, null)).toList(),
+            List.of(), List.of(), 0, FileSyncEngine.AbortCause.NONE);
+
+        SwingUtilities.invokeAndWait(() -> {
+            UiJobEvents events = view.beginJobDisplay(request);
+            events.onPhase("verifying");
+            for (String rel : queued) events.onFileProcessed(rel, "OK", null, null);
+            events.onCompletion(result);
+            // Still inside the same EDT callback: the whole job arrived before any drain could run.
+            assertEquals(9, events.pendingLines());
+        });
+        SwingUtilities.invokeAndWait(() -> { });
+
+        String log;
+        try {
+            Field field = FileVerifierView.class.getDeclaredField("tailLog");
+            field.setAccessible(true);
+            log = ((TailLog) field.get(view)).text();
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+        for (String rel : queued) assertTrue(log.contains(rel), "missing from the log: " + rel + "\n" + log);
+        assertEquals(9, log.lines().filter(l -> l.contains("[OK]")).count(), log);
+        assertEquals(0, log.lines().filter(l -> l.contains("not shown in this log")).count(),
+            "a nine-line job must not be reported as suppressed: " + log);
+        assertTrue(log.contains("JOB COMPLETED"), log);
+        assertTrue(log.contains("matched=9"), log);
+
+        JTable results = (JTable) field(view, "resultsTable");
+        assertEquals(9, results.getModel().getRowCount(), "every verdict stays in Results");
+        List<String> listed = new ArrayList<>();
+        for (int row = 0; row < results.getModel().getRowCount(); row++) {
+            assertEquals("OK", results.getModel().getValueAt(row, 0));
+            listed.add(String.valueOf(results.getModel().getValueAt(row, 1)));
+        }
+        assertEquals(Set.copyOf(queued), Set.copyOf(listed), "the same nine paths, none invented");
+        view.shutdown();
+    }
+
     private static JButton findNamedButton(Container parent, String name) {
         for (java.awt.Component component : parent.getComponents()) {
             if (component instanceof JButton button && name.equals(button.getName())) return button;

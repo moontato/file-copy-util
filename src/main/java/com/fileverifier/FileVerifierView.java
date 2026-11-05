@@ -1535,7 +1535,8 @@ public final class FileVerifierView extends JPanel {
             @Override public void suppressed(long count) {
                 if (!current()) return;
                 suppressedTotal[0] += count;
-                log("  " + count + " live display event(s) suppressed; job results and counters are unaffected.");
+                log("  " + count + " per-file line(s) were not shown in this log; every verdict is still listed in"
+                    + " the Results table and in CSV/JSON exports. Job results and counters are unaffected.");
             }
             @Override public void complete(FileSyncEngine.JobResult result) {
                 if (!current()) return;
@@ -1544,7 +1545,9 @@ public final class FileVerifierView extends JPanel {
                 // The final warning list can itself be long enough to trim an earlier suppression notice.
                 // Repeat the cumulative display-only count after those warnings, without changing the result.
                 if (suppressedTotal[0] > 0 && activeEvents == null) {
-                    log("  Total: " + suppressedTotal[0] + " live display event(s) suppressed; job results and counters are unaffected.");
+                    log("  Total: " + suppressedTotal[0] + " per-file line(s) were not shown in this log; every"
+                        + " verdict is still listed in the Results table and in CSV/JSON exports. Job results and"
+                        + " counters are unaffected.");
                 }
             }
         });

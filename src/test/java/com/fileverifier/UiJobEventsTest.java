@@ -49,7 +49,62 @@ class UiJobEventsTest {
         assertEquals("completed", seen.get(seen.size() - 1));
         assertTrue(seen.contains("phase:done"));
         assertFalse(seen.contains("status:late status"));
-        assertEquals(10_000 - UiJobEvents.MAX_PER_DRAIN, dropped[0]);
+        // Completion now displays the queued lines that fit its pass instead of discarding the whole backlog, so
+        // every line is accounted for: delivered in the first pass, delivered by the completion pass, or counted.
+        long delivered = seen.stream().filter(s -> s.startsWith("line:")).count();
+        assertEquals(UiJobEvents.MAX_PER_DRAIN + UiJobEvents.RETAINED_LINES_AT_COMPLETION, delivered,
+            "one pass may deliver at most its own line budget, and completion delivers at most its retained batch");
+        assertEquals(10_000 - delivered, dropped[0],
+            "nothing may vanish silently: what is not on screen is reported as suppressed");
+        assertTrue(edt.isEmpty());
+        assertFalse(events.drainScheduled());
+    }
+
+    @Test
+    void aNineFileJobShowsAllNineVerdictLinesAndSuppressesNoneOfThem() {
+        // The reported bug: nine verdicts arrived, four [OK] lines were displayed, and the completion counted the
+        // remaining five as suppressed while the report said nine matched. Deterministic on purpose - the whole
+        // job arrives before the display has drained anything, which is what a small job actually looks like.
+        ArrayDeque<Runnable> edt = new ArrayDeque<>();
+        List<String> seen = new ArrayList<>();
+        long[] suppressed = {0};
+        List<String> queued = List.of(
+            "notes/a.txt", "notes/b.txt", "notes/c.txt",
+            "albums/xperia/xperia-2024-0001.jpg", "albums/xperia/xperia-2024-0002.jpg",
+            "albums/xperia/xperia-2024-0003.jpg", "albums/xperia/xperia-2024-0004.jpg",
+            "albums/xperia/xperia-2024-0005.jpg", "albums/xperia/xperia-2024-0006.jpg");
+        FileSyncEngine.JobResult result = new FileSyncEngine.JobResult(FileSyncEngine.JobStatus.COMPLETED,
+            "finished", 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0,
+            queued.stream().map(rel -> new FileSyncEngine.FileOutcome(rel, "OK", null, null)).toList(),
+            List.of(), List.of(), 0, FileSyncEngine.AbortCause.NONE);
+        UiJobEvents events = new UiJobEvents(edt::addLast, new UiJobEvents.Sink() {
+            @Override public void phase(String phase) { seen.add("phase:" + phase); }
+            @Override public void progress(int percent, String text) { seen.add("status:" + text); }
+            @Override public void line(String line) { seen.add("line:" + line); }
+            @Override public void suppressed(long count) { suppressed[0] += count; }
+            @Override public void complete(FileSyncEngine.JobResult finished) {
+                assertSame(result, finished);
+                seen.add("completed");
+            }
+        });
+
+        events.onPhase("verifying");
+        for (String rel : queued) events.onFileProcessed(rel, "OK", null, null);
+        events.onCompletion(result);
+
+        assertEquals(9, events.pendingLines(), "every verdict is still queued: nothing has been drained yet");
+        assertEquals(1, edt.size(), "only one drain may be outstanding");
+        edt.removeFirst().run();
+
+        List<String> lines = seen.stream().filter(s -> s.startsWith("line:")).toList();
+        assertEquals(9, lines.size(), "all nine verdict lines reach the display: " + seen);
+        for (int i = 0; i < queued.size(); i++) {
+            // Order is the order the engine reported them in, and the completion summary still comes last.
+            assertEquals("line:" + FileVerifierView.formatFileLine("OK", queued.get(i), null, null), lines.get(i));
+        }
+        assertEquals(0, suppressed[0], "a nine-line job must not be reported as suppressed at all");
+        assertEquals("completed", seen.get(seen.size() - 1), "the summary follows the lines it was behind");
+        assertEquals(0, events.pendingLines());
         assertTrue(edt.isEmpty());
         assertFalse(events.drainScheduled());
     }
@@ -176,7 +231,15 @@ class UiJobEventsTest {
                 java.lang.reflect.Field field = FileVerifierView.class.getDeclaredField("tailLog");
                 field.setAccessible(true);
                 String text = ((TailLog) field.get(ref.get())).text();
-                assertTrue(text.contains("10000 live display event(s) suppressed"), text);
+                // 10,000 verdicts were reported for a job whose display can hold 256 at a time; the completion
+                // pass now shows 32 of them, so the figure is what is left, and it names where the outcomes are.
+                int suppressed = 10_000 - UiJobEvents.RETAINED_LINES_AT_COMPLETION;
+                assertTrue(text.contains(suppressed + " per-file line(s) were not shown in this log"), text);
+                assertTrue(text.contains("Total: " + suppressed + " per-file line(s) were not shown in this log"), text);
+                assertTrue(text.contains("the Results table and in CSV/JSON exports"), text);
+                assertEquals(UiJobEvents.RETAINED_LINES_AT_COMPLETION,
+                    text.lines().filter(l -> l.contains("[OK]")).count(),
+                    "the completion pass displays the retained batch it kept");
                 assertTrue(text.contains("2 row(s) are not listed"), text);
                 assertTrue(text.contains("mismatched=1"), text);
                 assertSame(result, ref.get().completedJobInUse().result());
