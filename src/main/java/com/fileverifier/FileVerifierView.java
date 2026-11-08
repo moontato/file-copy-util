@@ -99,6 +99,8 @@ public final class FileVerifierView extends JPanel {
     private final FileListModel destModel = new FileListModel();
     private JList<DirectoryEntry> sourceList;
     private JList<DirectoryEntry> destList;
+    private JButton sourceUntickUnmatchedButton;
+    private JButton destUntickUnmatchedButton;
     private JTextField sourceFilterField;
     private JTextField destFilterField;
 
@@ -566,8 +568,21 @@ public final class FileVerifierView extends JPanel {
             model.selectAll(false);
             list.repaint();
         });
+        JButton untickUnmatched = UiTheme.button("Untick unmatched");
+        untickUnmatched.setToolTipText("Untick files whose relative path is absent from the other folder. "
+            + "File contents are checked when verification runs.");
+        untickUnmatched.setEnabled(false);
+        if (isSource) sourceUntickUnmatchedButton = untickUnmatched;
+        else destUntickUnmatchedButton = untickUnmatched;
+        untickUnmatched.addActionListener(e -> {
+            // Recheck on activation as well as when updating the buttons: never act on stale rows.
+            if (!canUntickUnmatched()) return;
+            model.untickAbsentFrom(isSource ? destModel : sourceModel);
+            list.repaint();
+        });
         buttons.add(selectAllBtn);
         buttons.add(deselectAllBtn);
+        buttons.add(untickUnmatched);
         actions.add(buttons, BorderLayout.NORTH);
         JLabel hint = UiTheme.caption(isSource ? "unticked is never copied or verified"
             : "unticked is excluded from Verify only");
@@ -972,6 +987,7 @@ public final class FileVerifierView extends JPanel {
      */
     /** Scan options changed: the same invalidation, because the rows depend on them. */
     private void noteScanOptionsChanged() {
+        updateUntickUnmatchedAvailability();
         if (scanOptionsStale || sourceModel.total() == 0) {
             return;
         }
@@ -1092,6 +1108,7 @@ public final class FileVerifierView extends JPanel {
         final long generation = ++scanGeneration;
         inFlightScans.incrementAndGet();
         scanning = true;
+        updateUntickUnmatchedAvailability();
         setStatusText("Scanning files...");
         savePreferences();
 
@@ -1126,6 +1143,7 @@ public final class FileVerifierView extends JPanel {
                     // saying it is scanning, and a scan that finishes while a newer one is still queued must
                     // not clear the flag either.
                     scanning = inFlightScans.decrementAndGet() > 0;
+                    updateUntickUnmatchedAvailability();
                 }
             }
         };
@@ -1168,6 +1186,7 @@ public final class FileVerifierView extends JPanel {
         logScanDetails(result.source(), "source");
         logScanDetails(result.dest(), "destination");
         scanOptionsStale = false;
+        updateUntickUnmatchedAvailability();
     }
 
     /** The number a finished scan has to carry for its rows to be allowed on screen. */
@@ -1233,6 +1252,20 @@ public final class FileVerifierView extends JPanel {
         verifyCheck.setEnabled(copy);
         updateHashBasisAvailability();
         updateWorkSetSummary();
+        updateUntickUnmatchedAvailability();
+    }
+
+    private boolean canUntickUnmatched() {
+        return runButton != null && runButton.isEnabled() && activeEvents == null && !engine.isRunning()
+            && currentJobType == FileSyncEngine.JobType.VERIFY_ONLY && loadedScan != null
+            && loadedScan.generation() == scanGeneration && runRefusal() == null;
+    }
+
+    private void updateUntickUnmatchedAvailability() {
+        if (sourceUntickUnmatchedButton == null || destUntickUnmatchedButton == null) return;
+        boolean enabled = canUntickUnmatched();
+        sourceUntickUnmatchedButton.setEnabled(enabled);
+        destUntickUnmatchedButton.setEnabled(enabled);
     }
 
     /**
@@ -1344,6 +1377,7 @@ public final class FileVerifierView extends JPanel {
         extraCheck.setEnabled(idle);
         symlinkCombo.setEnabled(idle);
         cancelButton.setEnabled(!idle);
+        updateUntickUnmatchedAvailability();
     }
 
     private void requestCancel() {
@@ -1902,6 +1936,7 @@ public final class FileVerifierView extends JPanel {
         // A scan that is reading the directory this field used to name is now reading the wrong place, so its
         // results are no longer allowed on screen - whether or not there were rows here to clear.
         scanGeneration++;
+        updateUntickUnmatchedAvailability();
         if (!hasLoadedLists()) {
             return;
         }
@@ -2141,6 +2176,18 @@ public final class FileVerifierView extends JPanel {
         void setFilter(String text) {
             filter = text == null ? "" : text.trim().toLowerCase(Locale.ROOT);
             rebuild();
+        }
+
+        /** Untick selected rows absent by exact relative path, including rows hidden by the filter. */
+        void untickAbsentFrom(FileListModel other) {
+            for (DirectoryEntry entry : all) {
+                if (entry.selected() && other.find(entry.relPath()) == null) {
+                    entry.setSelected(false);
+                    selectedCount--;
+                    unticked.add(entry.relPath());
+                }
+            }
+            fireSelectionChange();
         }
 
         void selectAll(boolean selected) {
