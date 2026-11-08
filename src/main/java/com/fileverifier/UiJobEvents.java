@@ -18,7 +18,7 @@ final class UiJobEvents implements FileSyncEngine.ProgressListener {
      * shows the oldest lines that fit in its pass, so a job of a few dozen files reads back whole. A job whose
      * queue is genuinely saturated still has the rest reported as suppressed, and one pass still does no more
      * work than {@link #RETAINED_LINES_AT_COMPLETION} lines plus the summary, so how long completion waits does
-     * not grow with the backlog. It stays below {@link #MAX_PER_DRAIN} for that reason.
+     * is bounded independently of the backlog. It stays below {@link #MAX_PER_DRAIN} for that reason.
      */
     static final int RETAINED_LINES_AT_COMPLETION = 32;
 
@@ -133,7 +133,7 @@ final class UiJobEvents implements FileSyncEngine.ProgressListener {
             if (completed != null) {
                 // Completion must not eat the per-file lines that arrived before it. The oldest queued lines are
                 // delivered in order ahead of the summary, and only what is left over counts as suppressed: the
-                // pass is bounded, so a saturated job does not push the completion further behind.
+                // pass is bounded, so a saturated job cannot add further drain passes before completion.
                 while (batch.size() < RETAINED_LINES_AT_COMPLETION && !lines.isEmpty()) batch.add(lines.removeFirst());
                 dropped += lines.size();
                 lines.clear();

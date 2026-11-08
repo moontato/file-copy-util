@@ -5,9 +5,9 @@
 - Fix a loss in the window's live log: when a job completed, the per-file lines still queued were counted as
   suppressed instead of being shown, so a nine-file job could display four `[OK]` lines while the report said
   nine matched. A completion pass now delivers the queued lines that fit in it (32) ahead of its job summary and
-  counts only the remainder as suppressed, so a saturated job keeps the same bounds on queue size, work done per
-  pass and how long completion waits. A suppression notice now says where the outcomes are kept - the Results
-  table and CSV/JSON exports - instead of only that display events were suppressed. Presentation only: engine
+  counts only the remainder as suppressed, keeping queue size, work per pass and completion work bounded. A
+  suppression notice directs users to Results or CSV/JSON exports for retained outcomes; separate warnings still
+  identify omitted result rows. Presentation only: engine
   verdicts, counters, event order and the isolation of a superseded job's callbacks are unchanged.
 
 ## 1.4.1 — 2026-11-03

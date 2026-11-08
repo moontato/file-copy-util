@@ -236,7 +236,8 @@ class UiJobEventsTest {
                 int suppressed = 10_000 - UiJobEvents.RETAINED_LINES_AT_COMPLETION;
                 assertTrue(text.contains(suppressed + " per-file line(s) were not shown in this log"), text);
                 assertTrue(text.contains("Total: " + suppressed + " per-file line(s) were not shown in this log"), text);
-                assertTrue(text.contains("the Results table and in CSV/JSON exports"), text);
+                assertTrue(text.contains("see Results or CSV/JSON exports for retained outcomes"), text);
+                assertFalse(text.contains("every verdict is still listed"), text);
                 assertEquals(UiJobEvents.RETAINED_LINES_AT_COMPLETION,
                     text.lines().filter(l -> l.contains("[OK]")).count(),
                     "the completion pass displays the retained batch it kept");
