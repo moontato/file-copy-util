@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.4.2 — 2026-11-08
 
-- Add an **Untick unmatched** button to each file pane for Verify Only. Each unticks paths absent from the
-  other complete scanned list, regardless of filters or ticks, without comparing contents or kinds. Existing
-  unticks remain; matching paths stay selected for verification. The buttons require a current scan and an idle job.
+- Add an **Untick unmatched** button to each file pane for Verify Only. Each unticks entries whose exact relative
+  path is absent from the other complete scanned list, regardless of filters or ticks. It does not compare file
+  contents or kinds; shared paths remain selected for verification unless manually unticked. Existing unticks
+  remain, and the buttons require a current scan and an idle job. Transfer and verification defaults are unchanged.
 - Fix a loss in the window's live log: when a job completed, the per-file lines still queued were counted as
   suppressed instead of being shown, so a nine-file job could display four `[OK]` lines while the report said
   nine matched. A completion pass now delivers the queued lines that fit in it (32) ahead of its job summary and

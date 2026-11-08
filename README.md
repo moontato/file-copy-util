@@ -68,8 +68,8 @@ sudo apt install openjdk-21-jre rsync
 mvn clean package
 ```
 
-Output: `target/file-copy-util-1.4.1.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
-`target/original-file-copy-util-1.4.1.jar` is the same program without FlatLaf: the GUI falls back to the
+Output: `target/file-copy-util-1.4.2.jar` - one runnable jar with the FlatLaf theme bundled (~1.1 MB).
+`target/original-file-copy-util-1.4.2.jar` is the same program without FlatLaf: the GUI falls back to the
 platform look and feel, with the application's light/dark palettes. `mvn clean verify` tests a headless
 view and theme switching in a separate JVM against that actual thin jar; it does not test a desktop window.
 
@@ -89,17 +89,17 @@ the configuration here does not assert that alerts are enabled, and update PRs a
 
 ```bash
 # GUI
-java -jar target/file-copy-util-1.4.1.jar
+java -jar target/file-copy-util-1.4.2.jar
 
 # Headless
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all --no-verify
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --files-from0 names.lst
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all --dry-run
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all --hash-source after-copy
-java -jar target/file-copy-util-1.4.1.jar --cli --help
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --files a.txt,sub/b.txt --csv report.csv
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all --verify-only --json report.json
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all --no-verify
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --files-from0 names.lst
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all --dry-run
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all --hash-source after-copy
+java -jar target/file-copy-util-1.4.2.jar --cli --help
 ```
 
 The CLI runs the same engine with the same selection rules: either `--files`, `--files-from(0)` or `--all` is
@@ -503,7 +503,7 @@ accents, Cyrillic, CJK and similar names cannot be listed, copied or verified. T
 says so rather than guessing a name or crashing. To handle them, run with a UTF-8 locale:
 
 ```bash
-LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.4.1.jar --cli --source DIR --dest DIR --all
+LC_ALL=C.UTF-8 java -jar target/file-copy-util-1.4.2.jar --cli --source DIR --dest DIR --all
 ```
 
 ### "N name collision(s) in the work set"
@@ -661,7 +661,7 @@ release.
 Only the GUI needs a display. On a machine without one, use `--cli`:
 
 ```bash
-java -jar target/file-copy-util-1.4.1.jar --cli --source /data/src --dest /backup/dst --all
+java -jar target/file-copy-util-1.4.2.jar --cli --source /data/src --dest /backup/dst --all
 ```
 
 On Wayland sessions, the app automatically falls back to X11. If you still see this error, ensure:
